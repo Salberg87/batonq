@@ -26,7 +26,8 @@
   "bin": {
     "batonq": "bin/batonq",
     "batonq-hook": "bin/batonq-hook",
-    "batonq-loop": "bin/batonq-loop"
+    "batonq-loop": "bin/batonq-loop",
+    "batonq-tui": "bin/batonq-tui"
   },
   "files": [
     "bin/",

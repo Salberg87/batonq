@@ -56,14 +56,24 @@ switch (cmd) {
   case "tasks":
     listTasks();
     break;
+  case "tui":
+    runTui();
+    break;
   default:
     console.error(
       "usage: agent-coord\n" +
         "  Coordination:  check | status | release <path> | sweep\n" +
         "  Measurement:   tail [-n N] | report [--since ISO] [--until ISO] [--json]\n" +
-        "  Tasks:         sync-tasks | pick | mine | done [<id>] | abandon [<id>] | tasks"
+        "  Tasks:         sync-tasks | pick | mine | done [<id>] | abandon [<id>] | tasks\n" +
+        "  Dashboard:     tui"
     );
     process.exit(2);
+}
+
+function runTui(): void {
+  const here = new URL("./tui.tsx", import.meta.url).pathname;
+  const r = spawnSync("bun", ["run", here], { stdio: "inherit" });
+  process.exit(r.status ?? 0);
 }
 
 // ── check ─────────────────────────────────────────────────────────────────────

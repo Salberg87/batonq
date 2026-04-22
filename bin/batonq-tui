@@ -1,0 +1,4 @@
+#!/bin/sh
+# batonq-tui — launch the ink TUI dashboard.
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+exec bun run "$DIR/src/tui.tsx" "$@"
