@@ -5,9 +5,19 @@
 import { Database } from "bun:sqlite";
 import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync } from "node:fs";
 import { execSync, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { basename, isAbsolute, resolve } from "node:path";
 import { homedir } from "node:os";
+import {
+  parseTasksFile as parseTasksFileCore,
+  externalId,
+  initTaskSchema,
+  syncTasks as syncTasksCore,
+  selectCandidate,
+  claimCandidate,
+  runVerify,
+  rewriteMdTaskStatus as rewriteMdTaskStatusCore,
+  type ParsedTask,
+} from "./tasks-core";
 
 const HOME = homedir();
 const LOG_DIR = `${HOME}/.claude/agent-coord-measurement`;
@@ -260,108 +270,8 @@ function sweepCmd() {
 
 // ── tasks ─────────────────────────────────────────────────────────────────────
 
-interface ParsedTask {
-  repo: string;
-  body: string;
-  status: "pending" | "claimed" | "done";
-  lineIdx: number;
-  verifyCmd?: string;
-  judgeCmd?: string;
-}
-
 function parseTasksFile(): { lines: string[]; tasks: ParsedTask[] } {
-  if (!existsSync(TASKS_PATH)) return { lines: [], tasks: [] };
-  const text = readFileSync(TASKS_PATH, "utf8");
-  const lines = text.split("\n");
-  const tasks: ParsedTask[] = [];
-  const taskRe = /^- \[([ x~])\] (?:\d{4}-\d{2}-\d{2} )?\*\*([^*]+)\*\*\s*[—–-]+\s*(.+?)(?:\s*\([^)]*\))?$/;
-  const verifyRe = /^\s+verify:\s*(.+?)\s*$/;
-  const judgeRe = /^\s+judge:\s*(.+?)\s*$/;
-  let inHtmlComment = false;
-  let inCodeFence = false;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (!inHtmlComment && /^\s*```/.test(line)) {
-      inCodeFence = !inCodeFence;
-      continue;
-    }
-    if (inCodeFence) continue;
-    if (!inHtmlComment && line.includes("<!--")) {
-      if (line.includes("-->")) continue;
-      inHtmlComment = true;
-      continue;
-    }
-    if (inHtmlComment) {
-      if (line.includes("-->")) inHtmlComment = false;
-      continue;
-    }
-    const m = line.match(taskRe);
-    if (!m) continue;
-    const status = m[1] === " " ? "pending" : m[1] === "~" ? "claimed" : "done";
-    // Look ahead for verify: and judge: lines (indented, directly under the task)
-    let verifyCmd: string | undefined;
-    let judgeCmd: string | undefined;
-    let nextIdx = i + 1;
-    if (nextIdx < lines.length) {
-      const vm = lines[nextIdx].match(verifyRe);
-      if (vm) verifyCmd = vm[1];
-      else {
-        const jm = lines[nextIdx].match(judgeRe);
-        if (jm) judgeCmd = jm[1];
-      }
-    }
-    // Check for judge: if verify was on i+1
-    if (nextIdx + 1 < lines.length && verifyCmd) {
-      const jm = lines[nextIdx + 1].match(judgeRe);
-      if (jm) judgeCmd = jm[1];
-    }
-    tasks.push({
-      repo: m[2].trim(),
-      body: m[3].trim(),
-      status,
-      lineIdx: i,
-      verifyCmd,
-      judgeCmd,
-    });
-  }
-  return { lines, tasks };
-}
-
-function externalId(repo: string, body: string): string {
-  return createHash("sha256").update(`${repo}|${body}`).digest("hex").slice(0, 12);
-}
-
-function initTaskSchema(db: Database): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS tasks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      external_id TEXT UNIQUE NOT NULL,
-      repo TEXT NOT NULL,
-      body TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      claimed_by TEXT,
-      claimed_at TEXT,
-      completed_at TEXT,
-      created_at TEXT NOT NULL,
-      verify_cmd TEXT,
-      verify_output TEXT,
-      verify_ran_at TEXT,
-      judge_cmd TEXT,
-      judge_output TEXT,
-      judge_ran_at TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status);
-    CREATE INDEX IF NOT EXISTS idx_task_repo_status ON tasks(repo, status);
-  `);
-  // Migration for pre-existing DBs that lack verify_* and judge_* columns
-  const cols = db.query("SELECT name FROM pragma_table_info('tasks')").all() as { name: string }[];
-  const has = (n: string) => cols.some((c) => c.name === n);
-  if (!has("verify_cmd")) db.exec("ALTER TABLE tasks ADD COLUMN verify_cmd TEXT");
-  if (!has("verify_output")) db.exec("ALTER TABLE tasks ADD COLUMN verify_output TEXT");
-  if (!has("verify_ran_at")) db.exec("ALTER TABLE tasks ADD COLUMN verify_ran_at TEXT");
-  if (!has("judge_cmd")) db.exec("ALTER TABLE tasks ADD COLUMN judge_cmd TEXT");
-  if (!has("judge_output")) db.exec("ALTER TABLE tasks ADD COLUMN judge_output TEXT");
-  if (!has("judge_ran_at")) db.exec("ALTER TABLE tasks ADD COLUMN judge_ran_at TEXT");
+  return parseTasksFileCore(TASKS_PATH);
 }
 
 function openTaskDb(): Database {
@@ -374,47 +284,18 @@ function openTaskDb(): Database {
 function syncTasks(verbose: boolean): { added: number; completed: number; parsed: number } {
   const { tasks: parsed } = parseTasksFile();
   const db = openTaskDb();
-  let added = 0;
-  let completed = 0;
-  const now = new Date().toISOString();
+  let result;
   try {
-    for (const t of parsed) {
-      const eid = externalId(t.repo, t.body);
-      const existing = db.query("SELECT * FROM tasks WHERE external_id = ?").get(eid) as any;
-      const verify = t.verifyCmd ?? null;
-      const judge = t.judgeCmd ?? null;
-      if (!existing) {
-        db.run(
-          `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [eid, t.repo, t.body, t.status === "done" ? "done" : "pending", now, verify, judge]
-        );
-        if (t.status !== "done") added++;
-      } else {
-        if (t.status === "done" && existing.status !== "done") {
-          db.run(
-            `UPDATE tasks SET status = 'done', completed_at = ? WHERE external_id = ?`,
-            [now, eid]
-          );
-          completed++;
-        }
-        // Keep verify_cmd and judge_cmd in sync — Fredrik may add/edit them on an already-synced task
-        if (verify !== existing.verify_cmd) {
-          db.run(`UPDATE tasks SET verify_cmd = ? WHERE external_id = ?`, [verify, eid]);
-        }
-        if (judge !== existing.judge_cmd) {
-          db.run(`UPDATE tasks SET judge_cmd = ? WHERE external_id = ?`, [judge, eid]);
-        }
-      }
-    }
+    result = syncTasksCore(db, parsed);
   } finally {
     db.close();
   }
   if (verbose) {
     console.log(
-      `Synced ${parsed.length} task(s) from ${TASKS_PATH}: ${added} new, ${completed} newly marked done.`
+      `Synced ${result.parsed} task(s) from ${TASKS_PATH}: ${result.added} new, ${result.completed} newly marked done.`
     );
   }
-  return { added, completed, parsed: parsed.length };
+  return result;
 }
 
 function getRepoForCwd(): string | null {
@@ -453,27 +334,7 @@ function pickTask(): void {
     const args = process.argv.slice(3);
     const any = args.includes("--any");
 
-    let candidate: any = null;
-    if (any) {
-      // --any: plukk første pending uansett repo
-      candidate = db
-        .query(`SELECT * FROM tasks WHERE status = 'pending' ORDER BY id LIMIT 1`)
-        .get();
-    } else if (repo) {
-      // i et git-repo: plukk matchende eller any:*
-      candidate = db
-        .query(
-          `SELECT * FROM tasks WHERE status = 'pending' AND (repo = ? OR repo LIKE 'any:%') ORDER BY id LIMIT 1`
-        )
-        .get(repo);
-    } else {
-      // ikke i git, ikke --any: plukk bare any:* (aldri en repo-spesifikk task)
-      candidate = db
-        .query(
-          `SELECT * FROM tasks WHERE status = 'pending' AND repo LIKE 'any:%' ORDER BY id LIMIT 1`
-        )
-        .get();
-    }
+    const candidate: any = selectCandidate(db, { repo, any });
     if (!candidate) {
       console.log("NO_TASK");
       if (any) {
@@ -487,12 +348,7 @@ function pickTask(): void {
       }
       return;
     }
-    const now = new Date().toISOString();
-    const result = db.run(
-      `UPDATE tasks SET status = 'claimed', claimed_by = ?, claimed_at = ?
-       WHERE id = ? AND status = 'pending'`,
-      [session, now, candidate.id]
-    );
+    const result = claimCandidate(db, candidate.id, session);
     if (result.changes === 0) {
       console.log("NO_TASK");
       console.log("Task was claimed by another session between sync and claim. Run /pick-next again.");
@@ -556,29 +412,6 @@ function resolveRepoPath(repoName: string): string {
     }
   }
   return process.cwd();
-}
-
-function runVerify(cmd: string, cwd: string, taskId: string): { code: number; output: string } {
-  const MAX_OUTPUT = 1024 * 1024 * 4; // 4 MB
-  const result = spawnSync("/bin/sh", ["-c", cmd], {
-    cwd,
-    env: {
-      ...process.env,
-      AGENT_COORD_REPO_ROOT: cwd,
-      AGENT_COORD_TASK_ID: taskId,
-    },
-    timeout: 300_000, // 5 min
-    encoding: "utf8",
-    maxBuffer: MAX_OUTPUT,
-  });
-  const stdout = result.stdout ?? "";
-  const stderr = result.stderr ?? "";
-  const output = stdout + (stderr ? `\n[stderr]\n${stderr}` : "");
-  let code: number;
-  if (result.error && (result.error as any).code === "ETIMEDOUT") code = 124; // classic timeout exit
-  else if (result.signal) code = 128 + (result.signal === "SIGKILL" ? 9 : result.signal === "SIGTERM" ? 15 : 1);
-  else code = result.status ?? 1;
-  return { code, output };
 }
 
 function runJudge(judgePrompt: string, gitDiff: string, cwd: string): { passed: boolean; output: string } {
@@ -796,17 +629,7 @@ function listTasks(): void {
 }
 
 function rewriteMdTaskStatus(repo: string, body: string, newStatus: "done" | "pending"): void {
-  const { lines, tasks } = parseTasksFile();
-  if (lines.length === 0) return;
-  const target = tasks.find((t) => t.repo === repo && t.body === body);
-  if (!target) return;
-  if (newStatus === "done") {
-    const date = new Date().toISOString().slice(0, 10);
-    lines[target.lineIdx] = `- [x] ${date} **${repo}** — ${body}`;
-  } else {
-    lines[target.lineIdx] = `- [ ] **${repo}** — ${body}`;
-  }
-  writeFileSync(TASKS_PATH, lines.join("\n"));
+  rewriteMdTaskStatusCore(TASKS_PATH, repo, body, newStatus);
 }
 
 // ── report ────────────────────────────────────────────────────────────────────

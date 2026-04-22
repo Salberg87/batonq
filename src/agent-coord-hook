@@ -14,10 +14,11 @@
 
 import { Database } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync, appendFileSync, mkdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { isAbsolute, resolve, basename } from "node:path";
 import { homedir } from "node:os";
+import { hashFile, extractBashPaths, DESTRUCTIVE, MAX_HASH_BYTES } from "./hook-core";
 
 const MODE = process.argv[2]; // pre | post | bash
 const HOME = homedir();
@@ -25,10 +26,7 @@ const LOG_DIR = `${HOME}/.claude/agent-coord-measurement`;
 const LOG_PATH = `${LOG_DIR}/events.jsonl`;
 const DB_PATH = `${HOME}/.claude/agent-coord-state.db`;
 const SCOPE_PREFIXES = [`${HOME}/DEV/`, `${HOME}/dev/`];
-const MAX_HASH_BYTES = 1_048_576;
 const TTL_MS = 10 * 60_000; // 10 min heartbeat window
-const DESTRUCTIVE =
-  /\b(rm|mv|truncate|shred)\b|(^|[\s;&|])>\s*[^\s&|;]|\bgit\s+reset\s+--hard\b|\bgit\s+checkout\s+--\s|\bdd\s+of=/;
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -99,47 +97,6 @@ function computeFingerprint(gitRoot: string): string {
     // non-fatal
   }
   return fp;
-}
-
-function hashFile(path: string): string | null {
-  try {
-    if (!existsSync(path)) return null;
-    const size = statSync(path).size;
-    const h = createHash("sha256");
-    if (size <= MAX_HASH_BYTES) {
-      h.update(readFileSync(path));
-    } else {
-      const buf = readFileSync(path);
-      h.update(buf.subarray(0, MAX_HASH_BYTES));
-      h.update(`|size=${size}`);
-    }
-    return "sha256:" + h.digest("hex");
-  } catch {
-    return null;
-  }
-}
-
-function extractBashPaths(cmd: string, cwd: string): string[] {
-  const tokens = cmd
-    .replace(/[|;&<>]/g, " ")
-    .split(/\s+/)
-    .map((t) => t.replace(/^['"]|['"]$/g, ""))
-    .filter(
-      (t) =>
-        t &&
-        !t.startsWith("-") &&
-        !/^(rm|mv|cp|dd|git|reset|hard|of|checkout|truncate|shred|sudo|sh|bash|zsh|echo)$/i.test(t) &&
-        (t.includes("/") || t.includes("."))
-    );
-  return tokens
-    .map((t) => (isAbsolute(t) ? t : resolve(cwd, t)))
-    .filter((p) => {
-      try {
-        return existsSync(p);
-      } catch {
-        return false;
-      }
-    });
 }
 
 function uuidv7(): string {
