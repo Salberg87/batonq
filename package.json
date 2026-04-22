@@ -5,13 +5,13 @@
   "license": "MIT",
   "type": "module",
   "author": "Fredrik Salberg",
-  "homepage": "https://github.com/fsalb/batonq",
+  "homepage": "https://github.com/Salberg87/batonq",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/fsalb/batonq.git"
+    "url": "git+https://github.com/Salberg87/batonq.git"
   },
   "bugs": {
-    "url": "https://github.com/fsalb/batonq/issues"
+    "url": "https://github.com/Salberg87/batonq/issues"
   },
   "keywords": [
     "agent",

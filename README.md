@@ -2,7 +2,7 @@
   <img src="./docs/logo.svg" alt="batonq" width="120" height="120">
 </p>
 
-![CI](https://github.com/{placeholder}/batonq/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/Salberg87/batonq/actions/workflows/ci.yml/badge.svg)
 
 <h1 align="center">batonq</h1>
 
@@ -38,7 +38,7 @@ boring on purpose.
 Requires [Bun](https://bun.sh) (≥ 1.0).
 
 ```sh
-git clone https://github.com/fsalb/batonq.git
+git clone https://github.com/Salberg87/batonq.git
 cd batonq
 bun install
 export PATH="$PWD/bin:$PATH"
