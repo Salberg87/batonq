@@ -2,6 +2,8 @@
   <img src="./docs/logo.svg" alt="batonq" width="120" height="120">
 </p>
 
+![CI](https://github.com/{placeholder}/batonq/actions/workflows/ci.yml/badge.svg)
+
 <h1 align="center">batonq</h1>
 
 <p align="center"><strong>A baton queue for parallel agents.</strong></p>

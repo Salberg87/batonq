@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Run tests
+        run: bun test
+
+      - name: Typecheck
+        run: |
+          if [ -f tsconfig.json ]; then
+            bunx tsc --noEmit
+          else
+            echo "No tsconfig.json found, skipping typecheck"
+          fi
+
+      - name: ShellCheck
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install shellcheck
+          else
+            sudo apt-get update && sudo apt-get install -y shellcheck
+          fi
+          files=$(find . -type f -name '*.sh' -not -path './node_modules/*' -not -path './.git/*')
+          if [ -n "$files" ]; then
+            echo "$files" | xargs shellcheck
+          else
+            echo "No .sh files found"
+          fi
