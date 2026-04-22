@@ -1,0 +1,51 @@
+#!/bin/bash
+set -euo pipefail
+
+# agent-coord-loop — Path A: Fresh Claude invocation per task
+# Polls agent-coord pick and spawns a new Claude instance for each task.
+# Useful for long-running task loops where fresh context per task is preferred.
+
+PICK_NEXT_SYSTEM_PROMPT="$(cat ~/.claude/commands/pick-next.md)"
+
+while true; do
+  echo "→ agent-coord pick"
+  PICK_OUTPUT=$(agent-coord pick 2>&1)
+
+  if [[ "$PICK_OUTPUT" =~ ^NO_TASK ]]; then
+    echo "$PICK_OUTPUT"
+    echo "Queue empty. Sleeping 60s..."
+    sleep 60
+    continue
+  fi
+
+  if [[ "$PICK_OUTPUT" =~ ^TASK_CLAIMED ]]; then
+    echo "$PICK_OUTPUT"
+    echo
+    echo "→ spawning claude -p for this task"
+    echo
+
+    # Pass pick output + system prompt to new Claude invocation.
+    # Use --append-system-prompt (not -s, which doesn't exist) and --dangerously-skip-permissions
+    # so the fresh `claude -p` can actually edit/commit without interactive prompts.
+    # Stream JSON events through agent-coord-watch for ANSI-colored pretty output.
+    echo "$PICK_OUTPUT" \
+      | claude -p \
+          --output-format stream-json \
+          --verbose \
+          --dangerously-skip-permissions \
+          --append-system-prompt "$PICK_NEXT_SYSTEM_PROMPT" \
+      | agent-coord-watch
+
+    # Wait before next pick
+    echo
+    echo "→ sleeping 5s before next task..."
+    sleep 5
+    continue
+  fi
+
+  # Unexpected output
+  echo "✗ Unexpected agent-coord pick output:"
+  echo "$PICK_OUTPUT"
+  echo "Sleeping 60s..."
+  sleep 60
+done

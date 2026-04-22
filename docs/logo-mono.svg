@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="batonq">
+  <title>batonq</title>
+  <rect x="28" y="54" width="64" height="12" rx="6" fill="currentColor"/>
+  <circle cx="28" cy="60" r="14" fill="currentColor"/>
+  <circle cx="92" cy="60" r="14" fill="none" stroke="currentColor" stroke-width="4"/>
+</svg>

@@ -1,0 +1,434 @@
+#!/usr/bin/env bun
+// agent-coord-hook — unified hook binary.
+// Layer 1: measurement (append-only JSONL, identical to v0.1 — no behavior change).
+// Layer 2: coordination (atomic claim/release in SQLite, blocking on conflict).
+//
+// Discipline: exit 0 always unless emitting a deny via hookSpecificOutput JSON.
+// On deny: emit JSON to stdout, still exit 0. On any internal error: fail open.
+//
+// Liveness note: R10's spec called for (pid, start_time) tuples. Claude Code's hook
+// payload does not expose the Claude process PID reliably (process.ppid is the shell,
+// not Claude). We use heartbeat-based liveness instead: session.last_seen updates on
+// every tool call; claims expire after TTL when no heartbeat refreshes them. Trade-off
+// documented in peer-review-agent-coord.md Timeline.
+
+import { Database } from "bun:sqlite";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, readFileSync, appendFileSync, mkdirSync, statSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { isAbsolute, resolve, basename } from "node:path";
+import { homedir } from "node:os";
+
+const MODE = process.argv[2]; // pre | post | bash
+const HOME = homedir();
+const LOG_DIR = `${HOME}/.claude/agent-coord-measurement`;
+const LOG_PATH = `${LOG_DIR}/events.jsonl`;
+const DB_PATH = `${HOME}/.claude/agent-coord-state.db`;
+const SCOPE_PREFIXES = [`${HOME}/DEV/`, `${HOME}/dev/`];
+const MAX_HASH_BYTES = 1_048_576;
+const TTL_MS = 10 * 60_000; // 10 min heartbeat window
+const DESTRUCTIVE =
+  /\b(rm|mv|truncate|shred)\b|(^|[\s;&|])>\s*[^\s&|;]|\bgit\s+reset\s+--hard\b|\bgit\s+checkout\s+--\s|\bdd\s+of=/;
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+function inScope(path: string): boolean {
+  return SCOPE_PREFIXES.some((p) => path.startsWith(p));
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function resolveGitRoot(cwd: string): string | null {
+  try {
+    const out = execSync("git rev-parse --show-toplevel", {
+      cwd,
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1000,
+    })
+      .toString()
+      .trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+// Repo fingerprint per R10: `sha256(remote.origin.url + "|" + first-commit-SHA)`.
+// Invariant across worktree siblings AND across separate clones of the same remote.
+// Falls back to toplevel path if no remote.
+//
+// Cached in ~/.claude/agent-coord-fingerprint.json keyed by gitRoot to avoid
+// 30ms of git subprocess overhead per hook invocation.
+const FINGERPRINT_CACHE_PATH = `${HOME}/.claude/agent-coord-fingerprint.json`;
+
+function computeFingerprint(gitRoot: string): string {
+  // cache hit?
+  try {
+    if (existsSync(FINGERPRINT_CACHE_PATH)) {
+      const cache = JSON.parse(readFileSync(FINGERPRINT_CACHE_PATH, "utf8"));
+      if (cache[gitRoot]) return cache[gitRoot];
+    }
+  } catch {
+    // fall through
+  }
+  // compute — combine both git calls into one spawn via sh -c
+  let fp = "path:" + gitRoot;
+  try {
+    const out = execSync(
+      `git config --get remote.origin.url 2>/dev/null; echo "---"; git rev-list --max-parents=0 HEAD 2>/dev/null | head -1`,
+      { cwd: gitRoot, stdio: ["ignore", "pipe", "ignore"], timeout: 800, shell: "/bin/sh" }
+    ).toString();
+    const [remote, firstCommit] = out.split("---\n").map((s) => s.trim());
+    if (remote && firstCommit) {
+      fp = createHash("sha256").update(`${remote}|${firstCommit}`).digest("hex").slice(0, 16);
+    }
+  } catch {
+    // fall through
+  }
+  // persist cache
+  try {
+    const cache = existsSync(FINGERPRINT_CACHE_PATH)
+      ? JSON.parse(readFileSync(FINGERPRINT_CACHE_PATH, "utf8"))
+      : {};
+    cache[gitRoot] = fp;
+    appendFileSync(FINGERPRINT_CACHE_PATH, ""); // ensure exists
+    Bun.write(FINGERPRINT_CACHE_PATH, JSON.stringify(cache, null, 2));
+  } catch {
+    // non-fatal
+  }
+  return fp;
+}
+
+function hashFile(path: string): string | null {
+  try {
+    if (!existsSync(path)) return null;
+    const size = statSync(path).size;
+    const h = createHash("sha256");
+    if (size <= MAX_HASH_BYTES) {
+      h.update(readFileSync(path));
+    } else {
+      const buf = readFileSync(path);
+      h.update(buf.subarray(0, MAX_HASH_BYTES));
+      h.update(`|size=${size}`);
+    }
+    return "sha256:" + h.digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+function extractBashPaths(cmd: string, cwd: string): string[] {
+  const tokens = cmd
+    .replace(/[|;&<>]/g, " ")
+    .split(/\s+/)
+    .map((t) => t.replace(/^['"]|['"]$/g, ""))
+    .filter(
+      (t) =>
+        t &&
+        !t.startsWith("-") &&
+        !/^(rm|mv|cp|dd|git|reset|hard|of|checkout|truncate|shred|sudo|sh|bash|zsh|echo)$/i.test(t) &&
+        (t.includes("/") || t.includes("."))
+    );
+  return tokens
+    .map((t) => (isAbsolute(t) ? t : resolve(cwd, t)))
+    .filter((p) => {
+      try {
+        return existsSync(p);
+      } catch {
+        return false;
+      }
+    });
+}
+
+function uuidv7(): string {
+  const now = BigInt(Date.now());
+  const bytes = new Uint8Array(16);
+  const dv = new DataView(bytes.buffer);
+  dv.setUint32(0, Number((now >> 16n) & 0xffffffffn), false);
+  dv.setUint16(4, Number(now & 0xffffn), false);
+  const rand = randomBytes(10);
+  for (let i = 0; i < 10; i++) bytes[6 + i] = rand[i];
+  bytes[6] = (bytes[6] & 0x0f) | 0x70;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+// ── SQLite setup ───────────────────────────────────────────────────────────────
+
+function openDb(): Database {
+  const db = new Database(DB_PATH, { create: true });
+  db.exec(`
+    PRAGMA journal_mode=WAL;
+    PRAGMA busy_timeout=3000;
+    PRAGMA synchronous=NORMAL;
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      session_id TEXT PRIMARY KEY,
+      cwd TEXT,
+      started_at TEXT NOT NULL,
+      last_seen TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS claims (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fingerprint TEXT NOT NULL,
+      file_path TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      acquired_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      released_at TEXT,
+      release_hash TEXT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_active_claim
+      ON claims(fingerprint, file_path)
+      WHERE released_at IS NULL;
+
+    CREATE INDEX IF NOT EXISTS idx_claim_file
+      ON claims(fingerprint, file_path, released_at);
+
+    CREATE INDEX IF NOT EXISTS idx_claim_session
+      ON claims(session_id, released_at);
+  `);
+  return db;
+}
+
+function touchSession(db: Database, session: string, cwd: string): void {
+  const now = nowIso();
+  db.run(
+    `INSERT INTO sessions (session_id, cwd, started_at, last_seen)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(session_id) DO UPDATE SET last_seen = excluded.last_seen, cwd = excluded.cwd`,
+    [session, cwd, now, now]
+  );
+}
+
+function sweepStale(db: Database): void {
+  const now = nowIso();
+  db.run(`UPDATE claims SET released_at = ? WHERE released_at IS NULL AND expires_at < ?`, [now, now]);
+  // Clean up sessions not seen in 30 min (hard TTL)
+  const cutoff = new Date(Date.now() - 30 * 60_000).toISOString();
+  db.run(`DELETE FROM sessions WHERE last_seen < ?`, [cutoff]);
+}
+
+function refreshHolderClaims(db: Database, session: string): void {
+  const newExpiry = new Date(Date.now() + TTL_MS).toISOString();
+  db.run(
+    `UPDATE claims SET expires_at = ? WHERE session_id = ? AND released_at IS NULL`,
+    [newExpiry, session]
+  );
+}
+
+function emitDeny(reason: string): never {
+  console.log(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: reason,
+      },
+    })
+  );
+  process.exit(0);
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────────
+
+async function main() {
+  const raw = await Bun.stdin.text();
+  if (!raw.trim()) return;
+  const payload = JSON.parse(raw);
+
+  const session: string = payload.session_id ?? "unknown";
+  const cwd: string = payload.cwd ?? process.cwd();
+  const tool: string = payload.tool_name ?? "unknown";
+  const toolInput = payload.tool_input ?? {};
+
+  const gitRoot = resolveGitRoot(cwd);
+  if (!gitRoot || !inScope(gitRoot + "/")) return;
+
+  let paths: string[] = [];
+  let bashPattern: string | undefined;
+
+  if (MODE === "bash") {
+    const cmd = toolInput.command ?? "";
+    const m = cmd.match(DESTRUCTIVE);
+    if (!m) return;
+    bashPattern = m[0].trim();
+    paths = extractBashPaths(cmd, cwd).filter(inScope);
+    if (!paths.length) return;
+  } else {
+    const fp = toolInput.file_path;
+    if (!fp || typeof fp !== "string") return;
+    const abs = isAbsolute(fp) ? fp : resolve(cwd, fp);
+    if (!inScope(abs)) return;
+    paths = [abs];
+  }
+
+  const hashes: Record<string, string | null> = {};
+  for (const p of paths) hashes[p] = hashFile(p);
+
+  // ── Layer 1: measurement log (unchanged) ──────────────────────────────────
+  const event: Record<string, unknown> = {
+    event_id: uuidv7(),
+    ts: nowIso(),
+    phase: MODE === "post" ? "post" : "pre",
+    session,
+    cwd,
+    git_root: gitRoot,
+    tool,
+    paths,
+    hashes,
+  };
+  if (bashPattern) event.bash_pattern = bashPattern;
+
+  if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 });
+  appendFileSync(LOG_PATH, JSON.stringify(event) + "\n", { mode: 0o600 });
+
+  // ── Layer 2: coordination ─────────────────────────────────────────────────
+  // Fast path: Read doesn't need fingerprint, SQLite writes, or sweep.
+  // Just update last_seen (which sweepStale consults) and return.
+  if (MODE === "pre" && tool === "Read") {
+    const dbFast = openDb();
+    try {
+      touchSession(dbFast, session, cwd);
+    } finally {
+      dbFast.close();
+    }
+    return;
+  }
+
+  const db = openDb();
+  try {
+    const fingerprint = computeFingerprint(gitRoot);
+    touchSession(db, session, cwd);
+    sweepStale(db);
+    refreshHolderClaims(db, session);
+
+    if (MODE === "pre") {
+      if (!["Edit", "Write", "MultiEdit"].includes(tool)) return;
+
+      db.run("BEGIN IMMEDIATE");
+      try {
+        const conflictDenies: string[] = [];
+        for (const p of paths) {
+          // Hard block: conflict with another live session
+          const active = db
+            .query(
+              `SELECT c.*, s.cwd AS holder_cwd FROM claims c
+               LEFT JOIN sessions s ON s.session_id = c.session_id
+               WHERE c.fingerprint = ? AND c.file_path = ? AND c.released_at IS NULL`
+            )
+            .get(fingerprint, p) as any;
+          if (active && active.session_id !== session) {
+            const ageSec = Math.round((Date.now() - Date.parse(active.acquired_at)) / 1000);
+            conflictDenies.push(
+              `${basename(p)} held by session ${active.session_id.slice(0, 8)} (${active.holder_cwd ?? "?"}, ${ageSec}s ago)`
+            );
+            continue;
+          }
+          // Hash-mismatch on self re-claim — DOWNGRADED from deny to silent info.
+          //
+          // Rationale: the original VS-Code-edit detection fires false positives whenever
+          // another hook mutates the file between our post-hook and next pre-hook. With
+          // autoformat (Prettier) running in the PostToolUse chain, every self re-claim
+          // after a Write/Edit sees a different hash. Blocking here prevented the agent
+          // from editing its own files after any formatting.
+          //
+          // We keep the detection logic (could be reinstated as a log-only counter in the
+          // measurement layer later) but it no longer blocks. Cross-session collisions
+          // above remain hard blocks — those are real concurrency, not formatting drift.
+          const lastOwn = db
+            .query(
+              `SELECT * FROM claims WHERE fingerprint = ? AND file_path = ? AND session_id = ?
+               AND released_at IS NOT NULL ORDER BY released_at DESC LIMIT 1`
+            )
+            .get(fingerprint, p, session) as any;
+          if (
+            lastOwn &&
+            lastOwn.release_hash &&
+            hashes[p] &&
+            lastOwn.release_hash !== hashes[p]
+          ) {
+            // no-op: benign drift, likely autoformat or external editor. Not blocking.
+          }
+        }
+
+        if (conflictDenies.length) {
+          db.run("ROLLBACK");
+          emitDeny(
+            conflictDenies.join("; ") +
+              ". Run `agent-coord status` to inspect; `agent-coord release <file>` if the holder's session is actually dead."
+          );
+        }
+
+        // Grant all claims atomically
+        const expiresAt = new Date(Date.now() + TTL_MS).toISOString();
+        for (const p of paths) {
+          const mine = db
+            .query(
+              `SELECT 1 FROM claims WHERE fingerprint = ? AND file_path = ? AND session_id = ? AND released_at IS NULL`
+            )
+            .get(fingerprint, p, session);
+          if (mine) continue;
+          db.run(
+            `INSERT INTO claims (fingerprint, file_path, session_id, acquired_at, expires_at)
+             VALUES (?, ?, ?, ?, ?)`,
+            [fingerprint, p, session, nowIso(), expiresAt]
+          );
+        }
+        db.run("COMMIT");
+      } catch (e) {
+        try {
+          db.run("ROLLBACK");
+        } catch {}
+        // fail-open — allow the tool to run
+      }
+    } else if (MODE === "post") {
+      if (!["Edit", "Write", "MultiEdit"].includes(tool)) return;
+      for (const p of paths) {
+        db.run(
+          `UPDATE claims SET released_at = ?, release_hash = ?
+           WHERE fingerprint = ? AND file_path = ? AND session_id = ? AND released_at IS NULL`,
+          [nowIso(), hashes[p], fingerprint, p, session]
+        );
+      }
+    } else if (MODE === "bash") {
+      if (!bashPattern) return;
+      const denies: string[] = [];
+      for (const p of paths) {
+        const active = db
+          .query(
+            `SELECT c.*, s.cwd AS holder_cwd FROM claims c
+             LEFT JOIN sessions s ON s.session_id = c.session_id
+             WHERE c.fingerprint = ? AND c.file_path = ? AND c.released_at IS NULL AND c.session_id != ?`
+          )
+          .get(fingerprint, p, session) as any;
+        if (active) {
+          denies.push(
+            `${basename(p)} held by session ${active.session_id.slice(0, 8)} (${active.holder_cwd ?? "?"})`
+          );
+        }
+      }
+      if (denies.length) {
+        emitDeny(
+          `Destructive Bash (pattern: '${bashPattern}') blocked — ${denies.join("; ")}. Run \`agent-coord status\` to inspect.`
+        );
+      }
+    }
+  } finally {
+    db.close();
+  }
+}
+
+try {
+  await main();
+} catch {
+  // fail-open per hook discipline
+}
+process.exit(0);

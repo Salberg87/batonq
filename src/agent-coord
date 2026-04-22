@@ -1,0 +1,1037 @@
+#!/usr/bin/env bun
+// agent-coord — CLI for measurement + coordination.
+// Commands: check | tail | report | status | release | sweep
+
+import { Database } from "bun:sqlite";
+import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync } from "node:fs";
+import { execSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { basename, isAbsolute, resolve } from "node:path";
+import { homedir } from "node:os";
+
+const HOME = homedir();
+const LOG_DIR = `${HOME}/.claude/agent-coord-measurement`;
+const LOG_PATH = `${LOG_DIR}/events.jsonl`;
+const DB_PATH = `${HOME}/.claude/agent-coord-state.db`;
+const HOOK_PATH = `${HOME}/bin/agent-coord-hook`;
+const SETTINGS_PATH = `${HOME}/.claude/settings.json`;
+const TASKS_PATH = `${HOME}/DEV/TASKS.md`;
+
+const cmd = process.argv[2];
+
+switch (cmd) {
+  case "check":
+    check();
+    break;
+  case "tail":
+    tail();
+    break;
+  case "report":
+    report();
+    break;
+  case "status":
+    status();
+    break;
+  case "release":
+    release(process.argv[3]);
+    break;
+  case "sweep":
+    sweepCmd();
+    break;
+  case "sync-tasks":
+    syncTasks(true);
+    break;
+  case "pick":
+    pickTask();
+    break;
+  case "mine":
+    mineTask();
+    break;
+  case "done":
+    doneTask(process.argv[3]);
+    break;
+  case "abandon":
+    abandonTask(process.argv[3]);
+    break;
+  case "tasks":
+    listTasks();
+    break;
+  default:
+    console.error(
+      "usage: agent-coord\n" +
+        "  Coordination:  check | status | release <path> | sweep\n" +
+        "  Measurement:   tail [-n N] | report [--since ISO] [--until ISO] [--json]\n" +
+        "  Tasks:         sync-tasks | pick | mine | done [<id>] | abandon [<id>] | tasks"
+    );
+    process.exit(2);
+}
+
+// ── check ─────────────────────────────────────────────────────────────────────
+
+function check() {
+  let green = true;
+  const ok = (m: string) => console.log("  ok   " + m);
+  const bad = (m: string) => {
+    console.error("  FAIL " + m);
+    green = false;
+  };
+  const warn = (m: string) => console.log("  warn " + m);
+
+  if (existsSync(HOOK_PATH)) {
+    const mode = statSync(HOOK_PATH).mode & 0o111;
+    if (mode) ok(`hook binary executable: ${HOOK_PATH}`);
+    else bad(`hook binary not executable: ${HOOK_PATH}`);
+  } else bad(`hook binary missing: ${HOOK_PATH}`);
+
+  if (existsSync(SETTINGS_PATH)) {
+    try {
+      const cfg = JSON.parse(readFileSync(SETTINGS_PATH, "utf8"));
+      const pre = cfg.hooks?.PreToolUse ?? [];
+      const post = cfg.hooks?.PostToolUse ?? [];
+      const has = (arr: any[], pat: RegExp) =>
+        arr.some((b: any) =>
+          b.hooks?.some((h: any) => typeof h.command === "string" && pat.test(h.command))
+        );
+      if (has(pre, /agent-coord-hook pre/)) ok("PreToolUse hook (pre) configured");
+      else bad("PreToolUse hook (pre) NOT configured");
+      if (has(pre, /agent-coord-hook bash/)) ok("PreToolUse hook (bash) configured");
+      else bad("PreToolUse hook (bash) NOT configured");
+      if (has(post, /agent-coord-hook post/)) ok("PostToolUse hook (post) configured");
+      else bad("PostToolUse hook (post) NOT configured");
+    } catch (e: any) {
+      bad(`could not parse settings.json: ${e.message}`);
+    }
+  } else bad(`settings.json missing: ${SETTINGS_PATH}`);
+
+  if (!existsSync(LOG_DIR)) {
+    try {
+      mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 });
+      ok(`created log dir: ${LOG_DIR}`);
+    } catch (e: any) {
+      bad(`could not create log dir: ${e.message}`);
+    }
+  } else ok(`log dir exists: ${LOG_DIR}`);
+
+  for (const [name, c] of [
+    ["bun", "bun --version"],
+    ["git", "git --version"],
+  ] as const) {
+    try {
+      const v = execSync(c, { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+      ok(`${name}: ${v}`);
+    } catch {
+      bad(`${name} not on PATH`);
+    }
+  }
+  try {
+    const v = execSync("claude --version", { stdio: ["ignore", "pipe", "ignore"] })
+      .toString()
+      .trim();
+    ok(`claude: ${v}`);
+  } catch {
+    warn("claude CLI version could not be detected (non-fatal)");
+  }
+
+  if (existsSync(LOG_PATH)) {
+    ok(`events log: ${LOG_PATH} (${Math.round(statSync(LOG_PATH).size / 1024)} KB)`);
+  } else warn(`events log not created yet — will appear on first in-scope tool call`);
+
+  if (existsSync(DB_PATH)) {
+    ok(`state.db: ${DB_PATH} (${Math.round(statSync(DB_PATH).size / 1024)} KB)`);
+  } else warn(`state.db not created yet — will appear on first in-scope tool call`);
+
+  process.exit(green ? 0 : 1);
+}
+
+// ── tail ──────────────────────────────────────────────────────────────────────
+
+function tail() {
+  const nIdx = process.argv.indexOf("-n");
+  const n = nIdx > 0 ? parseInt(process.argv[nIdx + 1] ?? "50", 10) || 50 : 50;
+  if (!existsSync(LOG_PATH)) {
+    console.log("(no events yet)");
+    return;
+  }
+  const lines = readFileSync(LOG_PATH, "utf8").trim().split("\n").slice(-n);
+  for (const l of lines) {
+    let e: any;
+    try {
+      e = JSON.parse(l);
+    } catch {
+      continue;
+    }
+    const repo = e.git_root ? basename(e.git_root) : "?";
+    const rel = (e.paths ?? [])
+      .map((p: string) => (e.git_root ? p.replace(e.git_root + "/", "") : p))
+      .join(", ");
+    const pat = e.bash_pattern ? ` [${e.bash_pattern}]` : "";
+    console.log(
+      `${e.ts.slice(11, 19)}  ${String(e.session).slice(0, 8)}  ${e.tool.padEnd(9)} ${e.phase.padEnd(4)} ${repo}/${rel}${pat}`
+    );
+  }
+}
+
+// ── status ────────────────────────────────────────────────────────────────────
+
+function status() {
+  if (!existsSync(DB_PATH)) {
+    console.log("(no state.db yet — no activity)");
+    return;
+  }
+  const db = new Database(DB_PATH, { readonly: true });
+  const sessions = db
+    .query("SELECT * FROM sessions ORDER BY last_seen DESC")
+    .all() as any[];
+  console.log(`Sessions (${sessions.length}):`);
+  for (const s of sessions) {
+    const ageS = Math.round((Date.now() - Date.parse(s.last_seen)) / 1000);
+    const stale = ageS > 600 ? " STALE" : "";
+    console.log(`  ${s.session_id.slice(0, 10)}  cwd=${s.cwd}  last_seen=${ageS}s ago${stale}`);
+  }
+  console.log();
+  const claims = db
+    .query(
+      `SELECT c.*, s.cwd FROM claims c
+       LEFT JOIN sessions s ON s.session_id = c.session_id
+       WHERE c.released_at IS NULL
+       ORDER BY c.acquired_at`
+    )
+    .all() as any[];
+  console.log(`Active claims (${claims.length}):`);
+  for (const c of claims) {
+    const ageS = Math.round((Date.now() - Date.parse(c.acquired_at)) / 1000);
+    const expS = Math.round((Date.parse(c.expires_at) - Date.now()) / 1000);
+    console.log(
+      `  ${c.file_path}  →  ${c.session_id.slice(0, 10)}  (held ${ageS}s, expires in ${expS}s)`
+    );
+  }
+  db.close();
+}
+
+// ── release ───────────────────────────────────────────────────────────────────
+
+function release(path: string | undefined) {
+  if (!path) {
+    console.error("usage: agent-coord release <path>");
+    process.exit(2);
+  }
+  if (!existsSync(DB_PATH)) {
+    console.log("(no state.db — nothing to release)");
+    return;
+  }
+  const abs = isAbsolute(path) ? path : resolve(process.cwd(), path);
+  const db = new Database(DB_PATH);
+  const r = db.run(
+    `UPDATE claims SET released_at = ? WHERE file_path = ? AND released_at IS NULL`,
+    [new Date().toISOString(), abs]
+  );
+  console.log(`Released ${r.changes} active claim(s) on ${abs}`);
+  db.close();
+}
+
+// ── sweep ─────────────────────────────────────────────────────────────────────
+
+function sweepCmd() {
+  if (!existsSync(DB_PATH)) {
+    console.log("(no state.db — nothing to sweep)");
+    return;
+  }
+  const db = new Database(DB_PATH);
+  const now = new Date().toISOString();
+  const expired = db.run(
+    `UPDATE claims SET released_at = ? WHERE released_at IS NULL AND expires_at < ?`,
+    [now, now]
+  );
+  const cutoff = new Date(Date.now() - 30 * 60_000).toISOString();
+  const staleS = db.run(`DELETE FROM sessions WHERE last_seen < ?`, [cutoff]);
+  console.log(`Swept: ${expired.changes} expired claim(s), ${staleS.changes} stale session(s).`);
+  db.close();
+}
+
+// ── tasks ─────────────────────────────────────────────────────────────────────
+
+interface ParsedTask {
+  repo: string;
+  body: string;
+  status: "pending" | "claimed" | "done";
+  lineIdx: number;
+  verifyCmd?: string;
+  judgeCmd?: string;
+}
+
+function parseTasksFile(): { lines: string[]; tasks: ParsedTask[] } {
+  if (!existsSync(TASKS_PATH)) return { lines: [], tasks: [] };
+  const text = readFileSync(TASKS_PATH, "utf8");
+  const lines = text.split("\n");
+  const tasks: ParsedTask[] = [];
+  const taskRe = /^- \[([ x~])\] (?:\d{4}-\d{2}-\d{2} )?\*\*([^*]+)\*\*\s*[—–-]+\s*(.+?)(?:\s*\([^)]*\))?$/;
+  const verifyRe = /^\s+verify:\s*(.+?)\s*$/;
+  const judgeRe = /^\s+judge:\s*(.+?)\s*$/;
+  let inHtmlComment = false;
+  let inCodeFence = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!inHtmlComment && /^\s*```/.test(line)) {
+      inCodeFence = !inCodeFence;
+      continue;
+    }
+    if (inCodeFence) continue;
+    if (!inHtmlComment && line.includes("<!--")) {
+      if (line.includes("-->")) continue;
+      inHtmlComment = true;
+      continue;
+    }
+    if (inHtmlComment) {
+      if (line.includes("-->")) inHtmlComment = false;
+      continue;
+    }
+    const m = line.match(taskRe);
+    if (!m) continue;
+    const status = m[1] === " " ? "pending" : m[1] === "~" ? "claimed" : "done";
+    // Look ahead for verify: and judge: lines (indented, directly under the task)
+    let verifyCmd: string | undefined;
+    let judgeCmd: string | undefined;
+    let nextIdx = i + 1;
+    if (nextIdx < lines.length) {
+      const vm = lines[nextIdx].match(verifyRe);
+      if (vm) verifyCmd = vm[1];
+      else {
+        const jm = lines[nextIdx].match(judgeRe);
+        if (jm) judgeCmd = jm[1];
+      }
+    }
+    // Check for judge: if verify was on i+1
+    if (nextIdx + 1 < lines.length && verifyCmd) {
+      const jm = lines[nextIdx + 1].match(judgeRe);
+      if (jm) judgeCmd = jm[1];
+    }
+    tasks.push({
+      repo: m[2].trim(),
+      body: m[3].trim(),
+      status,
+      lineIdx: i,
+      verifyCmd,
+      judgeCmd,
+    });
+  }
+  return { lines, tasks };
+}
+
+function externalId(repo: string, body: string): string {
+  return createHash("sha256").update(`${repo}|${body}`).digest("hex").slice(0, 12);
+}
+
+function initTaskSchema(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      external_id TEXT UNIQUE NOT NULL,
+      repo TEXT NOT NULL,
+      body TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      claimed_by TEXT,
+      claimed_at TEXT,
+      completed_at TEXT,
+      created_at TEXT NOT NULL,
+      verify_cmd TEXT,
+      verify_output TEXT,
+      verify_ran_at TEXT,
+      judge_cmd TEXT,
+      judge_output TEXT,
+      judge_ran_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status);
+    CREATE INDEX IF NOT EXISTS idx_task_repo_status ON tasks(repo, status);
+  `);
+  // Migration for pre-existing DBs that lack verify_* and judge_* columns
+  const cols = db.query("SELECT name FROM pragma_table_info('tasks')").all() as { name: string }[];
+  const has = (n: string) => cols.some((c) => c.name === n);
+  if (!has("verify_cmd")) db.exec("ALTER TABLE tasks ADD COLUMN verify_cmd TEXT");
+  if (!has("verify_output")) db.exec("ALTER TABLE tasks ADD COLUMN verify_output TEXT");
+  if (!has("verify_ran_at")) db.exec("ALTER TABLE tasks ADD COLUMN verify_ran_at TEXT");
+  if (!has("judge_cmd")) db.exec("ALTER TABLE tasks ADD COLUMN judge_cmd TEXT");
+  if (!has("judge_output")) db.exec("ALTER TABLE tasks ADD COLUMN judge_output TEXT");
+  if (!has("judge_ran_at")) db.exec("ALTER TABLE tasks ADD COLUMN judge_ran_at TEXT");
+}
+
+function openTaskDb(): Database {
+  const db = new Database(DB_PATH, { create: true });
+  db.exec("PRAGMA busy_timeout=3000;");
+  initTaskSchema(db);
+  return db;
+}
+
+function syncTasks(verbose: boolean): { added: number; completed: number; parsed: number } {
+  const { tasks: parsed } = parseTasksFile();
+  const db = openTaskDb();
+  let added = 0;
+  let completed = 0;
+  const now = new Date().toISOString();
+  try {
+    for (const t of parsed) {
+      const eid = externalId(t.repo, t.body);
+      const existing = db.query("SELECT * FROM tasks WHERE external_id = ?").get(eid) as any;
+      const verify = t.verifyCmd ?? null;
+      const judge = t.judgeCmd ?? null;
+      if (!existing) {
+        db.run(
+          `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [eid, t.repo, t.body, t.status === "done" ? "done" : "pending", now, verify, judge]
+        );
+        if (t.status !== "done") added++;
+      } else {
+        if (t.status === "done" && existing.status !== "done") {
+          db.run(
+            `UPDATE tasks SET status = 'done', completed_at = ? WHERE external_id = ?`,
+            [now, eid]
+          );
+          completed++;
+        }
+        // Keep verify_cmd and judge_cmd in sync — Fredrik may add/edit them on an already-synced task
+        if (verify !== existing.verify_cmd) {
+          db.run(`UPDATE tasks SET verify_cmd = ? WHERE external_id = ?`, [verify, eid]);
+        }
+        if (judge !== existing.judge_cmd) {
+          db.run(`UPDATE tasks SET judge_cmd = ? WHERE external_id = ?`, [judge, eid]);
+        }
+      }
+    }
+  } finally {
+    db.close();
+  }
+  if (verbose) {
+    console.log(
+      `Synced ${parsed.length} task(s) from ${TASKS_PATH}: ${added} new, ${completed} newly marked done.`
+    );
+  }
+  return { added, completed, parsed: parsed.length };
+}
+
+function getRepoForCwd(): string | null {
+  try {
+    const root = execSync("git rev-parse --show-toplevel", {
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+    return root ? basename(root) : null;
+  } catch {
+    return null;
+  }
+}
+
+function currentSession(): string {
+  // Session identifier per terminal: TTY + shell PID.
+  // Not Claude's session_id (not available here), but stable within a single Warp tab's lifetime.
+  try {
+    const tty = execSync("tty", { stdio: ["ignore", "pipe", "ignore"] })
+      .toString()
+      .trim()
+      .replace("/dev/", "");
+    return `term_${tty}_${process.ppid}`;
+  } catch {
+    return `pid_${process.ppid}`;
+  }
+}
+
+function pickTask(): void {
+  syncTasks(false);
+  const db = openTaskDb();
+  try {
+    const repo = getRepoForCwd();
+    const session = currentSession();
+    const args = process.argv.slice(3);
+    const any = args.includes("--any");
+
+    let candidate: any = null;
+    if (any) {
+      // --any: plukk første pending uansett repo
+      candidate = db
+        .query(`SELECT * FROM tasks WHERE status = 'pending' ORDER BY id LIMIT 1`)
+        .get();
+    } else if (repo) {
+      // i et git-repo: plukk matchende eller any:*
+      candidate = db
+        .query(
+          `SELECT * FROM tasks WHERE status = 'pending' AND (repo = ? OR repo LIKE 'any:%') ORDER BY id LIMIT 1`
+        )
+        .get(repo);
+    } else {
+      // ikke i git, ikke --any: plukk bare any:* (aldri en repo-spesifikk task)
+      candidate = db
+        .query(
+          `SELECT * FROM tasks WHERE status = 'pending' AND repo LIKE 'any:%' ORDER BY id LIMIT 1`
+        )
+        .get();
+    }
+    if (!candidate) {
+      console.log("NO_TASK");
+      if (any) {
+        console.log(`No pending tasks in the queue at ${TASKS_PATH}`);
+      } else if (repo) {
+        console.log(`No pending tasks for repo "${repo}" (or any:* tasks). Queue: ${TASKS_PATH}`);
+      } else {
+        console.log(
+          `No pending any:* tasks (current cwd is not in a git-repo; use --any to pick any task, or cd into a repo).`
+        );
+      }
+      return;
+    }
+    const now = new Date().toISOString();
+    const result = db.run(
+      `UPDATE tasks SET status = 'claimed', claimed_by = ?, claimed_at = ?
+       WHERE id = ? AND status = 'pending'`,
+      [session, now, candidate.id]
+    );
+    if (result.changes === 0) {
+      console.log("NO_TASK");
+      console.log("Task was claimed by another session between sync and claim. Run /pick-next again.");
+      return;
+    }
+    console.log(`TASK_CLAIMED`);
+    console.log(`external_id: ${candidate.external_id}`);
+    console.log(`repo:        ${candidate.repo}`);
+    console.log(`session:     ${session}`);
+    console.log(``);
+    console.log(`TASK:`);
+    console.log(candidate.body);
+    console.log(``);
+    console.log(`When complete:   agent-coord done ${candidate.external_id}`);
+    console.log(`If abandoning:   agent-coord abandon ${candidate.external_id}`);
+  } finally {
+    db.close();
+  }
+}
+
+function mineTask(): void {
+  const db = openTaskDb();
+  const session = currentSession();
+  const mine = db
+    .query(`SELECT * FROM tasks WHERE status = 'claimed' AND claimed_by = ? ORDER BY claimed_at`)
+    .all(session) as any[];
+  const others = db
+    .query(`SELECT * FROM tasks WHERE status = 'claimed' AND claimed_by != ? ORDER BY claimed_at`)
+    .all(session) as any[];
+  console.log(`My claims (${mine.length}) — session ${session}:`);
+  for (const r of mine) {
+    const ageS = Math.round((Date.now() - Date.parse(r.claimed_at)) / 1000);
+    console.log(`  ${r.external_id}  [${r.repo}] ${r.body}  (${ageS}s ago)`);
+  }
+  if (others.length) {
+    console.log();
+    console.log(`Other sessions' claims (${others.length}):`);
+    for (const r of others) {
+      const ageS = Math.round((Date.now() - Date.parse(r.claimed_at)) / 1000);
+      console.log(`  ${r.external_id}  [${r.repo}] ${r.body}  — ${r.claimed_by}  (${ageS}s ago)`);
+    }
+  }
+  db.close();
+}
+
+function resolveRepoPath(repoName: string): string {
+  if (repoName.startsWith("any:")) return process.cwd();
+  for (const base of [`${HOME}/DEV`, `${HOME}/dev`]) {
+    const p = `${base}/${repoName}`;
+    if (existsSync(p)) {
+      try {
+        execSync("git rev-parse --show-toplevel", {
+          cwd: p,
+          stdio: ["ignore", "ignore", "ignore"],
+          timeout: 1000,
+        });
+        return p;
+      } catch {
+        // not a git repo, keep looking
+      }
+    }
+  }
+  return process.cwd();
+}
+
+function runVerify(cmd: string, cwd: string, taskId: string): { code: number; output: string } {
+  const MAX_OUTPUT = 1024 * 1024 * 4; // 4 MB
+  const result = spawnSync("/bin/sh", ["-c", cmd], {
+    cwd,
+    env: {
+      ...process.env,
+      AGENT_COORD_REPO_ROOT: cwd,
+      AGENT_COORD_TASK_ID: taskId,
+    },
+    timeout: 300_000, // 5 min
+    encoding: "utf8",
+    maxBuffer: MAX_OUTPUT,
+  });
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  const output = stdout + (stderr ? `\n[stderr]\n${stderr}` : "");
+  let code: number;
+  if (result.error && (result.error as any).code === "ETIMEDOUT") code = 124; // classic timeout exit
+  else if (result.signal) code = 128 + (result.signal === "SIGKILL" ? 9 : result.signal === "SIGTERM" ? 15 : 1);
+  else code = result.status ?? 1;
+  return { code, output };
+}
+
+function runJudge(judgePrompt: string, gitDiff: string, cwd: string): { passed: boolean; output: string } {
+  const MAX_OUTPUT = 1024 * 1024 * 4; // 4 MB
+  const prompt = `${judgePrompt}\n\n---\nGit diff:\n\`\`\`\n${gitDiff}\n\`\`\`\n\nRespond with PASS or FAIL on the first line, followed by a brief explanation.`;
+
+  const result = spawnSync("claude", ["-p", "-m", "haiku"], {
+    cwd,
+    input: prompt,
+    timeout: 120_000, // 2 min
+    encoding: "utf8",
+    maxBuffer: MAX_OUTPUT,
+  });
+
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  const output = stdout + (stderr ? `\n[stderr]\n${stderr}` : "");
+
+  const firstLine = (stdout ?? "").trim().split("\n")[0]?.toUpperCase() ?? "";
+  const passed = firstLine.startsWith("PASS");
+
+  return { passed, output };
+}
+
+function getGitDiffSinceClaim(cwd: string, claimedAt: string): string {
+  try {
+    // Get the commit hash that was at the claimed_at timestamp
+    const { stdout: commitHash } = spawnSync("git", ["rev-list", "-n", "1", `--before=${claimedAt}`, "HEAD"], {
+      cwd,
+      encoding: "utf8",
+    });
+    if (!commitHash?.trim()) {
+      // Fallback: if no commit before claimed_at, use the first commit in repo
+      const { stdout: firstCommit } = spawnSync("git", ["rev-list", "--max-parents=0", "HEAD"], {
+        cwd,
+        encoding: "utf8",
+      });
+      const baseCommit = firstCommit?.trim() || "";
+      if (!baseCommit) return "";
+      const { stdout: diff } = spawnSync("git", ["diff", baseCommit, "HEAD"], {
+        cwd,
+        encoding: "utf8",
+        maxBuffer: 1024 * 1024 * 2,
+      });
+      return diff ?? "";
+    }
+    const baseCommit = commitHash.trim();
+    const { stdout: diff } = spawnSync("git", ["diff", baseCommit, "HEAD"], {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024 * 2,
+    });
+    return diff ?? "";
+  } catch (e) {
+    return "";
+  }
+}
+
+function doneTask(id?: string): void {
+  const args = process.argv.slice(3);
+  const skipVerify = args.includes("--skip-verify");
+  if (skipVerify && process.env.AGENT_COORD_ALLOW_SKIP !== "1") {
+    console.error(
+      "--skip-verify requires AGENT_COORD_ALLOW_SKIP=1 (prevents autonomous agents from bypassing verify)"
+    );
+    process.exit(2);
+  }
+  // strip flag from id lookup
+  const positional = args.filter((a) => !a.startsWith("--"));
+  const explicitId = positional[0];
+  const db = openTaskDb();
+  try {
+    const session = currentSession();
+    let target: any;
+    if (explicitId ?? id) {
+      const wanted = explicitId ?? id;
+      target = db.query("SELECT * FROM tasks WHERE external_id = ?").get(wanted);
+      if (!target) {
+        console.error(`No task with external_id ${wanted}.`);
+        process.exit(1);
+      }
+    } else {
+      target = db
+        .query(
+          `SELECT * FROM tasks WHERE status = 'claimed' AND claimed_by = ? ORDER BY claimed_at DESC LIMIT 1`
+        )
+        .get(session);
+      if (!target) {
+        console.error(`No claimed task for this session. Pass the external_id explicitly.`);
+        process.exit(1);
+      }
+    }
+
+    // --- Verify gate ---
+    if (target.verify_cmd && !skipVerify) {
+      const repoPath = resolveRepoPath(target.repo);
+      console.log(`→ verify: ${target.verify_cmd}`);
+      console.log(`  (cwd: ${repoPath}, timeout: 300s)`);
+      console.log();
+      const { code, output } = runVerify(target.verify_cmd, repoPath, target.external_id);
+      const truncated = output.length > 80_000 ? output.slice(0, 80_000) + "\n[truncated]" : output;
+      process.stdout.write(truncated);
+      console.log();
+      db.run(
+        `UPDATE tasks SET verify_output = ?, verify_ran_at = ? WHERE id = ?`,
+        [truncated, new Date().toISOString(), target.id]
+      );
+      if (code !== 0) {
+        console.error(`✗ verify FAILED (exit ${code}). Task stays claimed.`);
+        console.error(`  Retry done after fixing, or: AGENT_COORD_ALLOW_SKIP=1 agent-coord done --skip-verify ${target.external_id} (logged as override)`);
+        console.error(`  Or release and re-queue: agent-coord abandon ${target.external_id}`);
+        process.exit(code);
+      }
+      console.log(`✓ verify passed.`);
+    } else if (target.verify_cmd && skipVerify) {
+      db.run(
+        `UPDATE tasks SET verify_output = ?, verify_ran_at = ? WHERE id = ?`,
+        [`[SKIPPED by --skip-verify]`, new Date().toISOString(), target.id]
+      );
+      console.log(`⚠ verify SKIPPED (--skip-verify). Override logged.`);
+    }
+
+    // --- Judge gate ---
+    if (target.judge_cmd && !skipVerify) {
+      const repoPath = resolveRepoPath(target.repo);
+      console.log(`→ judge: ${target.judge_cmd}`);
+      console.log(`  (cwd: ${repoPath})`);
+      console.log();
+
+      const gitDiff = getGitDiffSinceClaim(repoPath, target.claimed_at);
+      const { passed, output } = runJudge(target.judge_cmd, gitDiff, repoPath);
+
+      const truncated = output.length > 80_000 ? output.slice(0, 80_000) + "\n[truncated]" : output;
+      process.stdout.write(truncated);
+      console.log();
+
+      db.run(
+        `UPDATE tasks SET judge_output = ?, judge_ran_at = ? WHERE id = ?`,
+        [truncated, new Date().toISOString(), target.id]
+      );
+
+      if (!passed) {
+        console.error(`✗ judge FAILED. Task stays claimed.`);
+        console.error(`  Fix issues and retry: agent-coord done ${target.external_id}`);
+        console.error(`  Or release and re-queue: agent-coord abandon ${target.external_id}`);
+        process.exit(1);
+      }
+      console.log(`✓ judge passed.`);
+    }
+
+    db.run(
+      `UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?`,
+      [new Date().toISOString(), target.id]
+    );
+    rewriteMdTaskStatus(target.repo, target.body, "done");
+    console.log(`✓ done: [${target.repo}] ${target.body}`);
+  } finally {
+    db.close();
+  }
+}
+
+function abandonTask(id?: string): void {
+  const db = openTaskDb();
+  try {
+    const session = currentSession();
+    let target: any;
+    if (id) {
+      target = db.query("SELECT * FROM tasks WHERE external_id = ?").get(id);
+    } else {
+      target = db
+        .query(
+          `SELECT * FROM tasks WHERE status = 'claimed' AND claimed_by = ? ORDER BY claimed_at DESC LIMIT 1`
+        )
+        .get(session);
+    }
+    if (!target) {
+      console.error("No matching task.");
+      process.exit(1);
+    }
+    db.run(
+      `UPDATE tasks SET status = 'pending', claimed_by = NULL, claimed_at = NULL WHERE id = ?`,
+      [target.id]
+    );
+    console.log(`↺ abandoned (re-queued): [${target.repo}] ${target.body}`);
+  } finally {
+    db.close();
+  }
+}
+
+function listTasks(): void {
+  syncTasks(false);
+  const db = openTaskDb();
+  const groups: Array<["pending" | "claimed" | "done", string]> = [
+    ["pending", "Pending"],
+    ["claimed", "Claimed"],
+    ["done", "Done (recent)"],
+  ];
+  for (const [status, label] of groups) {
+    const rows = db
+      .query(
+        status === "done"
+          ? `SELECT * FROM tasks WHERE status = ? ORDER BY completed_at DESC LIMIT 10`
+          : `SELECT * FROM tasks WHERE status = ? ORDER BY id`
+      )
+      .all(status) as any[];
+    if (rows.length === 0) continue;
+    console.log(`${label} (${rows.length}):`);
+    for (const r of rows) {
+      const badge = status === "claimed" ? `[claimed by ${r.claimed_by.slice(0, 12)}]` : "";
+      console.log(`  ${r.external_id}  [${r.repo}] ${r.body}  ${badge}`);
+    }
+    console.log();
+  }
+  db.close();
+}
+
+function rewriteMdTaskStatus(repo: string, body: string, newStatus: "done" | "pending"): void {
+  const { lines, tasks } = parseTasksFile();
+  if (lines.length === 0) return;
+  const target = tasks.find((t) => t.repo === repo && t.body === body);
+  if (!target) return;
+  if (newStatus === "done") {
+    const date = new Date().toISOString().slice(0, 10);
+    lines[target.lineIdx] = `- [x] ${date} **${repo}** — ${body}`;
+  } else {
+    lines[target.lineIdx] = `- [ ] **${repo}** — ${body}`;
+  }
+  writeFileSync(TASKS_PATH, lines.join("\n"));
+}
+
+// ── report ────────────────────────────────────────────────────────────────────
+
+function report() {
+  if (!existsSync(LOG_PATH)) {
+    console.log("No events to report.");
+    return;
+  }
+  const sinceIdx = process.argv.indexOf("--since");
+  const untilIdx = process.argv.indexOf("--until");
+  const jsonOut = process.argv.includes("--json");
+  const since = sinceIdx > 0 ? Date.parse(process.argv[sinceIdx + 1]) : 0;
+  const until = untilIdx > 0 ? Date.parse(process.argv[untilIdx + 1]) : Infinity;
+
+  const events = readFileSync(LOG_PATH, "utf8")
+    .trim()
+    .split("\n")
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    })
+    .filter((e): e is any => e !== null)
+    .filter((e) => {
+      const t = Date.parse(e.ts);
+      return t >= since && t <= until;
+    });
+
+  if (events.length === 0) {
+    console.log("No events in window.");
+    return;
+  }
+
+  const sessions = new Set(events.map((e) => e.session));
+  const repos = new Set(events.map((e) => e.git_root).filter(Boolean));
+  const files = new Set(events.flatMap((e) => e.paths ?? []));
+  const editKinds = new Set(["Edit", "Write", "MultiEdit"]);
+  const editEvents = events.filter((e) => editKinds.has(e.tool));
+  const readEvents = events.filter((e) => e.tool === "Read");
+  const bashEvents = events.filter((e) => e.tool === "Bash");
+  const preEdits = editEvents.filter((e) => e.phase === "pre");
+
+  const collisions: any[] = [];
+  for (let i = 0; i < preEdits.length; i++) {
+    for (let j = i + 1; j < preEdits.length; j++) {
+      const a = preEdits[i];
+      const b = preEdits[j];
+      if (a.session === b.session) continue;
+      if (a.git_root !== b.git_root) continue;
+      const overlap = (a.paths ?? []).some((p: string) => (b.paths ?? []).includes(p));
+      if (!overlap) continue;
+      const dt = Math.abs(Date.parse(a.ts) - Date.parse(b.ts)) / 1000;
+      if (dt <= 300) collisions.push({ a, b, dt });
+    }
+  }
+
+  const drifts: any[] = [];
+  for (const r of readEvents) {
+    const p = r.paths?.[0];
+    if (!p) continue;
+    const rHash = r.hashes?.[p];
+    if (!rHash) continue;
+    const t1 = Date.parse(r.ts);
+    const write = preEdits
+      .filter((w) => w.session === r.session && (w.paths ?? []).includes(p))
+      .find((w) => {
+        const t2 = Date.parse(w.ts);
+        return t2 - t1 > 300_000 && w.hashes?.[p] && w.hashes[p] !== rHash;
+      });
+    if (write) drifts.push({ read: r, write });
+  }
+
+  const humanEdits: any[] = [];
+  const byPath: Record<string, any[]> = {};
+  for (const e of events) for (const p of e.paths ?? []) (byPath[p] ??= []).push(e);
+  for (const [p, hist] of Object.entries(byPath)) {
+    hist.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+    let lastPost: string | null = null;
+    for (const ev of hist) {
+      if (ev.phase === "pre" && editKinds.has(ev.tool)) {
+        const h = ev.hashes?.[p];
+        if (lastPost && h && h !== lastPost) humanEdits.push({ ev, path: p });
+      }
+      if (ev.phase === "post") {
+        const h = ev.hashes?.[p];
+        if (h) lastPost = h;
+      }
+    }
+  }
+
+  const destrOverShared: any[] = [];
+  const postEvents = events.filter((e) => e.phase === "post");
+  for (const b of bashEvents) {
+    const t = Date.parse(b.ts);
+    for (const p of b.paths ?? []) {
+      const prior = postEvents.find((e) => {
+        if (e.session === b.session) return false;
+        if (!(e.paths ?? []).includes(p)) return false;
+        const tp = Date.parse(e.ts);
+        return tp < t && t - tp <= 300_000;
+      });
+      if (prior) {
+        destrOverShared.push({ bash: b, write: prior, path: p });
+        break;
+      }
+    }
+  }
+
+  const wouldWarn = collisions.length + drifts.length;
+  const wouldBlock = collisions.length + destrOverShared.length;
+  const sum =
+    collisions.length + drifts.length + humanEdits.length + destrOverShared.length;
+  const maxSingle = Math.max(
+    collisions.length,
+    drifts.length,
+    humanEdits.length,
+    destrOverShared.length
+  );
+
+  let suggest: string;
+  if (sum < 10) suggest = "Ship §4C-v1 — low coordination pain.";
+  else if (maxSingle > 40) suggest = "Ship §4A-v2 — real concurrency pain.";
+  else suggest = "Middle zone — judgment call.";
+  if (sum > 0 && humanEdits.length / sum > 0.6)
+    suggest += " human_edits dominate — §4A-v2 hash-at-reacquire preferred.";
+  if (sum > 0 && destrOverShared.length / sum > 0.4)
+    suggest += " Bash-bypass is material.";
+
+  const claudeVer = (() => {
+    try {
+      return execSync("claude --version", { stdio: ["ignore", "pipe", "ignore"] })
+        .toString()
+        .trim();
+    } catch {
+      return "unknown";
+    }
+  })();
+
+  // Also pull DB-side stats (active claims, total released) for live ops
+  let dbStats: any = null;
+  if (existsSync(DB_PATH)) {
+    const db = new Database(DB_PATH, { readonly: true });
+    const activeClaims = (db.query("SELECT COUNT(*) AS n FROM claims WHERE released_at IS NULL").get() as any).n;
+    const totalClaims = (db.query("SELECT COUNT(*) AS n FROM claims").get() as any).n;
+    const totalSessions = (db.query("SELECT COUNT(*) AS n FROM sessions").get() as any).n;
+    dbStats = { activeClaims, totalClaims, totalSessions };
+    db.close();
+  }
+
+  if (jsonOut) {
+    console.log(
+      JSON.stringify(
+        {
+          window: { from: events[0].ts, to: events[events.length - 1].ts },
+          claude_version: claudeVer,
+          sessions: sessions.size,
+          repos: Array.from(repos).map((r) => basename(r as string)),
+          files: files.size,
+          counters: {
+            collisions: collisions.length,
+            drifts: drifts.length,
+            human_edits: humanEdits.length,
+            destructive_bash_total: bashEvents.length,
+            destructive_bash_over_shared: destrOverShared.length,
+            would_warn: wouldWarn,
+            would_block: wouldBlock,
+            hook_errors: 0,
+          },
+          db_stats: dbStats,
+          suggest,
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
+
+  console.log(`Measurement window: ${events[0].ts} → ${events[events.length - 1].ts}`);
+  console.log(`Claude Code version (now): ${claudeVer}`);
+  console.log(`Sessions observed: ${sessions.size}`);
+  console.log(
+    `Total events: ${editEvents.length} edit (pre+post), ${readEvents.length} read, ${bashEvents.length} destructive-bash`
+  );
+  console.log(`Unique files touched: ${files.size}`);
+  console.log(
+    `Unique repos: ${repos.size} (${Array.from(repos).map((r) => basename(r as string)).join(", ")})`
+  );
+  if (dbStats) {
+    console.log(
+      `Coord state: ${dbStats.activeClaims} active claim(s), ${dbStats.totalClaims} total, ${dbStats.totalSessions} session(s)`
+    );
+  }
+  console.log();
+  const row = (label: string, n: number, suf = "") =>
+    console.log(`  ${label.padEnd(34)} ${String(n).padStart(4)}  ${suf}`);
+  row("collisions:", collisions.length);
+  row("drifts:", drifts.length);
+  row("human_edits:", humanEdits.length);
+  row("destructive_bash_total:", bashEvents.length);
+  row("destructive_bash_over_shared:", destrOverShared.length);
+  row("would_warn:", wouldWarn, "(cry-wolf sim)");
+  row("would_block:", wouldBlock, "(false-deny sim)");
+  row("hook_errors:", 0);
+  console.log();
+  console.log(`Decision (thresholds 10/40):`);
+  console.log(`  sum = ${sum}, max single = ${maxSingle}`);
+  console.log(`  → ${suggest}`);
+
+  if (sum > 0) {
+    console.log();
+    console.log("Examples:");
+    const rel = (p: string, root: string) => p.replace(root + "/", "");
+    for (const c of collisions.slice(0, 3))
+      console.log(
+        `  collision: ${basename(c.a.git_root)}/${rel(c.a.paths[0], c.a.git_root)} (${c.a.session.slice(0, 6)}+${c.b.session.slice(0, 6)}, ${Math.round(c.dt)}s apart)`
+      );
+    for (const d of drifts.slice(0, 3)) {
+      const dt = Math.round((Date.parse(d.write.ts) - Date.parse(d.read.ts)) / 1000);
+      console.log(
+        `  drift: ${basename(d.read.git_root)}/${rel(d.read.paths[0], d.read.git_root)} (read at T, write at T+${dt}s, hash changed)`
+      );
+    }
+    for (const h of humanEdits.slice(0, 3))
+      console.log(
+        `  human_edit: ${basename(h.ev.git_root)}/${rel(h.path, h.ev.git_root)}`
+      );
+    for (const d of destrOverShared.slice(0, 3)) {
+      const dt = Math.round((Date.parse(d.bash.ts) - Date.parse(d.write.ts)) / 1000);
+      console.log(
+        `  destructive_bash_over_shared: ${basename(d.bash.git_root)}/${rel(d.path, d.bash.git_root)} (${d.bash.bash_pattern}, ${dt}s after other write)`
+      );
+    }
+  }
+}

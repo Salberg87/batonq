@@ -1,0 +1,4 @@
+#!/bin/sh
+# batonq — CLI wrapper. Delegates to src/agent-coord.
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+exec "$DIR/src/agent-coord" "$@"

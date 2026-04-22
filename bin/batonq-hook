@@ -1,0 +1,4 @@
+#!/bin/sh
+# batonq-hook — Claude Code hook binary. Delegates to src/agent-coord-hook.
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+exec "$DIR/src/agent-coord-hook" "$@"

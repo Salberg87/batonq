@@ -1,0 +1,52 @@
+{
+  "name": "batonq",
+  "version": "0.1.0",
+  "description": "A baton queue for parallel agents. Coordination as a primitive, not a platform.",
+  "license": "MIT",
+  "type": "module",
+  "author": "Fredrik Salberg",
+  "homepage": "https://github.com/fsalb/batonq",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fsalb/batonq.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fsalb/batonq/issues"
+  },
+  "keywords": [
+    "agent",
+    "claude-code",
+    "cli",
+    "task-queue",
+    "coordination",
+    "ai-agents",
+    "sqlite",
+    "flock"
+  ],
+  "bin": {
+    "batonq": "bin/batonq",
+    "batonq-hook": "bin/batonq-hook",
+    "batonq-loop": "bin/batonq-loop"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "docs/",
+    "examples/",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@types/react": "^19.2.14",
+    "ink": "^7.0.1",
+    "react": "^19.2.5"
+  }
+}

@@ -1,0 +1,4 @@
+#!/bin/sh
+# batonq-loop — fresh-Claude-per-task loop (Path A). Delegates to src/agent-coord-loop.
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+exec "$DIR/src/agent-coord-loop" "$@"
