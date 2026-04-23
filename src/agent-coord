@@ -15,6 +15,8 @@ import {
   selectCandidate,
   claimCandidate,
   runVerify,
+  runJudge,
+  getGitDiffSinceClaim,
   rewriteMdTaskStatus as rewriteMdTaskStatusCore,
   type ParsedTask,
 } from "./tasks-core";
@@ -415,96 +417,6 @@ function resolveRepoPath(repoName: string): string {
     }
   }
   return process.cwd();
-}
-
-function runJudge(judgePrompt: string, gitDiff: string, cwd: string): { passed: boolean; output: string } {
-  // Invariant: PASS requires result.status === 0 && !result.error FIRST — never
-  // trust stdout alone (a non-zero exit whose stdout contains "PASS" must NOT gate through).
-  const MAX_OUTPUT = 1024 * 1024 * 4; // 4 MB
-  const prompt = `${judgePrompt}\n\n---\nGit diff:\n\`\`\`\n${gitDiff}\n\`\`\`\n\nRespond with PASS or FAIL on the first line, followed by a brief explanation.`;
-
-  const result = spawnSync("claude", ["-p", "--model", "haiku"], {
-    cwd,
-    input: prompt,
-    timeout: 120_000, // 2 min
-    encoding: "utf8",
-    maxBuffer: MAX_OUTPUT,
-  });
-
-  const stdout = result.stdout ?? "";
-  const stderr = result.stderr ?? "";
-  const errCode = (result.error as NodeJS.ErrnoException | undefined)?.code;
-
-  // Timeout or SIGTERM-by-timeout → infra FAIL with clear message,
-  // never a silent PASS from partial stdout.
-  if (errCode === "ETIMEDOUT" || (result.error && result.signal === "SIGTERM")) {
-    return {
-      passed: false,
-      output: `[judge infra FAIL] claude timed out after 120s (ETIMEDOUT). ` +
-        `stdout=${stdout.length}b stderr=${stderr.length}b\n${stderr}`,
-    };
-  }
-
-  // Any other spawn error (ENOENT, EACCES, …) → FAIL. Don't trust stdout.
-  if (result.error) {
-    return {
-      passed: false,
-      output: `[judge infra FAIL] claude spawn error: ${result.error.message}\n${stderr}`,
-    };
-  }
-
-  const output = stdout + (stderr ? `\n[stderr]\n${stderr}` : "");
-  const firstLine = stdout.trim().split("\n")[0]?.toUpperCase() ?? "";
-
-  // Gate on subprocess success BEFORE inspecting the "PASS" text, so a
-  // non-zero exit whose stdout happens to contain "PASS" cannot open the gate.
-  const passed = result.status === 0 && !result.error && firstLine.startsWith("PASS");
-
-  return { passed, output };
-}
-
-function getGitDiffSinceClaim(cwd: string, claimedAt: string): string {
-  // Throws on any failure. doneTask catches and surfaces a judge FAIL with
-  // a clear message — we must NEVER feed an empty diff to the LLM (it will
-  // typically answer PASS on empty input, silently opening the gate).
-  const revListRes = spawnSync(
-    "git",
-    ["rev-list", "-n", "1", `--before=${claimedAt}`, "HEAD"],
-    { cwd, encoding: "utf8", timeout: 10_000 }
-  );
-  if (revListRes.error) throw new Error(`git rev-list failed: ${revListRes.error.message}`);
-
-  let baseCommit = revListRes.stdout?.trim() ?? "";
-  if (!baseCommit) {
-    // Fallback: no commit existed at claim time — diff from repo root.
-    const rootRes = spawnSync("git", ["rev-list", "--max-parents=0", "HEAD"], {
-      cwd,
-      encoding: "utf8",
-      timeout: 10_000,
-    });
-    if (rootRes.error) throw new Error(`git rev-list --max-parents=0 failed: ${rootRes.error.message}`);
-    baseCommit = rootRes.stdout?.trim() ?? "";
-    if (!baseCommit) {
-      throw new Error("no diff: could not resolve a base commit (empty repo?)");
-    }
-  }
-
-  const diffRes = spawnSync("git", ["diff", baseCommit, "HEAD"], {
-    cwd,
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 2,
-    timeout: 30_000,
-  });
-  if (diffRes.error) throw new Error(`git diff failed: ${diffRes.error.message}`);
-  if (typeof diffRes.status === "number" && diffRes.status !== 0) {
-    throw new Error(`git diff exited ${diffRes.status}: ${(diffRes.stderr ?? "").trim()}`);
-  }
-
-  const diff = diffRes.stdout ?? "";
-  if (!diff.trim()) {
-    throw new Error("no diff: no committed changes since claim (did you forget to commit?)");
-  }
-  return diff;
 }
 
 function doneTask(id?: string): void {

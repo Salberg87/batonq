@@ -303,6 +303,143 @@ export function runVerify(
   return { code, output };
 }
 
+// ── judge gate ────────────────────────────────────────────────────────────────
+
+export interface JudgeResult {
+  passed: boolean;
+  output: string;
+}
+
+// Spawn shape we actually depend on — a narrow subset of spawnSync's return,
+// so tests can inject a fake without pulling the whole child_process surface.
+export interface SpawnResult {
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  error?: (Error & { code?: string }) | null;
+}
+export type SpawnFn = (
+  cmd: string,
+  args: string[],
+  opts: { cwd: string; input?: string; timeout?: number; maxBuffer?: number },
+) => SpawnResult;
+
+function defaultSpawn(
+  cmd: string,
+  args: string[],
+  opts: { cwd: string; input?: string; timeout?: number; maxBuffer?: number },
+): SpawnResult {
+  const r = spawnSync(cmd, args, { ...opts, encoding: "utf8" });
+  return {
+    status: r.status,
+    signal: r.signal,
+    stdout: r.stdout ?? "",
+    stderr: r.stderr ?? "",
+    error: (r.error ?? null) as any,
+  };
+}
+
+export function runJudge(
+  judgePrompt: string,
+  gitDiff: string,
+  cwd: string,
+  spawn: SpawnFn = defaultSpawn,
+): JudgeResult {
+  // Invariant: PASS requires result.status === 0 && !result.error FIRST — never
+  // trust stdout alone (a non-zero exit whose stdout contains "PASS" must NOT gate through).
+  const MAX_OUTPUT = 1024 * 1024 * 4; // 4 MB
+  const prompt = `${judgePrompt}\n\n---\nGit diff:\n\`\`\`\n${gitDiff}\n\`\`\`\n\nRespond with PASS or FAIL on the first line, followed by a brief explanation.`;
+
+  const result = spawn("claude", ["-p", "--model", "haiku"], {
+    cwd,
+    input: prompt,
+    timeout: 120_000, // 2 min
+    maxBuffer: MAX_OUTPUT,
+  });
+
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  const errCode = result.error?.code;
+
+  if (
+    errCode === "ETIMEDOUT" ||
+    (result.error && result.signal === "SIGTERM")
+  ) {
+    return {
+      passed: false,
+      output:
+        `[judge infra FAIL] claude timed out after 120s (ETIMEDOUT). ` +
+        `stdout=${stdout.length}b stderr=${stderr.length}b\n${stderr}`,
+    };
+  }
+  if (result.error) {
+    return {
+      passed: false,
+      output: `[judge infra FAIL] claude spawn error: ${result.error.message}\n${stderr}`,
+    };
+  }
+
+  const output = stdout + (stderr ? `\n[stderr]\n${stderr}` : "");
+  const firstLine = stdout.trim().split("\n")[0]?.toUpperCase() ?? "";
+  const passed =
+    result.status === 0 && !result.error && firstLine.startsWith("PASS");
+  return { passed, output };
+}
+
+export function getGitDiffSinceClaim(
+  cwd: string,
+  claimedAt: string,
+  spawn: SpawnFn = defaultSpawn,
+): string {
+  // Throws on any failure. doneTask catches and surfaces a judge FAIL with
+  // a clear message — we must NEVER feed an empty diff to the LLM (it will
+  // typically answer PASS on empty input, silently opening the gate).
+  const revList = spawn(
+    "git",
+    ["rev-list", "-n", "1", `--before=${claimedAt}`, "HEAD"],
+    { cwd, timeout: 10_000 },
+  );
+  if (revList.error)
+    throw new Error(`git rev-list failed: ${revList.error.message}`);
+
+  let baseCommit = (revList.stdout ?? "").trim();
+  if (!baseCommit) {
+    const root = spawn("git", ["rev-list", "--max-parents=0", "HEAD"], {
+      cwd,
+      timeout: 10_000,
+    });
+    if (root.error)
+      throw new Error(
+        `git rev-list --max-parents=0 failed: ${root.error.message}`,
+      );
+    baseCommit = (root.stdout ?? "").trim();
+    if (!baseCommit) {
+      throw new Error("no diff: could not resolve a base commit (empty repo?)");
+    }
+  }
+
+  const diff = spawn("git", ["diff", baseCommit, "HEAD"], {
+    cwd,
+    maxBuffer: 1024 * 1024 * 2,
+    timeout: 30_000,
+  });
+  if (diff.error) throw new Error(`git diff failed: ${diff.error.message}`);
+  if (typeof diff.status === "number" && diff.status !== 0) {
+    throw new Error(
+      `git diff exited ${diff.status}: ${(diff.stderr ?? "").trim()}`,
+    );
+  }
+
+  const out = diff.stdout ?? "";
+  if (!out.trim()) {
+    throw new Error(
+      "no diff: no committed changes since claim (did you forget to commit?)",
+    );
+  }
+  return out;
+}
+
 export function rewriteMdTaskStatus(
   tasksPath: string,
   repo: string,

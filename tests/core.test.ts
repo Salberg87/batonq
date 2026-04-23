@@ -16,16 +16,20 @@ import { spawnSync } from "node:child_process";
 import {
   claimCandidate,
   externalId,
+  getGitDiffSinceClaim,
   initClaimsSchema,
   initTaskSchema,
   parseTasksFile,
   parseTasksText,
   rewriteMdTaskStatus,
+  runJudge,
   runVerify,
   selectCandidate,
   sweepClaims,
   syncTasks,
   type ParsedTask,
+  type SpawnFn,
+  type SpawnResult,
 } from "../src/tasks-core";
 import {
   DESTRUCTIVE,
@@ -428,5 +432,175 @@ describe("DESTRUCTIVE regex", () => {
     // Plain non-destructive commands
     expect(DESTRUCTIVE.test("echo hello world")).toBe(false);
     expect(DESTRUCTIVE.test("ls -la")).toBe(false);
+  });
+});
+
+// ── 13. runJudge fail-modes (hardened per /tmp/agent-coord-audit.md) ──────────
+
+describe("runJudge fail-modes", () => {
+  const fakeSpawn =
+    (r: Partial<SpawnResult>): SpawnFn =>
+    () => ({
+      status: r.status ?? 0,
+      signal: r.signal ?? null,
+      stdout: r.stdout ?? "",
+      stderr: r.stderr ?? "",
+      error: r.error ?? null,
+    });
+
+  test("ETIMEDOUT returns infra FAIL, never PASS — even if stdout says PASS", () => {
+    const err = Object.assign(new Error("etimedout"), { code: "ETIMEDOUT" });
+    const res = runJudge(
+      "judge",
+      "diff",
+      "/tmp",
+      fakeSpawn({
+        status: null,
+        signal: "SIGTERM",
+        stdout: "PASS ok",
+        error: err,
+      }),
+    );
+    expect(res.passed).toBe(false);
+    expect(res.output).toContain("[judge infra FAIL]");
+    expect(res.output).toContain("timed out");
+  });
+
+  test("SIGTERM-by-timeout without explicit error.code is still FAIL", () => {
+    const err = Object.assign(new Error("killed"), { code: undefined });
+    const res = runJudge(
+      "judge",
+      "diff",
+      "/tmp",
+      fakeSpawn({ status: null, signal: "SIGTERM", stdout: "", error: err }),
+    );
+    expect(res.passed).toBe(false);
+    expect(res.output).toContain("[judge infra FAIL]");
+  });
+
+  test("ENOENT spawn error returns infra FAIL, not PASS", () => {
+    const err = Object.assign(new Error("command not found"), {
+      code: "ENOENT",
+    });
+    const res = runJudge(
+      "judge",
+      "diff",
+      "/tmp",
+      fakeSpawn({ status: null, signal: null, stdout: "PASS", error: err }),
+    );
+    expect(res.passed).toBe(false);
+    expect(res.output).toContain("spawn error");
+  });
+
+  test("non-zero exit with PASS text in stdout must NOT gate through", () => {
+    // This is the canonical false-PASS scenario from the audit HIGH finding.
+    const res = runJudge(
+      "judge",
+      "diff",
+      "/tmp",
+      fakeSpawn({
+        status: 1,
+        stdout: "PASS looks fine\nbut really it errored",
+        stderr: "rate limit",
+      }),
+    );
+    expect(res.passed).toBe(false);
+  });
+
+  test("status=0 + 'PASS' first line → pass", () => {
+    const res = runJudge(
+      "judge",
+      "diff",
+      "/tmp",
+      fakeSpawn({ status: 0, stdout: "PASS looks good" }),
+    );
+    expect(res.passed).toBe(true);
+  });
+
+  test("status=0 + 'FAIL' first line → fail (normal judge rejection)", () => {
+    const res = runJudge(
+      "judge",
+      "diff",
+      "/tmp",
+      fakeSpawn({ status: 0, stdout: "FAIL missing tests" }),
+    );
+    expect(res.passed).toBe(false);
+  });
+});
+
+// ── 14. getGitDiffSinceClaim throws (never fail-open to empty diff) ───────────
+
+describe("getGitDiffSinceClaim fail-modes", () => {
+  const seqSpawn = (results: Partial<SpawnResult>[]): SpawnFn => {
+    let i = 0;
+    return () => {
+      const r = results[i++] ?? {};
+      return {
+        status: r.status ?? 0,
+        signal: r.signal ?? null,
+        stdout: r.stdout ?? "",
+        stderr: r.stderr ?? "",
+        error: r.error ?? null,
+      };
+    };
+  };
+
+  test("rev-list error throws (does not silently return empty diff)", () => {
+    const spawn = seqSpawn([
+      { error: Object.assign(new Error("git missing"), { code: "ENOENT" }) },
+    ]);
+    expect(() => getGitDiffSinceClaim("/tmp", "2026-01-01", spawn)).toThrow(
+      /rev-list failed/,
+    );
+  });
+
+  test("empty base commit falls back to root, throws if root also empty", () => {
+    const spawn = seqSpawn([
+      { status: 0, stdout: "" }, // rev-list --before → empty
+      { status: 0, stdout: "" }, // rev-list --max-parents=0 → empty
+    ]);
+    expect(() => getGitDiffSinceClaim("/tmp", "2026-01-01", spawn)).toThrow(
+      /no diff.*base commit/,
+    );
+  });
+
+  test("git diff error throws (never returns empty string)", () => {
+    const spawn = seqSpawn([
+      { status: 0, stdout: "abc123\n" },
+      { error: Object.assign(new Error("diff died"), { code: "ENOENT" }) },
+    ]);
+    expect(() => getGitDiffSinceClaim("/tmp", "2026-01-01", spawn)).toThrow(
+      /git diff failed/,
+    );
+  });
+
+  test("git diff non-zero status throws with stderr detail", () => {
+    const spawn = seqSpawn([
+      { status: 0, stdout: "abc123\n" },
+      { status: 128, stdout: "", stderr: "fatal: bad revision" },
+    ]);
+    expect(() => getGitDiffSinceClaim("/tmp", "2026-01-01", spawn)).toThrow(
+      /git diff exited 128.*bad revision/,
+    );
+  });
+
+  test("empty diff output throws 'no diff' — never feeds empty prompt to LLM", () => {
+    const spawn = seqSpawn([
+      { status: 0, stdout: "abc123\n" },
+      { status: 0, stdout: "" }, // no diff!
+    ]);
+    expect(() => getGitDiffSinceClaim("/tmp", "2026-01-01", spawn)).toThrow(
+      /no diff.*no committed changes/,
+    );
+  });
+
+  test("happy path: returns diff content as-is", () => {
+    const spawn = seqSpawn([
+      { status: 0, stdout: "abc123\n" },
+      { status: 0, stdout: "diff --git a/x b/x\n+hello\n" },
+    ]);
+    expect(getGitDiffSinceClaim("/tmp", "2026-01-01", spawn)).toContain(
+      "diff --git",
+    );
   });
 });
