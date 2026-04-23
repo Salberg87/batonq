@@ -8,8 +8,8 @@ set -euo pipefail
 PICK_NEXT_SYSTEM_PROMPT="$(cat ~/.claude/commands/pick-next.md)"
 
 while true; do
-  echo "→ agent-coord pick"
-  PICK_OUTPUT=$(agent-coord pick 2>&1)
+  echo "→ batonq pick"
+  PICK_OUTPUT=$(batonq pick 2>&1)
 
   if [[ "$PICK_OUTPUT" =~ ^NO_TASK ]]; then
     echo "$PICK_OUTPUT"
@@ -27,14 +27,14 @@ while true; do
     # Pass pick output + system prompt to new Claude invocation.
     # Use --append-system-prompt (not -s, which doesn't exist) and --dangerously-skip-permissions
     # so the fresh `claude -p` can actually edit/commit without interactive prompts.
-    # Stream JSON events through agent-coord-watch for ANSI-colored pretty output.
+    # Stream JSON events through batonq-watch for ANSI-colored pretty output.
     echo "$PICK_OUTPUT" \
       | claude -p \
           --output-format stream-json \
           --verbose \
           --dangerously-skip-permissions \
           --append-system-prompt "$PICK_NEXT_SYSTEM_PROMPT" \
-      | agent-coord-watch
+      | batonq-watch
 
     # Wait before next pick
     echo
@@ -44,7 +44,7 @@ while true; do
   fi
 
   # Unexpected output
-  echo "✗ Unexpected agent-coord pick output:"
+  echo "✗ Unexpected batonq pick output:"
   echo "$PICK_OUTPUT"
   echo "Sleeping 60s..."
   sleep 60

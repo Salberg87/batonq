@@ -71,7 +71,7 @@ switch (cmd) {
     break;
   default:
     console.error(
-      "usage: agent-coord\n" +
+      "usage: batonq\n" +
         "  Coordination:  check | status | release <path> | sweep\n" +
         "  Measurement:   tail [-n N] | report [--since ISO] [--until ISO] [--json]\n" +
         "  Tasks:         sync-tasks | pick | mine | done [<id>] | abandon [<id>] | tasks\n" +
@@ -232,7 +232,7 @@ function status() {
 
 function release(path: string | undefined) {
   if (!path) {
-    console.error("usage: agent-coord release <path>");
+    console.error("usage: batonq release <path>");
     process.exit(2);
   }
   if (!existsSync(DB_PATH)) {
@@ -362,8 +362,8 @@ function pickTask(): void {
     console.log(`TASK:`);
     console.log(candidate.body);
     console.log(``);
-    console.log(`When complete:   agent-coord done ${candidate.external_id}`);
-    console.log(`If abandoning:   agent-coord abandon ${candidate.external_id}`);
+    console.log(`When complete:   batonq done ${candidate.external_id}`);
+    console.log(`If abandoning:   batonq abandon ${candidate.external_id}`);
   } finally {
     db.close();
   }
@@ -521,8 +521,8 @@ function doneTask(id?: string): void {
       );
       if (code !== 0) {
         console.error(`✗ verify FAILED (exit ${code}). Task stays claimed.`);
-        console.error(`  Retry done after fixing, or: AGENT_COORD_ALLOW_SKIP=1 agent-coord done --skip-verify ${target.external_id} (logged as override)`);
-        console.error(`  Or release and re-queue: agent-coord abandon ${target.external_id}`);
+        console.error(`  Retry done after fixing, or: AGENT_COORD_ALLOW_SKIP=1 batonq done --skip-verify ${target.external_id} (logged as override)`);
+        console.error(`  Or release and re-queue: batonq abandon ${target.external_id}`);
         process.exit(code);
       }
       console.log(`✓ verify passed.`);
@@ -555,8 +555,8 @@ function doneTask(id?: string): void {
 
       if (!passed) {
         console.error(`✗ judge FAILED. Task stays claimed.`);
-        console.error(`  Fix issues and retry: agent-coord done ${target.external_id}`);
-        console.error(`  Or release and re-queue: agent-coord abandon ${target.external_id}`);
+        console.error(`  Fix issues and retry: batonq done ${target.external_id}`);
+        console.error(`  Or release and re-queue: batonq abandon ${target.external_id}`);
         process.exit(1);
       }
       console.log(`✓ judge passed.`);

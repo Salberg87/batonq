@@ -320,7 +320,7 @@ async function main() {
           db.run("ROLLBACK");
           emitDeny(
             conflictDenies.join("; ") +
-              ". Run `agent-coord status` to inspect; `agent-coord release <file>` if the holder's session is actually dead."
+              ". Run `batonq status` to inspect; `batonq release <file>` if the holder's session is actually dead."
           );
         }
 
@@ -374,7 +374,7 @@ async function main() {
       }
       if (denies.length) {
         emitDeny(
-          `Destructive Bash (pattern: '${bashPattern}') blocked — ${denies.join("; ")}. Run \`agent-coord status\` to inspect.`
+          `Destructive Bash (pattern: '${bashPattern}') blocked — ${denies.join("; ")}. Run \`batonq status\` to inspect.`
         );
       }
     }
