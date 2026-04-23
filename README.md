@@ -55,6 +55,15 @@ your solo `claude -p` loop has zero chance of catching a fabricated `done`
 by vibe. You need the gate to fire when it says it fires, and you need
 the receipts when it doesn't.
 
+The repo ships a [juks-detection scorecard](./evals/results/2026-04-24-juks-detection.md)
+that demonstrates this concretely: 5 cheating-agent scenarios (stub
+tests, skipped commits, undocumented code, rigged tests, comment-only
+"implementations"), a hard-coded cheat per scenario, and a side-by-side
+table of what batonq's verify gate concludes vs. what bare `claude -p`
+would have closed. Current run: **5/5 cheats blocked by batonq, 5/5
+silently closed by bare claude -p.** See [`evals/`](./evals/) for the
+runner, the JSON tasks, and how to re-generate the scorecard.
+
 Running multiple agents against the same repo also creates coordination
 chaos — two instances claiming the same task, edits colliding on the same
 file, a crashed run holding a lock nobody can see. The usual answer —
