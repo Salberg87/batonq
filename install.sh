@@ -337,6 +337,33 @@ verify_db_paths() {
   fi
 }
 
+# ── Step 6b: migrate legacy TASKS.md to DB ────────────────────────────────────
+#
+# TASKS.md used to be the authoritative task queue. Since arch-2 the DB is
+# the truth, and pick / done / tasks / enrich no longer auto-sync from the
+# file. Without an explicit migration step, any pending entries that only
+# live in TASKS.md would be silently invisible after the upgrade. `batonq
+# import` is idempotent (insert-new semantics; duplicates skipped), so
+# re-running it on every install is safe.
+
+migrate_legacy_tasks_md() {
+  bindir="$1"
+  tasks_md="${HOME}/DEV/TASKS.md"
+  if [ ! -f "${tasks_md}" ]; then
+    return 0
+  fi
+  if ! grep -qE '^- \[ \]' "${tasks_md}"; then
+    ok "TASKS.md has no pending entries — nothing to migrate."
+    return 0
+  fi
+  info "Migrating pending entries from ${tasks_md} into the DB (idempotent)…"
+  if "${bindir}/${NAME}" import "${tasks_md}" 2>&1 | sed 's/^/    /'; then
+    ok "Legacy TASKS.md migrated. The file is now deprecated — use 'batonq add' / 'batonq import' going forward."
+  else
+    warn "Migration of ${tasks_md} failed. Run it manually: ${NAME} import ${tasks_md}"
+  fi
+}
+
 # ── Step 7: done ──────────────────────────────────────────────────────────────
 
 print_success() {
@@ -392,6 +419,7 @@ main() {
   merge_settings  "${bindir}"
   create_state_dirs
   verify_db_paths
+  migrate_legacy_tasks_md "${bindir}"
   print_success   "${bindir}"
 }
 

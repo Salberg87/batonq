@@ -458,6 +458,44 @@ describe("pick hot path is DB-only", () => {
       "db-only task that must survive TASKS.md being moved away",
     );
   });
+
+  test("`tasks` list does not leak entries from TASKS.md", () => {
+    // Lock-in companion to pick: write one task only to TASKS.md, seed a
+    // different one into the DB, and confirm `batonq tasks` renders only the
+    // DB row. Protects `listTasks` from regressing to pre-arch-2 auto-sync.
+    const tasksPath = join(fakeHome, "DEV", "TASKS.md");
+    writeFileSync(
+      tasksPath,
+      [
+        "# Tasks",
+        "",
+        "## Pending",
+        "",
+        "- [ ] **any:infra** — markdown-only ghost task must not appear in list",
+        "",
+      ].join("\n"),
+    );
+    const add = runBatonq(
+      [
+        "add",
+        "--body",
+        "db-seeded task that should be the only row in list output",
+        "--repo",
+        "any:infra",
+      ],
+      { home: fakeHome },
+    );
+    expect(add.status).toBe(0);
+
+    const list = runBatonq(["tasks"], { home: fakeHome });
+    expect(list.status).toBe(0);
+    expect(list.stdout).toContain(
+      "db-seeded task that should be the only row in list output",
+    );
+    expect(list.stdout).not.toContain(
+      "markdown-only ghost task must not appear in list",
+    );
+  });
 });
 
 // ── tasks-core unit tests (no CLI spawn) ──────────────────────────────────────

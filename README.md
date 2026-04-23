@@ -208,9 +208,17 @@ export'` header so it's clear the file is not authoritative input.
 > **TASKS.md is deprecated as a live sync target.** Pre-existing
 > `~/DEV/TASKS.md` files still work as a one-way import via
 > `batonq import ~/DEV/TASKS.md` or the legacy `batonq sync-tasks`, but
-> `pick` / `tasks` no longer auto-parse the file on every invocation — the
-> DB is the truth. Existing TASKS.md files get a `> ⚠️ DEPRECATED …` banner
-> prepended on the first `batonq add` / `batonq import`.
+> `pick` / `done` / `tasks` / `enrich` no longer auto-parse the file on
+> every invocation — the DB is the truth. Existing TASKS.md files get a
+> `> ⚠️ DEPRECATED …` banner prepended on the first `batonq add` /
+> `batonq import`.
+>
+> **Upgrading from a pre-arch-2 install?** `install.sh` runs
+> `batonq import ~/DEV/TASKS.md` automatically at the end of install if
+> the file has pending entries, so your in-flight tasks land in the DB
+> instead of vanishing. The import is idempotent (duplicates skipped), so
+> re-running it is always safe. If you're upgrading by hand, run
+> `batonq import ~/DEV/TASKS.md` once before your next `batonq pick`.
 
 ## Concepts
 
