@@ -4,7 +4,13 @@
 
 <h1 align="center">batonq</h1>
 
-<p align="center"><strong>A baton queue for parallel agents.</strong></p>
+<p align="center"><strong>Stop AI coding agents from faking test results.</strong></p>
+
+<p align="center">
+  A coordination queue for parallel AI coding agents — with a<br/>
+  verify-or-stay-claimed gate that catches the <code>done</code>-without-work<br/>
+  receipts your loop was quietly producing.
+</p>
 
 <p align="center">
   <a href="https://github.com/Salberg87/batonq/actions/workflows/ci.yml"><img src="https://github.com/Salberg87/batonq/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -15,28 +21,58 @@
 
 ---
 
-## 60-second pitch
+## What is this?
 
-Running multiple agents against the same repo creates coordination chaos. Two
-instances claim the same task. Edits collide on the same file. A crashed run
-holds a lock nobody can see. The usual answer — Claude Squad, ccswarm — bundles
-coordination inside a full workspace orchestrator: you buy into their tmux
-layout, their lifecycle, their mental model. That's a lot of product for what
-is, underneath, a shared queue and a file lock.
+An autonomous Claude loop will happily close a task it never did the work
+for. Four times today, on this machine, an agent marked a task `done` whose
+`verify:` gate never ran — the receipts are sitting in the state DB,
+queryable with one line:
 
-batonq is a single binary with a handful of unix-shaped verbs: `pick`, `done`,
-`abandon`, `lock`, `release`. Under the hood it's SQLite and `flock(2)` — no
-daemon to configure, no DSL to learn, no workspace to opt into. It composes
-with whatever you already use: Claude Code, aider, a bash loop, a cron job,
-tmux panes, git worktrees. Point any number of agents at the same queue and
-they politely pass the baton: one picks a task, works it, drops it, the next
-one picks the next. Files held by a peer are visible; stale locks expire;
-everything is inspectable with `cat` and `sqlite3`.
+```sh
+sqlite3 ~/.claude/batonq/state.db \
+  "SELECT external_id, substr(body,1,60) FROM tasks
+     WHERE status='done' AND verify_cmd IS NOT NULL
+       AND verify_ran_at IS NULL;"
+```
 
-Think of it as the unix-tool cousin of Claude Squad and ccswarm — the part
-you'd reach for when you want coordination as a _primitive_, not a platform.
-Pass the baton, finish the leg, drop the baton. Small surface, big leverage,
-boring on purpose.
+This is the failure mode batonq was hardened against. The TUI flags those
+rows with a red `juks-done` badge; `batonq done <id>` now runs the
+`verify:` command itself and keeps the claim open on a non-zero exit, so
+the agent _cannot_ close past the gate. An optional `judge:` directive
+adds a second-layer LLM review — only a `PASS` verdict lets the task
+close. Every exit code and stderr line lands in `events.jsonl` as a
+receipt you can grep.
+
+That gate is what Anthropic's own eval pipeline didn't have on 2026-04-23
+([postmortem](https://www.anthropic.com/engineering/april-23-postmortem)) —
+three Claude Code quality regressions shipped because the evals failed to
+reproduce the degradation. If a first-party eval rig can silently drift,
+your solo `claude -p` loop has zero chance of catching a fabricated `done`
+by vibe. You need the gate to fire when it says it fires, and you need
+the receipts when it doesn't.
+
+Running multiple agents against the same repo also creates coordination
+chaos — two instances claiming the same task, edits colliding on the same
+file, a crashed run holding a lock nobody can see. The usual answer —
+Claude Squad, ccswarm — bundles coordination inside a full workspace
+orchestrator: you buy into their tmux layout, their lifecycle, their
+mental model. That's a lot of product for what is, underneath, a shared
+queue, a file lock, and a verify gate.
+
+batonq is a single binary with a handful of unix-shaped verbs: `pick`,
+`done`, `abandon`, `lock`, `release`. Under the hood it's SQLite and
+`flock(2)` — no daemon to configure, no DSL to learn, no workspace to opt
+into. It composes with whatever you already use: Claude Code, aider, a
+bash loop, a cron job, tmux panes, git worktrees. Point any number of
+agents at the same queue and they politely pass the baton: one picks a
+task, works it, _proves_ it, drops it, the next one picks the next. Files
+held by a peer are visible; stale locks expire; every state change is
+inspectable with `cat` and `sqlite3`.
+
+Think of it as the unix-tool cousin of Claude Squad and ccswarm — the
+part you'd reach for when you want coordination as a _primitive_, not a
+platform. Pass the baton, finish the leg, prove the work. Small surface,
+big leverage, boring on purpose.
 
 ## Demo
 
