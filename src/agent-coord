@@ -3,7 +3,7 @@
 // Commands: check | tail | report | status | release | sweep
 
 import { Database } from "bun:sqlite";
-import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync, unlinkSync, readSync } from "node:fs";
 import { execSync, spawnSync } from "node:child_process";
 import { basename, isAbsolute, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -78,6 +78,9 @@ switch (cmd) {
   case "version":
     printVersion();
     break;
+  case "init":
+    initCmd();
+    break;
   case "check":
     check();
     break;
@@ -150,6 +153,7 @@ switch (cmd) {
   default:
     console.error(
       "usage: batonq\n" +
+        "  Setup:         init [--yes]\n" +
         "  Coordination:  check | doctor | status | release <path> | sweep | sweep-tasks\n" +
         "  Measurement:   tail [-n N] | logs [-f] [-n N] [--source events|loop|both] | report [--since ISO] [--until ISO] [--json]\n" +
         "  Tasks:         add --body <text> [--repo <name>] [--verify <sh>] [--judge <prompt>] [--priority high|normal|low] [--at <ISO>] [--status draft|pending] [--json]\n" +
@@ -231,6 +235,272 @@ function runUninstall(): void {
     { stdio: "inherit" }
   );
   process.exit(r.status ?? 0);
+}
+
+// ── init ──────────────────────────────────────────────────────────────────────
+//
+// First-run wizard. Runs four checks in order and offers a y/n fix where the
+// state is fixable: (a) merge batonq hooks into ~/.claude/settings.json,
+// (b) seed an example task if the queue is empty, (c) verify gtimeout/timeout
+// is on PATH (advisory — batonq-loop needs it but the queue itself does not),
+// (d) print the next-steps checklist.
+//
+// Flags:
+//   --yes, -y    answer "yes" to every prompt (non-interactive use, CI, tests)
+//
+// Idempotent: re-running on a fully-configured host prints all-green and
+// changes nothing. The hook merge is identical to install.sh's logic, only
+// done in TS so init has no jq dependency.
+
+function initCmd(): void {
+  const args = process.argv.slice(3);
+  const yes = args.includes("--yes") || args.includes("-y");
+
+  console.log("batonq init — first-run wizard");
+  console.log();
+
+  // ── (c) gtimeout / timeout ────────────────────────────────────────────────
+  // batonq-loop wraps each `claude -p` call in a hard timeout. macOS ships
+  // without a `timeout` binary; coreutils provides `gtimeout`. Either is OK
+  // for the loop's single code path. Advisory only — the queue and the CLI
+  // work without it; we just want the user to know before they hit it.
+  const timeoutBin = whichBin(["gtimeout", "timeout"]);
+  if (timeoutBin) {
+    console.log(`  ok   ${timeoutBin.bin} found (${timeoutBin.path}) — batonq-loop ready`);
+  } else {
+    console.log(`  warn neither gtimeout nor timeout on PATH`);
+    console.log(`       batonq-loop wraps each \`claude -p\` in a hard timeout. Install:`);
+    console.log(`         brew install coreutils       (macOS)`);
+    console.log(`         apt-get install -y coreutils (Debian/Ubuntu)`);
+  }
+  console.log();
+
+  // ── (a) Hook config ───────────────────────────────────────────────────────
+  const hookCheck = readHookConfigStatus();
+  if (hookCheck.parseError) {
+    console.error(`  FAIL settings.json could not be parsed: ${hookCheck.parseError}`);
+    console.error(`       fix the JSON at ${SETTINGS_PATH} (try: jq . ${SETTINGS_PATH}) and re-run`);
+    process.exit(1);
+  }
+  if (hookCheck.installed) {
+    console.log(`  ok   batonq hooks already configured in ${SETTINGS_PATH}`);
+  } else {
+    console.log(`  miss batonq hooks NOT configured in ${SETTINGS_PATH}`);
+    if (yes || promptYesNo("       Add them now?", true)) {
+      const hookBin = findHookBin();
+      writeHookConfig(hookBin);
+      console.log(`  ok   hooks installed (command: ${hookBin})`);
+      console.log(`       restart Claude Code once for the hooks to take effect`);
+    } else {
+      console.log(`  skip leaving settings.json unchanged`);
+    }
+  }
+  console.log();
+
+  // ── (b) Example task ──────────────────────────────────────────────────────
+  const taskCount = countTasksInDb();
+  if (taskCount > 0) {
+    console.log(`  ok   ${taskCount} task(s) already in queue`);
+  } else {
+    console.log(`  miss queue is empty`);
+    if (yes || promptYesNo("       Add an example task to try things out?", true)) {
+      try {
+        const eid = insertExampleTask();
+        console.log(`  ok   example task added (${eid})`);
+      } catch (e: any) {
+        console.error(`  FAIL could not insert example task: ${e?.message ?? String(e)}`);
+        process.exit(1);
+      }
+    } else {
+      console.log(`  skip queue stays empty`);
+    }
+  }
+  console.log();
+
+  // ── (d) Next steps ────────────────────────────────────────────────────────
+  console.log("Next steps:");
+  console.log("  1. Verify install:        batonq doctor");
+  console.log("  2. List the queue:        batonq tasks");
+  console.log("  3. Pick by hand:          batonq pick");
+  console.log("  4. Or start a worker:     cd <repo-under-~/DEV> && batonq-loop");
+}
+
+function whichBin(candidates: string[]): { bin: string; path: string } | null {
+  for (const bin of candidates) {
+    try {
+      const path = execSync(`command -v ${bin}`, {
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .toString()
+        .trim();
+      if (path) return { bin, path };
+    } catch {
+      // not on PATH; try next candidate
+    }
+  }
+  return null;
+}
+
+// Resolve the batonq-hook binary path to embed in settings.json. Prefer a
+// sibling of the running CLI so dev checkouts and installed bindirs both
+// work without configuration. Fall back to PATH lookup, and last-resort to
+// the default install target so the settings entry is at least
+// self-explanatory if the binary doesn't exist yet.
+function findHookBin(): string {
+  const me = process.argv[1];
+  if (me) {
+    const slash = me.lastIndexOf("/");
+    const dir = slash >= 0 ? me.substring(0, slash) : "";
+    for (const name of ["batonq-hook", "agent-coord-hook"]) {
+      const p = dir ? `${dir}/${name}` : name;
+      if (existsSync(p)) return p;
+    }
+  }
+  for (const name of ["batonq-hook", "agent-coord-hook"]) {
+    try {
+      const path = execSync(`command -v ${name}`, {
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .toString()
+        .trim();
+      if (path) return path;
+    } catch {
+      // not on PATH; try next candidate
+    }
+  }
+  return `${HOME}/.local/bin/batonq-hook`;
+}
+
+type HookConfigStatus = {
+  installed: boolean;
+  parseError?: string;
+};
+
+// Probe whether settings.json already has both Pre and PostToolUse blocks
+// pointing at the batonq (or legacy agent-coord) hook binary. Mirrors the
+// regex used by `doctor` and the install.sh idempotency filter so the three
+// stay aligned.
+function readHookConfigStatus(): HookConfigStatus {
+  if (!existsSync(SETTINGS_PATH)) return { installed: false };
+  let cfg: any;
+  try {
+    cfg = JSON.parse(readFileSync(SETTINGS_PATH, "utf8"));
+  } catch (e: any) {
+    return { installed: false, parseError: e?.message ?? String(e) };
+  }
+  const re = /(?:agent-coord-hook|batonq-hook)/;
+  const has = (event: string) => {
+    const arr = cfg?.hooks?.[event] ?? [];
+    return arr.some((b: any) =>
+      (b?.hooks ?? []).some(
+        (h: any) => typeof h?.command === "string" && re.test(h.command),
+      ),
+    );
+  };
+  if (has("PreToolUse") && has("PostToolUse")) return { installed: true };
+  return { installed: false };
+}
+
+// Merge the three batonq hook entries into settings.json. Strips any prior
+// batonq-hook / agent-coord-hook entries first so re-running is idempotent —
+// same invariant as install.sh's jq merge.
+function writeHookConfig(hookBin: string): void {
+  let cfg: any = {};
+  if (existsSync(SETTINGS_PATH)) {
+    try {
+      cfg = JSON.parse(readFileSync(SETTINGS_PATH, "utf8"));
+    } catch (e: any) {
+      throw new Error(
+        `refusing to overwrite unparseable settings.json: ${e?.message ?? String(e)}`,
+      );
+    }
+  }
+  cfg.hooks ??= {};
+
+  const re = /(?:agent-coord-hook|batonq-hook)/;
+  const isBaton = (block: any) =>
+    (block?.hooks ?? []).some(
+      (h: any) => typeof h?.command === "string" && re.test(h.command),
+    );
+
+  const newPre = [
+    {
+      matcher: "Read|Edit|Write|MultiEdit",
+      hooks: [{ type: "command", command: `${hookBin} pre`, timeout: 2 }],
+    },
+    {
+      matcher: "Bash",
+      hooks: [{ type: "command", command: `${hookBin} bash`, timeout: 2 }],
+    },
+  ];
+  const newPost = [
+    {
+      matcher: "Edit|Write|MultiEdit",
+      hooks: [{ type: "command", command: `${hookBin} post`, timeout: 2 }],
+    },
+  ];
+
+  cfg.hooks.PreToolUse = (cfg.hooks.PreToolUse ?? [])
+    .filter((b: any) => !isBaton(b))
+    .concat(newPre);
+  cfg.hooks.PostToolUse = (cfg.hooks.PostToolUse ?? [])
+    .filter((b: any) => !isBaton(b))
+    .concat(newPost);
+
+  mkdirSync(`${HOME}/.claude`, { recursive: true });
+  writeFileSync(SETTINGS_PATH, JSON.stringify(cfg, null, 2) + "\n", {
+    mode: 0o600,
+  });
+}
+
+function countTasksInDb(): number {
+  if (!existsSync(DB_PATH)) return 0;
+  const db = openTaskDb();
+  try {
+    const r = db.query("SELECT COUNT(*) AS n FROM tasks").get() as any;
+    return r?.n ?? 0;
+  } finally {
+    db.close();
+  }
+}
+
+function insertExampleTask(): string {
+  const body =
+    "Try batonq: read docs/tui-ux-v2.md and write a one-line feedback comment";
+  const repo = getRepoForCwd() ?? "any:infra";
+  const db = openTaskDb();
+  try {
+    return validatedInsertTask(db, {
+      body,
+      repo,
+      // Schema requires verify ≥ 10 chars; this is the trivially-passing
+      // command suggested by the task spec, padded with an explanatory
+      // comment so it parses.
+      verify: "true # batonq init example",
+      priority: "normal",
+      status: "pending",
+    });
+  } finally {
+    db.close();
+  }
+}
+
+// Synchronous y/n prompt. Returns `def` when stdin is not a TTY (piped/CI)
+// so non-interactive callers don't deadlock waiting for input.
+function promptYesNo(question: string, def: boolean): boolean {
+  if (!process.stdin.isTTY) return def;
+  const yn = def ? "[Y/n]" : "[y/N]";
+  process.stdout.write(`${question} ${yn} `);
+  const buf = Buffer.alloc(64);
+  let n = 0;
+  try {
+    n = readSync(0, buf, 0, buf.length, null);
+  } catch {
+    return def;
+  }
+  const ans = buf.toString("utf8", 0, n).trim().toLowerCase();
+  if (ans === "") return def;
+  return ans === "y" || ans === "yes";
 }
 
 // ── version ───────────────────────────────────────────────────────────────────
