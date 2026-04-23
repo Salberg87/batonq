@@ -109,3 +109,46 @@ jobs:
                 body,
               });
             }
+
+  coverage-badge:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Run coverage
+        run: |
+          set -o pipefail
+          bun test --coverage 2>&1 | tee coverage.txt
+
+      - name: Regenerate badge
+        run: |
+          line_pct=$(awk -F'|' '/^All files/ { gsub(/ /,"",$3); print $3 }' coverage.txt)
+          if [ -z "$line_pct" ]; then
+            echo "could not extract line %, leaving badge as-is"
+            exit 0
+          fi
+          bun scripts/gen-coverage-badge.ts "$line_pct"
+
+      - name: Commit badge if changed
+        run: |
+          if git diff --quiet docs/coverage.svg README.md; then
+            echo "no badge change"
+            exit 0
+          fi
+          git config user.name "batonq-ci"
+          git config user.email "ci@batonq.local"
+          git add docs/coverage.svg README.md
+          git commit -m "ci(coverage): refresh badge [skip ci]"
+          git push

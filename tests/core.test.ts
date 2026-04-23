@@ -41,6 +41,7 @@ import {
   syncTasks,
   TASK_CLAIM_TTL_MS,
   TASK_RECOVERY_HEARTBEAT_MS,
+  touchTaskProgress,
   type ParsedTask,
   type SpawnFn,
   type SpawnResult,
@@ -424,6 +425,159 @@ describe("runVerify", () => {
     );
     expect(withEnv.code).toBe(0);
     expect(withEnv.output).toContain("tid-xyz:" + workdir);
+  });
+});
+
+// ── 7a. touchTaskProgress refreshes last_progress_at on claimed rows ─────────
+
+describe("touchTaskProgress", () => {
+  test("updates last_progress_at only for caller's claimed rows", () => {
+    const db = memDb();
+    const t0 = "2026-04-24T00:00:00.000Z";
+    const t1 = "2026-04-24T00:05:00.000Z";
+
+    // Two claims for session A, one for session B, one pending row.
+    db.run(
+      `INSERT INTO tasks (external_id, repo, body, status, claimed_by, claimed_at, last_progress_at, created_at)
+       VALUES
+         ('a1', 'any:infra', 'A-first',  'claimed', 'sess-A', ?, ?, ?),
+         ('a2', 'any:infra', 'A-second', 'claimed', 'sess-A', ?, ?, ?),
+         ('b1', 'any:infra', 'B-task',   'claimed', 'sess-B', ?, ?, ?),
+         ('p1', 'any:infra', 'pending',  'pending',  NULL,    NULL, NULL, ?)`,
+      [t0, t0, t0, t0, t0, t0, t0, t0, t0, t0],
+    );
+
+    const res = touchTaskProgress(db, "sess-A", t1);
+    expect(res.touched).toBe(2);
+
+    const rows = db
+      .query(
+        "SELECT external_id, last_progress_at FROM tasks ORDER BY external_id",
+      )
+      .all() as Array<{ external_id: string; last_progress_at: string | null }>;
+    const byId = Object.fromEntries(
+      rows.map((r) => [r.external_id, r.last_progress_at]),
+    );
+    expect(byId.a1).toBe(t1);
+    expect(byId.a2).toBe(t1);
+    expect(byId.b1).toBe(t0); // peer's claim untouched
+    expect(byId.p1).toBeNull(); // pending row untouched
+
+    // No-op on a session holding no claims
+    const res2 = touchTaskProgress(db, "sess-nobody", t1);
+    expect(res2.touched).toBe(0);
+
+    db.close();
+  });
+});
+
+// ── 7c. anti-juks gate: `done` keeps claim open when verify_cmd fails ────────
+//
+// This is the invariant the README hinges on — the verify gate must prevent a
+// `done` call from closing a task when the verify command exits non-zero. We
+// drive the real CLI against an isolated $HOME, seed a claimed task with a
+// failing verify_cmd, and assert:
+//   (a) `done` exits with the verify command's exit code (not 0)
+//   (b) the task stays in `claimed` (NOT `done`)
+//   (c) verify_output + verify_ran_at are persisted as a receipt
+// Then we flip verify_cmd to `exit 0` and assert the same call now closes.
+
+describe("done gate: verify_cmd fail keeps claim open, pass closes", () => {
+  test("failing verify blocks done; passing verify lets it through", () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "batonq-done-gate-"));
+    mkdirSync(join(fakeHome, ".claude"), { recursive: true });
+    const tasksPath = join(fakeHome, "DEV", "TASKS.md");
+    mkdirSync(join(fakeHome, "DEV"), { recursive: true });
+    writeFileSync(
+      tasksPath,
+      [
+        "# Tasks",
+        "",
+        "## Pending",
+        "",
+        "- [ ] **any:infra** — gate probe",
+        "",
+      ].join("\n"),
+    );
+
+    const dbPath = join(fakeHome, ".claude", "batonq", "state.db");
+    const env = {
+      ...process.env,
+      HOME: fakeHome,
+      PATH: process.env.PATH ?? "",
+    };
+
+    try {
+      const seed = spawnSync(BATONQ_BIN, ["sync-tasks"], {
+        env,
+        encoding: "utf8",
+      });
+      expect(seed.status).toBe(0);
+
+      // Seed a claim on the task and attach a failing verify_cmd.
+      const db = new Database(dbPath);
+      const now = new Date().toISOString();
+      db.run(
+        `UPDATE tasks
+            SET status = 'claimed',
+                claimed_by = 'sess-gate',
+                claimed_at = ?,
+                last_progress_at = ?,
+                verify_cmd = 'echo gate-fired; exit 13'
+          WHERE body = 'gate probe'`,
+        [now, now],
+      );
+      const eidRow = db
+        .query("SELECT external_id FROM tasks WHERE body = 'gate probe'")
+        .get() as { external_id: string };
+      const eid = eidRow.external_id;
+      db.close();
+
+      // (1) done must fail — verify exits 13 — and claim stays open with receipt.
+      const fail = spawnSync(BATONQ_BIN, ["done", eid], {
+        env,
+        encoding: "utf8",
+      });
+      expect(fail.status).toBe(13);
+      expect(fail.stderr ?? "").toMatch(/verify FAILED \(exit 13\)/);
+
+      const afterFail = new Database(dbPath, { readonly: true });
+      const row1 = afterFail
+        .query(
+          "SELECT status, verify_ran_at, verify_output FROM tasks WHERE external_id = ?",
+        )
+        .get(eid) as {
+        status: string;
+        verify_ran_at: string | null;
+        verify_output: string | null;
+      };
+      expect(row1.status).toBe("claimed"); // gate held — NOT 'done'
+      expect(row1.verify_ran_at).not.toBeNull(); // receipt exists
+      expect(row1.verify_output ?? "").toContain("gate-fired"); // output captured
+      afterFail.close();
+
+      // (2) flip verify_cmd to pass; done now closes the task.
+      const db2 = new Database(dbPath);
+      db2.run("UPDATE tasks SET verify_cmd = 'exit 0' WHERE external_id = ?", [
+        eid,
+      ]);
+      db2.close();
+
+      const pass = spawnSync(BATONQ_BIN, ["done", eid], {
+        env,
+        encoding: "utf8",
+      });
+      expect(pass.status).toBe(0);
+
+      const afterPass = new Database(dbPath, { readonly: true });
+      const row2 = afterPass
+        .query("SELECT status FROM tasks WHERE external_id = ?")
+        .get(eid) as { status: string };
+      expect(row2.status).toBe("done");
+      afterPass.close();
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
   });
 });
 
