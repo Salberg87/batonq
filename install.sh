@@ -51,6 +51,34 @@ EOF
   exit 1
 }
 
+# ── Step 1b: gtimeout (required by batonq-loop) ───────────────────────────────
+
+check_gtimeout() {
+  if command -v gtimeout >/dev/null 2>&1; then
+    ok "gtimeout found ($(command -v gtimeout))"
+    return 0
+  fi
+  cat >&2 <<'EOF'
+✖ gtimeout is required by batonq-loop but not installed.
+
+batonq-loop wraps each `claude -p` invocation in `gtimeout` so a stuck task
+can't wedge the loop indefinitely. macOS ships without a `timeout` binary,
+so the loop uses `gtimeout` from GNU coreutils on both macOS and Linux for
+a single code path.
+
+On macOS:
+
+  brew install coreutils
+
+On Debian/Ubuntu:
+
+  sudo apt-get install -y coreutils
+
+Then re-run this installer.
+EOF
+  exit 1
+}
+
 # ── Step 2: detect bin dir ────────────────────────────────────────────────────
 
 detect_bindir() {
@@ -96,9 +124,10 @@ install_bins() {
     ok "Installed ${to}"
   }
 
-  install_one "${src}/agent-coord"      "${bindir}/${NAME}"
-  install_one "${src}/agent-coord-hook" "${bindir}/${NAME}-hook"
-  install_one "${src}/agent-coord-loop" "${bindir}/${NAME}-loop"
+  install_one "${src}/agent-coord"               "${bindir}/${NAME}"
+  install_one "${src}/agent-coord-hook"          "${bindir}/${NAME}-hook"
+  install_one "${src}/agent-coord-loop"          "${bindir}/${NAME}-loop"
+  install_one "${src}/agent-coord-loop-watchdog" "${bindir}/${NAME}-loop-watchdog"
 }
 
 # ── Step 5: merge hooks into ~/.claude/settings.json ──────────────────────────
@@ -222,6 +251,7 @@ main() {
   info "Installing ${NAME}"
 
   check_bun
+  check_gtimeout
 
   if ! bindir=$(detect_bindir); then
     fail "Neither ~/.local/bin nor ~/bin is on PATH. Add one to your shell rc and re-run:

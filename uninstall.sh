@@ -69,8 +69,8 @@ remove_bins() {
   removed_any=0
   for bindir in "${HOME}/.local/bin" "${HOME}/bin"; do
     [ -d "${bindir}" ] || continue
-    # Match batonq, batonq-hook, batonq-loop, batonq-tui (any batonq*).
-    for f in "${bindir}/${NAME}" "${bindir}/${NAME}-hook" "${bindir}/${NAME}-loop" "${bindir}/${NAME}-tui"; do
+    # Match batonq, batonq-hook, batonq-loop, batonq-loop-watchdog, batonq-tui.
+    for f in "${bindir}/${NAME}" "${bindir}/${NAME}-hook" "${bindir}/${NAME}-loop" "${bindir}/${NAME}-loop-watchdog" "${bindir}/${NAME}-tui"; do
       if [ -e "${f}" ] || [ -L "${f}" ]; then
         rm -f "${f}"
         ok "removed ${f}"

@@ -78,7 +78,17 @@ install -m 0755 src/agent-coord-hook ~/.local/bin/batonq-hook
 install -m 0755 src/agent-coord-loop ~/.local/bin/batonq-loop
 ```
 
-Requires [Bun](https://bun.sh) ≥ 1.0 and `jq` (for the hooks merge).
+Requires [Bun](https://bun.sh) ≥ 1.0, `jq` (for the hooks merge), and
+`gtimeout` from GNU coreutils (used by `batonq-loop` to bound each `claude -p`
+invocation so a stuck task can't wedge the loop). On macOS:
+`brew install coreutils`. On Debian/Ubuntu: `sudo apt-get install -y coreutils`.
+
+> **Heads up on multiple loops per host:** `batonq-loop`'s liveness watchdog
+> watches the shared hook log (`~/.claude/batonq-measurement/events.jsonl`).
+> If you run two loops on the same machine and only one is making progress,
+> the other's watchdog won't fire on its own wedge because the shared log
+> keeps getting fresh writes from the peer. Run at most one `batonq-loop` per
+> host, or give each loop its own events log.
 
 **Uninstall (if you change your mind):**
 

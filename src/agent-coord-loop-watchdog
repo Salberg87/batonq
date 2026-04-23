@@ -1,0 +1,43 @@
+#!/bin/bash
+set -euo pipefail
+
+# batonq-loop-watchdog — liveness watchdog for batonq-loop.
+#
+# Monitors the shared hook event log (events.jsonl) and, if its mtime goes
+# stale for BATONQ_WATCHDOG_STALE_SEC, kills the gtimeout/claude child tree
+# of PARENT_PID so the outer loop can roll forward.
+#
+# Usage:
+#   agent-coord-loop-watchdog <parent_pid> [events_log]
+#
+# Env:
+#   BATONQ_WATCHDOG_STALE_SEC   staleness threshold in seconds (default 600)
+#   BATONQ_WATCHDOG_WARMUP_SEC  warm-up before the first mtime check (default 120)
+#   BATONQ_WATCHDOG_POLL_SEC    polling interval between checks (default 60)
+
+PARENT_PID="${1:?usage: agent-coord-loop-watchdog <parent_pid> [events_log]}"
+EVENTS_LOG="${2:-$HOME/.claude/batonq-measurement/events.jsonl}"
+
+STALE_SEC="${BATONQ_WATCHDOG_STALE_SEC:-600}"
+WARMUP_SEC="${BATONQ_WATCHDOG_WARMUP_SEC:-120}"
+POLL_SEC="${BATONQ_WATCHDOG_POLL_SEC:-60}"
+
+sleep "$WARMUP_SEC"
+
+while true; do
+  sleep "$POLL_SEC"
+  if [ ! -f "$EVENTS_LOG" ]; then
+    continue
+  fi
+  # BSD stat (-f %m) on macOS, GNU stat (-c %Y) on Linux. Fall back to 0.
+  mtime=$(stat -f %m "$EVENTS_LOG" 2>/dev/null \
+       || stat -c %Y "$EVENTS_LOG" 2>/dev/null \
+       || echo 0)
+  age=$(( $(date +%s) - mtime ))
+  if [ "$age" -gt "$STALE_SEC" ]; then
+    echo "[watchdog] events.jsonl stale ${age}s (>${STALE_SEC}s) — killing claude tree" >&2
+    pkill -TERM -P "$PARENT_PID" -f "gtimeout"  2>/dev/null || true
+    pkill -TERM -P "$PARENT_PID" -f "claude -p" 2>/dev/null || true
+    exit 0
+  fi
+done

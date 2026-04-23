@@ -4,8 +4,24 @@ set -euo pipefail
 # batonq-loop — Path A: Fresh Claude invocation per task
 # Polls batonq pick and spawns a new Claude instance for each task.
 # Useful for long-running task loops where fresh context per task is preferred.
+#
+# Deps: gtimeout (coreutils). On macOS: `brew install coreutils`.
+#
+# Env:
+#   BATONQ_WATCHDOG_STALE_SEC   watchdog mtime-staleness threshold (default 600)
+#   BATONQ_WATCHDOG_WARMUP_SEC  watchdog warm-up before first check (default 120)
+#   BATONQ_LOOP_TIMEOUT         gtimeout duration for claude -p (default 20m)
+#
+# Multi-session caveat: the watchdog watches a *shared* hook log
+# (~/.claude/batonq-measurement/events.jsonl). If two batonq-loop instances run
+# concurrently on the same machine and only one is making progress, the other's
+# watchdog will see fresh mtimes from its peer and NOT fire on its own wedge.
+# Acceptable for single-loop-per-host setups; for parallel hosts-on-one-machine
+# use per-loop event logs (e.g. events.$PID.jsonl).
 
 PICK_NEXT_SYSTEM_PROMPT="$(cat ~/.claude/commands/pick-next.md)"
+
+LOOP_TIMEOUT="${BATONQ_LOOP_TIMEOUT:-20m}"
 
 while true; do
   echo "→ batonq pick"
@@ -24,17 +40,35 @@ while true; do
     echo "→ spawning claude -p for this task"
     echo
 
-    # Pass pick output + system prompt to new Claude invocation.
-    # Use --append-system-prompt (not -s, which doesn't exist) and --dangerously-skip-permissions
-    # so the fresh `claude -p` can actually edit/commit without interactive prompts.
-    # Stream JSON events through batonq-watch for ANSI-colored pretty output.
+    # Plain claude -p: the previous streaming variant with --verbose piped to a
+    # watcher held the process alive after /clear and wedged the loop. Plain
+    # mode exits cleanly on stdin EOF.
+    # gtimeout is belt-and-suspenders: any task that takes >LOOP_TIMEOUT is
+    # stuck; kill it so the loop continues. (macOS ships without `timeout` —
+    # gtimeout from coreutils is a hard dep.)
+    # The watchdog below gives us finer-grain hang detection via events.jsonl mtime.
+    # Watch progress with `batonq tail -n 20` in another terminal.
+
+    # Liveness watchdog: if the shared hook event log goes mtime-stale for
+    # BATONQ_WATCHDOG_STALE_SEC, kill the gtimeout/claude tree so the loop
+    # rolls forward. Default 600s (10 min), overridable via env. Extracted
+    # to its own script so it's independently testable.
+    WATCHDOG_CMD="$(command -v batonq-loop-watchdog \
+                || command -v agent-coord-loop-watchdog \
+                || echo "$(dirname "$0")/agent-coord-loop-watchdog")"
+    "$WATCHDOG_CMD" $$ "$HOME/.claude/batonq-measurement/events.jsonl" &
+    WATCHDOG_PID=$!
+
+    # `|| true` prevents `set -e` from tearing down the loop when gtimeout
+    # (124) or claude returns non-zero — we want the outer loop to keep running.
     echo "$PICK_OUTPUT" \
-      | claude -p \
-          --output-format stream-json \
-          --verbose \
+      | gtimeout "$LOOP_TIMEOUT" claude -p \
           --dangerously-skip-permissions \
-          --append-system-prompt "$PICK_NEXT_SYSTEM_PROMPT" \
-      | batonq-watch
+          --append-system-prompt "$PICK_NEXT_SYSTEM_PROMPT" || true
+
+    # Clean up watchdog (task done or killed)
+    kill "$WATCHDOG_PID" 2>/dev/null || true
+    wait "$WATCHDOG_PID" 2>/dev/null || true
 
     # Wait before next pick
     echo
