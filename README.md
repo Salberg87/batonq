@@ -237,10 +237,10 @@ agent tailing the file — can pick up the pieces. `lost` tasks are out of the
        ▼
 ┌─────────────┐   sync    ┌──────────────────────────────┐
 │ parse tasks │─────────▶│  ~/.claude/                   │
-└─────────────┘           │  ├─ agent-coord-state.db     │  SQLite:
+└─────────────┘           │  ├─ batonq-state.db          │  SQLite:
                           │  │                           │  sessions, tasks,
                           │  │                           │  claims, locks
-                          │  └─ agent-coord-measurement/ │
+                          │  └─ batonq-measurement/      │
                           │     └─ events.jsonl          │  append-only log
                           └──────────────────────────────┘
                                    ▲            ▲
@@ -258,7 +258,7 @@ agent tailing the file — can pick up the pieces. `lost` tasks are out of the
 ```
 
 Three moving parts: the **event log** (`events.jsonl`, append-only, grep-able),
-the **SQLite state** (`~/.claude/agent-coord-state.db`, mutated under
+the **SQLite state** (`~/.claude/batonq-state.db`, mutated under
 transactions), and the **hooks** (`batonq-hook pre|bash|post`, 2-second
 timeout, never blocks Claude on its own failure). Everything else is a shell
 of unix verbs around those three files.
@@ -286,7 +286,7 @@ background) reclaims them. The task flips back to `pending` and any other
 agent with a matching scope can pick it up.
 
 **Can it coordinate across machines?**
-Not yet — state lives in a local SQLite DB (`~/.claude/agent-coord-state.db`)
+Not yet — state lives in a local SQLite DB (`~/.claude/batonq-state.db`)
 and locks use `flock(2)` on the local filesystem. Cross-machine would need
 either a hosted DB + lock service or a syncing agent; that's deliberately
 out of scope for v0.x. If you mount `~/.claude` over NFS with working byte

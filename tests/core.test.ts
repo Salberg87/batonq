@@ -1537,7 +1537,7 @@ describe("sweepTasks (task-claim TTL)", () => {
       ].join("\n"),
     );
 
-    const dbPath = join(fakeHome, ".claude", "agent-coord-state.db");
+    const dbPath = join(fakeHome, ".claude", "batonq-state.db");
     try {
       // First: sync populates the DB with the pending task, then we mutate
       // it to a stale claimed state and watch `pick` sweep it.
@@ -1600,7 +1600,7 @@ describe("batonq doctor", () => {
   function buildHealthyHome(): { home: string; cleanup: () => void } {
     const home = mkdtempSync(join(tmpdir(), "batonq-doctor-"));
     mkdirSync(join(home, ".claude"), { recursive: true });
-    mkdirSync(join(home, ".claude", "agent-coord-measurement"), {
+    mkdirSync(join(home, ".claude", "batonq-measurement"), {
       recursive: true,
     });
     mkdirSync(join(home, "DEV"), { recursive: true });
@@ -1824,7 +1824,7 @@ describe("batonq doctor", () => {
       );
       const measurementBefore = spawnSync(
         "ls",
-        ["-la", join(home, ".claude", "agent-coord-measurement")],
+        ["-la", join(home, ".claude", "batonq-measurement")],
         { encoding: "utf8" },
       ).stdout;
 
@@ -1855,19 +1855,169 @@ describe("batonq doctor", () => {
       // .batonq-doctor-probe should linger between runs.
       const measurementAfter = spawnSync(
         "ls",
-        ["-la", join(home, ".claude", "agent-coord-measurement")],
+        ["-la", join(home, ".claude", "batonq-measurement")],
         { encoding: "utf8" },
       ).stdout;
       expect(measurementAfter).toBe(measurementBefore);
 
       // Doctor never lazy-creates state.db — that's the hook's job.
-      expect(existsSync(join(home, ".claude", "agent-coord-state.db"))).toBe(
-        false,
-      );
+      expect(existsSync(join(home, ".claude", "batonq-state.db"))).toBe(false);
 
       expect(r1.status).toBe(r2.status);
     } finally {
       cleanup();
+    }
+  });
+});
+
+// ── migrate(): legacy agent-coord-* → batonq-* ────────────────────────────────
+//
+// The rename dropped the `agent-coord` name across the codebase but left a
+// trail of pre-existing state in `$HOME/.claude/agent-coord-*` on every
+// installed machine. `migrate()` moves that state under the new names without
+// data loss and is idempotent so a hook racing the CLI at startup can't
+// double-copy or corrupt.
+
+describe("migrate (agent-coord → batonq)", () => {
+  test("copies DB + fingerprint + measurement dir and backs up originals", async () => {
+    const { migrate } = await import("../src/migrate");
+    const home = mkdtempSync(join(tmpdir(), "batonq-migrate-"));
+    try {
+      const claude = join(home, ".claude");
+      mkdirSync(claude, { recursive: true });
+
+      // Seed a realistic legacy layout: a non-empty DB-like file, a WAL/SHM
+      // sibling pair, a JSON fingerprint cache, and an events.jsonl inside a
+      // measurement dir with a child file.
+      const legacyDb = join(claude, "agent-coord-state.db");
+      const legacyShm = `${legacyDb}-shm`;
+      const legacyWal = `${legacyDb}-wal`;
+      const legacyFp = join(claude, "agent-coord-fingerprint.json");
+      const legacyDir = join(claude, "agent-coord-measurement");
+      const legacyEvents = join(legacyDir, "events.jsonl");
+
+      writeFileSync(legacyDb, "SQLite-blob");
+      writeFileSync(legacyShm, "shm");
+      writeFileSync(legacyWal, "wal");
+      writeFileSync(legacyFp, '{"root": "abc"}');
+      mkdirSync(legacyDir, { recursive: true });
+      writeFileSync(legacyEvents, '{"event":"seed"}\n');
+
+      const logs: string[] = [];
+      migrate({ home, log: (m) => logs.push(m) });
+
+      // New paths hold the data
+      expect(readFileSync(join(claude, "batonq-state.db"), "utf8")).toBe(
+        "SQLite-blob",
+      );
+      expect(readFileSync(join(claude, "batonq-state.db-shm"), "utf8")).toBe(
+        "shm",
+      );
+      expect(readFileSync(join(claude, "batonq-state.db-wal"), "utf8")).toBe(
+        "wal",
+      );
+      expect(
+        readFileSync(join(claude, "batonq-fingerprint.json"), "utf8"),
+      ).toBe('{"root": "abc"}');
+      expect(
+        readFileSync(
+          join(claude, "batonq-measurement", "events.jsonl"),
+          "utf8",
+        ),
+      ).toBe('{"event":"seed"}\n');
+
+      // Old paths renamed to .bak (no data lost)
+      expect(existsSync(legacyDb)).toBe(false);
+      expect(existsSync(legacyDb + ".bak")).toBe(true);
+      expect(existsSync(legacyFp)).toBe(false);
+      expect(existsSync(legacyFp + ".bak")).toBe(true);
+      expect(existsSync(legacyDir)).toBe(false);
+      expect(existsSync(legacyDir + ".bak")).toBe(true);
+
+      // Success line printed to the provided log sink
+      expect(
+        logs.some((l) => l.startsWith("Migrated from agent-coord to batonq.")),
+      ).toBe(true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("idempotent: second run is a silent no-op", async () => {
+    const { migrate } = await import("../src/migrate");
+    const home = mkdtempSync(join(tmpdir(), "batonq-migrate-"));
+    try {
+      const claude = join(home, ".claude");
+      mkdirSync(claude, { recursive: true });
+      writeFileSync(join(claude, "agent-coord-state.db"), "payload");
+      mkdirSync(join(claude, "agent-coord-measurement"), { recursive: true });
+      writeFileSync(
+        join(claude, "agent-coord-measurement", "events.jsonl"),
+        "line\n",
+      );
+
+      const firstLogs: string[] = [];
+      migrate({ home, log: (m) => firstLogs.push(m) });
+      expect(firstLogs.some((l) => l.includes("Migrated"))).toBe(true);
+
+      // Second call: new state exists, no legacy, must not emit any logs and
+      // must not touch the new files.
+      const newDbBefore = readFileSync(join(claude, "batonq-state.db"), "utf8");
+      const secondLogs: string[] = [];
+      migrate({ home, log: (m) => secondLogs.push(m) });
+      expect(secondLogs.length).toBe(0);
+      expect(readFileSync(join(claude, "batonq-state.db"), "utf8")).toBe(
+        newDbBefore,
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("fresh install (no legacy state) is a no-op and emits nothing", async () => {
+    const { migrate } = await import("../src/migrate");
+    const home = mkdtempSync(join(tmpdir(), "batonq-migrate-"));
+    try {
+      const claude = join(home, ".claude");
+      mkdirSync(claude, { recursive: true });
+
+      const logs: string[] = [];
+      migrate({ home, log: (m) => logs.push(m) });
+      expect(logs.length).toBe(0);
+
+      // No new-path files were conjured out of thin air.
+      expect(existsSync(join(claude, "batonq-state.db"))).toBe(false);
+      expect(existsSync(join(claude, "batonq-measurement"))).toBe(false);
+      expect(existsSync(join(claude, "batonq-fingerprint.json"))).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses to overwrite existing new-path data", async () => {
+    // Defensive: a user could have started a fresh install (creating the new
+    // DB via the hook) and *also* still have the legacy DB sitting around.
+    // Migration must not clobber the live new-path data.
+    const { migrate } = await import("../src/migrate");
+    const home = mkdtempSync(join(tmpdir(), "batonq-migrate-"));
+    try {
+      const claude = join(home, ".claude");
+      mkdirSync(claude, { recursive: true });
+      writeFileSync(join(claude, "agent-coord-state.db"), "legacy");
+      writeFileSync(join(claude, "batonq-state.db"), "fresh");
+
+      const logs: string[] = [];
+      migrate({ home, log: (m) => logs.push(m) });
+
+      expect(readFileSync(join(claude, "batonq-state.db"), "utf8")).toBe(
+        "fresh",
+      );
+      // Fast path via alreadyMigrated(): legacy file is untouched (no .bak).
+      expect(existsSync(join(claude, "agent-coord-state.db"))).toBe(true);
+      expect(existsSync(join(claude, "agent-coord-state.db.bak"))).toBe(false);
+      expect(logs.length).toBe(0);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });

@@ -19,14 +19,24 @@ import { execSync } from "node:child_process";
 import { isAbsolute, resolve, basename } from "node:path";
 import { homedir } from "node:os";
 import { hashFile, extractBashPaths, DESTRUCTIVE, MAX_HASH_BYTES } from "./hook-core";
+import { migrate } from "./migrate";
 
 const MODE = process.argv[2]; // pre | post | bash
 const HOME = homedir();
-const LOG_DIR = `${HOME}/.claude/agent-coord-measurement`;
+const LOG_DIR = `${HOME}/.claude/batonq-measurement`;
 const LOG_PATH = `${LOG_DIR}/events.jsonl`;
-const DB_PATH = `${HOME}/.claude/agent-coord-state.db`;
+const DB_PATH = `${HOME}/.claude/batonq-state.db`;
 const SCOPE_PREFIXES = [`${HOME}/DEV/`, `${HOME}/dev/`];
 const TTL_MS = 10 * 60_000; // 10 min heartbeat window
+
+// One-shot rename of legacy `.claude/agent-coord-*` state. No-op on fresh
+// installs and after migration completes. Runs silently here because hook
+// stdout is consumed by Claude Code; the CLI entry prints the success line.
+try {
+  migrate({ silent: true });
+} catch {
+  // hook discipline: never throw
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -57,9 +67,9 @@ function resolveGitRoot(cwd: string): string | null {
 // Invariant across worktree siblings AND across separate clones of the same remote.
 // Falls back to toplevel path if no remote.
 //
-// Cached in ~/.claude/agent-coord-fingerprint.json keyed by gitRoot to avoid
+// Cached in ~/.claude/batonq-fingerprint.json keyed by gitRoot to avoid
 // 30ms of git subprocess overhead per hook invocation.
-const FINGERPRINT_CACHE_PATH = `${HOME}/.claude/agent-coord-fingerprint.json`;
+const FINGERPRINT_CACHE_PATH = `${HOME}/.claude/batonq-fingerprint.json`;
 
 function computeFingerprint(gitRoot: string): string {
   // cache hit?

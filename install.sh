@@ -11,7 +11,7 @@
 #   3. Installs the three CLI entry points to ~/.local/bin/ or ~/bin/
 #      (whichever is already on PATH, prefer ~/.local/bin).
 #   4. Merges Claude Code hooks into ~/.claude/settings.json (requires jq).
-#   5. Creates ~/.claude/ (for state.db) and ~/.claude/agent-coord-measurement/.
+#   5. Creates ~/.claude/ (for state.db) and ~/.claude/batonq-measurement/.
 #   6. Prints next steps.
 
 set -euo pipefail
@@ -22,7 +22,7 @@ BRANCH="main"
 TMP_DIR="/tmp/${NAME}-install"
 CLAUDE_DIR="${HOME}/.claude"
 SETTINGS="${CLAUDE_DIR}/settings.json"
-MEASUREMENT_DIR="${CLAUDE_DIR}/agent-coord-measurement"
+MEASUREMENT_DIR="${CLAUDE_DIR}/batonq-measurement"
 
 # ── Pretty output ─────────────────────────────────────────────────────────────
 

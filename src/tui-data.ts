@@ -281,8 +281,8 @@ export function latestTasks(tasks: TaskRow[], n: number = 5): TaskRow[] {
 
 // ── paths ─────────────────────────────────────────────────────────────────────
 
-export const DEFAULT_DB_PATH = `${process.env.HOME ?? ""}/.claude/agent-coord-state.db`;
-export const DEFAULT_EVENTS_PATH = `${process.env.HOME ?? ""}/.claude/agent-coord-measurement/events.jsonl`;
+export const DEFAULT_DB_PATH = `${process.env.HOME ?? ""}/.claude/batonq-state.db`;
+export const DEFAULT_EVENTS_PATH = `${process.env.HOME ?? ""}/.claude/batonq-measurement/events.jsonl`;
 
 export function openStateDb(path: string = DEFAULT_DB_PATH): Database {
   if (!existsSync(path)) {

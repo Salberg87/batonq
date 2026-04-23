@@ -26,14 +26,24 @@ import {
   sweepTasks as sweepTasksCore,
   type ParsedTask,
 } from "./tasks-core";
+import { migrate } from "./migrate";
 
 const HOME = homedir();
-const LOG_DIR = `${HOME}/.claude/agent-coord-measurement`;
+const LOG_DIR = `${HOME}/.claude/batonq-measurement`;
 const LOG_PATH = `${LOG_DIR}/events.jsonl`;
-const DB_PATH = `${HOME}/.claude/agent-coord-state.db`;
-const HOOK_PATH = `${HOME}/bin/agent-coord-hook`;
+const DB_PATH = `${HOME}/.claude/batonq-state.db`;
+const HOOK_PATH = `${HOME}/bin/batonq-hook`;
 const SETTINGS_PATH = `${HOME}/.claude/settings.json`;
 const TASKS_PATH = `${HOME}/DEV/TASKS.md`;
+
+// One-shot rename migration from legacy `.claude/agent-coord-*` layout.
+// No-op on fresh installs and after the first successful migration.
+// Runs before any command dispatch so every entry point sees the new paths.
+try {
+  migrate();
+} catch {
+  // migration is best-effort; never block the CLI
+}
 
 const cmd = process.argv[2];
 
@@ -133,11 +143,11 @@ function check() {
         arr.some((b: any) =>
           b.hooks?.some((h: any) => typeof h.command === "string" && pat.test(h.command))
         );
-      if (has(pre, /agent-coord-hook pre/)) ok("PreToolUse hook (pre) configured");
+      if (has(pre, /(?:agent-coord-hook|batonq-hook)\s+pre\b/)) ok("PreToolUse hook (pre) configured");
       else bad("PreToolUse hook (pre) NOT configured");
-      if (has(pre, /agent-coord-hook bash/)) ok("PreToolUse hook (bash) configured");
+      if (has(pre, /(?:agent-coord-hook|batonq-hook)\s+bash\b/)) ok("PreToolUse hook (bash) configured");
       else bad("PreToolUse hook (bash) NOT configured");
-      if (has(post, /agent-coord-hook post/)) ok("PostToolUse hook (post) configured");
+      if (has(post, /(?:agent-coord-hook|batonq-hook)\s+post\b/)) ok("PostToolUse hook (post) configured");
       else bad("PostToolUse hook (post) NOT configured");
     } catch (e: any) {
       bad(`could not parse settings.json: ${e.message}`);
