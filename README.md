@@ -409,6 +409,9 @@ transactions), and the **hooks** (`batonq-hook pre|bash|post`, 2-second
 timeout, never blocks Claude on its own failure). Everything else is a shell
 of unix verbs around those three files.
 
+For mermaid-rendered component, state, claim-write-path, and data-flow
+diagrams (with prose), see [`docs/architecture.md`](./docs/architecture.md).
+
 ## FAQ
 
 **Something isn't working — where do I start?**
