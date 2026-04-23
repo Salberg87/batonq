@@ -504,4 +504,35 @@ describe("AddTaskForm", () => {
     expect(submitted).toBeNull();
     expect(readFileSync(tasksPath, "utf8")).toBe(before);
   });
+
+  test("validateNewTask — body required, repo required", () => {
+    expect(validateNewTask({ repo: "r", body: "" }).ok).toBe(false);
+    expect(validateNewTask({ repo: "r", body: "   " }).reason).toBe(
+      "body-required",
+    );
+    expect(validateNewTask({ repo: "", body: "b" }).reason).toBe(
+      "repo-required",
+    );
+    expect(validateNewTask({ repo: "r", body: "b" }).ok).toBe(true);
+  });
+
+  test("appendTaskToPending — omits verify/judge when not supplied", () => {
+    appendTaskToPending(tasksPath, { repo: "any:infra", body: "bare body" });
+    const after = readFileSync(tasksPath, "utf8");
+    expect(after).toContain("- [ ] **any:infra** — bare body");
+    // None of the trailing rows should be a verify:/judge: for our task.
+    const bareIdx = after.indexOf("bare body");
+    const rest = after.slice(bareIdx);
+    const nextTwoLines = rest.split("\n").slice(0, 3).join("\n");
+    expect(nextTwoLines).not.toContain("verify:");
+    expect(nextTwoLines).not.toContain("judge:");
+  });
+
+  test("appendTaskToPending — throws when ## Pending section is missing", () => {
+    const bad = join(dir, "no-pending.md");
+    writeFileSync(bad, "# Tasks\n\njust some text, no headings\n");
+    expect(() => appendTaskToPending(bad, { repo: "r", body: "b" })).toThrow(
+      /Pending/,
+    );
+  });
 });
