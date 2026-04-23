@@ -99,6 +99,132 @@ describe("parseTasksFile", () => {
     expect(tasks).toHaveLength(1);
     expect(tasks[0]?.repo).toBe("repo-x");
   });
+
+  // Regression: previously the parser only peeked at line i+1 for verify:/judge:
+  // so a multi-paragraph body with indented prose between the task line and the
+  // directive lost the gates entirely. New contract: scan the whole task block
+  // until the next `- [ ]` or EOF.
+
+  test("captures verify: in multi-paragraph body (directive 3 lines below task)", () => {
+    const { tasks } = parseTasksText(
+      [
+        "- [ ] **any:infra** — multi-line task with prose before gate",
+        "",
+        "  Some indented continuation paragraph that describes the task.",
+        "  verify: echo ok",
+        "",
+        "- [ ] **other** — next task",
+      ].join("\n"),
+    );
+    expect(tasks).toHaveLength(2);
+    expect(tasks[0]?.verifyCmd).toBe("echo ok");
+    expect(tasks[0]?.judgeCmd).toBeUndefined();
+    // Directive must not leak into the following task
+    expect(tasks[1]?.verifyCmd).toBeUndefined();
+  });
+
+  test("multi-paragraph body with both verify: and judge: on non-adjacent lines", () => {
+    const { tasks } = parseTasksText(
+      [
+        "- [ ] **any:infra** — multi-paragraph indented task",
+        "",
+        "  First paragraph of prose.",
+        "",
+        "  **Fix A:** some bolded sub-heading in the body.",
+        "",
+        "  Another paragraph before the gates.",
+        "  verify: run-verify.sh",
+        "  judge: is this correct? PASS/FAIL.",
+        "",
+        "- [ ] **next** — boundary",
+      ].join("\n"),
+    );
+    expect(tasks[0]?.verifyCmd).toBe("run-verify.sh");
+    expect(tasks[0]?.judgeCmd).toBe("is this correct? PASS/FAIL.");
+  });
+
+  test("verify: inside a fenced code block is NOT captured as a directive", () => {
+    const { tasks } = parseTasksText(
+      [
+        "- [ ] **any:infra** — task demonstrating a code block",
+        "",
+        "  Example command the user might paste:",
+        "",
+        "  ```bash",
+        "  verify: this-is-documentation-not-a-gate",
+        "  ```",
+        "",
+        "  verify: actual-verify-cmd",
+        "",
+        "- [ ] **next** — boundary",
+      ].join("\n"),
+    );
+    expect(tasks[0]?.verifyCmd).toBe("actual-verify-cmd");
+  });
+
+  test("task with no verify/judge returns undefined for both", () => {
+    const { tasks } = parseTasksText(
+      [
+        "- [ ] **any:infra** — task with no directives at all",
+        "",
+        "  Just some prose, no gates here.",
+        "",
+        "- [ ] **next** — another bare task",
+      ].join("\n"),
+    );
+    expect(tasks[0]?.verifyCmd).toBeUndefined();
+    expect(tasks[0]?.judgeCmd).toBeUndefined();
+    expect(tasks[1]?.verifyCmd).toBeUndefined();
+    expect(tasks[1]?.judgeCmd).toBeUndefined();
+  });
+
+  test("first occurrence wins when a directive appears multiple times", () => {
+    const { tasks } = parseTasksText(
+      [
+        "- [ ] **any:infra** — duplicate-directive task",
+        "  verify: first-verify",
+        "  verify: second-verify-should-be-ignored",
+        "  judge: first-judge",
+        "  judge: second-judge-should-be-ignored",
+      ].join("\n"),
+    );
+    expect(tasks[0]?.verifyCmd).toBe("first-verify");
+    expect(tasks[0]?.judgeCmd).toBe("first-judge");
+  });
+
+  test("dogfood fixture mirroring task 26f32c3d1104 (multi-paragraph with hidden verify/judge)", () => {
+    // This fixture reproduces the exact structure of the "TUI add-task hardening"
+    // task from ~/DEV/TASKS.md that the old parser was missing: multi-paragraph
+    // prose body with bolded sub-headings and BOTH verify/judge on the last two
+    // lines of the block. External id for ("any:infra", body) = 26f32c3d1104.
+    const body =
+      "TUI add-task hardening (basert på judge-FAIL fra 8e1dba0a2439). Judge-dommen identifiserte to issues: (3) auto-refresh-delay opptil 2s etter submit før task vises i listen, og (4) kritisk race condition i `appendTaskToPending` — ingen flock/atomic rename, to samtidige TUI-instanser som begge trykker `n` vil overskrive hverandres tasks silent. Fiks begge i `~/DEV/batonq/src/tui.tsx` + core:";
+    const fixture = [
+      `- [x] 2026-04-23 **any:infra** — ${body}`,
+      "",
+      "  **Fix 4 (race condition, kritisk):** endre `appendTaskToPending` til å bruke atomic rename-pattern.",
+      "",
+      "  **Fix 3 (refresh-delay):** etter submit, trigger umiddelbar refresh.",
+      "",
+      '  Legg til 2 nye tester. Commit: "fix(tui): race-safe task append + immediate post-submit refresh".',
+      "  verify: cd /Users/fsalb/DEV/batonq && bun test tests/tui.test.ts",
+      "  judge: Ble begge issues faktisk fikset? PASS/FAIL + per-punkt-vurdering.",
+      "",
+      "- [ ] **any:infra** — the task that comes right after — must NOT inherit directives",
+    ].join("\n");
+    const { tasks } = parseTasksText(fixture);
+    expect(tasks).toHaveLength(2);
+    const [hardening, next] = tasks;
+    expect(externalId(hardening!.repo, hardening!.body)).toBe("26f32c3d1104");
+    expect(hardening!.verifyCmd).toBe(
+      "cd /Users/fsalb/DEV/batonq && bun test tests/tui.test.ts",
+    );
+    expect(hardening!.judgeCmd).toBe(
+      "Ble begge issues faktisk fikset? PASS/FAIL + per-punkt-vurdering.",
+    );
+    expect(next!.verifyCmd).toBeUndefined();
+    expect(next!.judgeCmd).toBeUndefined();
+  });
 });
 
 // ── 2. externalId: deterministic + collision-free across repo+body ────────────

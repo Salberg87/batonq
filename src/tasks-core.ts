@@ -42,10 +42,19 @@ export function parseTasksText(text: string): {
   lines: string[];
   tasks: ParsedTask[];
 } {
+  // Single pass: iterate every line with HTML-comment / code-fence state
+  // tracked continuously. The current "owning" task accumulates verify: and
+  // judge: directives that appear anywhere in its block (prose paragraphs,
+  // blank lines, indented continuations) until the next task line starts.
+  // Directives inside ```fences``` or <!-- comments --> are skipped because
+  // those branches `continue` before the verify/judge match runs.
+  // First occurrence of each directive wins — a task with two verify: lines
+  // keeps the first one.
   const lines = text.split("\n");
   const tasks: ParsedTask[] = [];
   let inHtmlComment = false;
   let inCodeFence = false;
+  let current: ParsedTask | null = null;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
     if (!inHtmlComment && /^\s*```/.test(line)) {
@@ -63,32 +72,30 @@ export function parseTasksText(text: string): {
       continue;
     }
     const m = line.match(TASK_RE);
-    if (!m) continue;
-    const status: ParsedTask["status"] =
-      m[1] === " " ? "pending" : m[1] === "~" ? "claimed" : "done";
-    let verifyCmd: string | undefined;
-    let judgeCmd: string | undefined;
-    const nextIdx = i + 1;
-    if (nextIdx < lines.length) {
-      const vm = lines[nextIdx]!.match(VERIFY_RE);
-      if (vm) verifyCmd = vm[1];
-      else {
-        const jm = lines[nextIdx]!.match(JUDGE_RE);
-        if (jm) judgeCmd = jm[1];
+    if (m) {
+      const status: ParsedTask["status"] =
+        m[1] === " " ? "pending" : m[1] === "~" ? "claimed" : "done";
+      current = {
+        repo: m[2]!.trim(),
+        body: m[3]!.trim(),
+        status,
+        lineIdx: i,
+      };
+      tasks.push(current);
+      continue;
+    }
+    if (!current) continue;
+    if (current.verifyCmd === undefined) {
+      const vm = line.match(VERIFY_RE);
+      if (vm) {
+        current.verifyCmd = vm[1];
+        continue;
       }
     }
-    if (nextIdx + 1 < lines.length && verifyCmd) {
-      const jm = lines[nextIdx + 1]!.match(JUDGE_RE);
-      if (jm) judgeCmd = jm[1];
+    if (current.judgeCmd === undefined) {
+      const jm = line.match(JUDGE_RE);
+      if (jm) current.judgeCmd = jm[1];
     }
-    tasks.push({
-      repo: m[2]!.trim(),
-      body: m[3]!.trim(),
-      status,
-      lineIdx: i,
-      verifyCmd,
-      judgeCmd,
-    });
   }
   return { lines, tasks };
 }
