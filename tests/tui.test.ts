@@ -36,7 +36,13 @@ import {
   validateNewTask,
   type NewTask,
 } from "../src/tasks-core";
-import { AddTaskForm } from "../src/tui";
+import {
+  AddTaskForm,
+  parseQuestions,
+  QuestionsOverlay,
+  type ParsedQuestion,
+} from "../src/tui";
+import { TasksPanel } from "../src/tui-panels";
 
 // ── schema helpers ────────────────────────────────────────────────────────────
 
@@ -370,7 +376,12 @@ describe("loadSnapshot", () => {
     expect(snap.claims).toHaveLength(1);
     expect(snap.claims[0]?.file_path).toBe("/repo-a/src/file.ts");
 
-    expect(snap.tasks.counts).toEqual({ pending: 1, claimed: 1, done: 1 });
+    expect(snap.tasks.counts).toEqual({
+      drafts: 0,
+      pending: 1,
+      claimed: 1,
+      done: 1,
+    });
     expect(snap.tasks.latest).toHaveLength(3);
     // most recent timestamp = t-done (completed 5s ago), then t-claimed (15s), then t-pending (-3600 created)
     expect(snap.tasks.latest.map((t) => t.external_id)).toEqual([
@@ -410,7 +421,12 @@ describe("loadSnapshot", () => {
     const snap = loadSnapshot(db, { now: NOW });
     expect(snap.sessions).toEqual([]);
     expect(snap.claims).toEqual([]);
-    expect(snap.tasks.counts).toEqual({ pending: 0, claimed: 0, done: 0 });
+    expect(snap.tasks.counts).toEqual({
+      drafts: 0,
+      pending: 0,
+      claimed: 0,
+      done: 0,
+    });
     expect(snap.tasks.latest).toEqual([]);
     db.close();
   });
@@ -588,5 +604,231 @@ appendTaskToPending(tasksPath, { repo: "any:infra", body });
     expect(after).toContain("- [ ] **repo-a** — existing task");
     // Lockfile cleaned up after all processes finished.
     expect(existsSync(tasksPath + ".lock")).toBe(false);
+  });
+});
+
+// ── draft workflow: parseQuestions / overlay / hybrid view ────────────────────
+
+describe("parseQuestions", () => {
+  test("splits numbered questions, trims whitespace", () => {
+    const qs = parseQuestions(
+      "1. Which dir should the helper live in?\n2. Any return-type constraints?",
+    );
+    expect(qs).toHaveLength(2);
+    expect(qs[0]?.n).toBe("1");
+    expect(qs[0]?.text).toBe("Which dir should the helper live in?");
+    expect(qs[1]?.n).toBe("2");
+    expect(qs[1]?.text).toBe("Any return-type constraints?");
+  });
+  test("folds continuation lines into the previous question", () => {
+    const qs = parseQuestions(
+      "1. A long question\n   that wraps onto the next line?\n2. Short one?",
+    );
+    expect(qs).toHaveLength(2);
+    expect(qs[0]?.text).toContain("wraps onto the next line");
+    expect(qs[1]?.text).toBe("Short one?");
+  });
+  test("empty / null returns empty list", () => {
+    expect(parseQuestions("")).toEqual([]);
+    expect(parseQuestions(null)).toEqual([]);
+    expect(parseQuestions(undefined)).toEqual([]);
+  });
+  test("supports '1) text' numbering too", () => {
+    const qs = parseQuestions("1) first\n2) second");
+    expect(qs.map((q) => q.text)).toEqual(["first", "second"]);
+  });
+});
+
+describe("QuestionsOverlay", () => {
+  // Test (a) from task spec: enrich med questions rendrer overlay.
+  // We render QuestionsOverlay directly (the TUI opens it on `e` when the
+  // selected draft already has enrich_questions stored) and assert the
+  // overlay text surfaces the questions the user must answer inline.
+  test("renders each question and the help footer", () => {
+    const questions: ParsedQuestion[] = [
+      { n: "1", text: "Which dir should the helper live in?" },
+      { n: "2", text: "Any return-type constraints?" },
+    ];
+    const { lastFrame, unmount } = render(
+      React.createElement(QuestionsOverlay, {
+        eid: "deadbeef00ab",
+        questions,
+        onSubmit: () => {},
+        onCancel: () => {},
+      }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("Clarifying questions");
+    expect(out).toContain("deadbeef");
+    expect(out).toContain("1. Which dir should the helper live in?");
+    expect(out).toContain("2. Any return-type constraints?");
+    expect(out).toContain("Esc: cancel");
+    unmount();
+  });
+
+  test("Enter with blank answer does NOT submit; Esc cancels", async () => {
+    let submitted = false;
+    let cancelled = false;
+    const { stdin, unmount } = render(
+      React.createElement(QuestionsOverlay, {
+        eid: "abc123",
+        questions: [{ n: "1", text: "A?" }],
+        onSubmit: () => {
+          submitted = true;
+        },
+        onCancel: () => {
+          cancelled = true;
+        },
+      }),
+    );
+    stdin.write("\r"); // Enter on empty answer — must be rejected
+    await new Promise((r) => setTimeout(r, 20));
+    expect(submitted).toBe(false);
+    stdin.write("\x1B"); // Esc
+    await new Promise((r) => setTimeout(r, 20));
+    unmount();
+    expect(cancelled).toBe(true);
+  });
+});
+
+describe("TasksPanel draft display", () => {
+  // Test (b) from task spec: enrich uten questions viser hybrid view.
+  // A draft with original_body !== body means enrichment already rewrote the
+  // body; the panel must surface both — enriched body as main content, a
+  // collapsed "Original: …" metadata line (press `o` to expand).
+  const mkDraft = (overrides: Partial<TaskRow> = {}): TaskRow => ({
+    id: 1,
+    external_id: "abcdef012345",
+    repo: "any:infra",
+    body: "Implement helper(s) returning number; add unit tests",
+    status: "draft",
+    claimed_by: null,
+    claimed_at: null,
+    completed_at: null,
+    created_at: "2026-04-23T10:00:00.000Z",
+    original_body: "add a helper",
+    enrich_questions: null,
+    ...overrides,
+  });
+
+  test("draft badge + collapsed 'Original: …' metadata shown for enriched drafts", () => {
+    const draft = mkDraft();
+    const { lastFrame, unmount } = render(
+      React.createElement(TasksPanel, {
+        latest: [draft],
+        counts: { drafts: 1, pending: 0, claimed: 0, done: 0 },
+        selected: 0,
+        focused: true,
+      }),
+    );
+    const out = lastFrame() ?? "";
+    // Draft badge with accent marker
+    expect(out).toContain("📝draft");
+    // Enriched body is the main content
+    expect(out).toContain("Implement helper");
+    // Original is visible but truncated, and invites `o` to expand
+    expect(out).toContain("Original: add a helper");
+    expect(out).toContain("o: expand");
+    unmount();
+  });
+
+  test("draft WITHOUT original_body shows only the draft body, no hybrid line", () => {
+    const { lastFrame, unmount } = render(
+      React.createElement(TasksPanel, {
+        latest: [mkDraft({ original_body: null })],
+        counts: { drafts: 1, pending: 0, claimed: 0, done: 0 },
+        selected: 0,
+        focused: true,
+      }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("📝draft");
+    expect(out).not.toContain("Original:");
+    unmount();
+  });
+
+  test("expandedOriginals toggles 'o: expand' ↔ 'o: collapse' for that eid", () => {
+    const draft = mkDraft();
+    const { lastFrame, unmount } = render(
+      React.createElement(TasksPanel, {
+        latest: [draft],
+        counts: { drafts: 1, pending: 0, claimed: 0, done: 0 },
+        selected: 0,
+        focused: true,
+        expandedOriginals: new Set([draft.external_id]),
+      }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("o: collapse");
+    expect(out).not.toContain("o: expand");
+    unmount();
+  });
+
+  test("title includes drafts count", () => {
+    const { lastFrame, unmount } = render(
+      React.createElement(TasksPanel, {
+        latest: [mkDraft()],
+        counts: { drafts: 3, pending: 2, claimed: 1, done: 0 },
+        selected: 0,
+        focused: true,
+      }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("drafts 3");
+    expect(out).toContain("pending 2");
+    unmount();
+  });
+});
+
+// ── test (c): promote flips DB + TASKS.md ─────────────────────────────────────
+//
+// The TUI's `p` keybind shells out to `batonq promote <id>` via runPromote.
+// Rather than mock spawnSync, we drive the actual core function — the same
+// one the CLI invokes — and assert the DB + file transition that the TUI
+// will then see on its next 2s snapshot. This matches the contract the TUI
+// depends on: "pressing p flips status from draft to pending everywhere".
+
+import {
+  promoteDraftToPending,
+  externalId as coreEid,
+  initTaskSchema,
+} from "../src/tasks-core";
+
+describe("promote (TUI keybind `p` backing behavior)", () => {
+  test("promoteDraftToPending flips DB + MD for the selected draft", () => {
+    const dir = mkdtempSync(join(tmpdir(), "batonq-promote-"));
+    try {
+      const tasksPath = join(dir, "TASKS.md");
+      writeFileSync(
+        tasksPath,
+        "# Tasks\n\n## Pending\n\n- [?] **any:infra** — enriched spec body\n  verify: echo ok\n  judge: PASS/FAIL\n\n## Done\n",
+      );
+      const db = new Database(":memory:");
+      initTaskSchema(db);
+      const eid = coreEid("any:infra", "enriched spec body");
+      db.run(
+        `INSERT INTO tasks (external_id, repo, body, status, created_at, original_body) VALUES (?, ?, ?, 'draft', ?, ?)`,
+        [
+          eid,
+          "any:infra",
+          "enriched spec body",
+          "2026-04-23T10:00:00.000Z",
+          "terse",
+        ],
+      );
+
+      expect(promoteDraftToPending(db, tasksPath, eid)).toBe(true);
+
+      const row = db
+        .query("SELECT status FROM tasks WHERE external_id = ?")
+        .get(eid) as any;
+      expect(row.status).toBe("pending");
+      const md = readFileSync(tasksPath, "utf8");
+      expect(md).toContain("- [ ] **any:infra** — enriched spec body");
+      expect(md).not.toContain("- [?] **any:infra** — enriched spec body");
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

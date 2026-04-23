@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import {
+  appendClarifyingAnswers,
   appendTaskToPending,
   applyEnrichment,
   claimCandidate,
@@ -1074,6 +1075,277 @@ rewriteMdTaskStatus(tasksPath, "any:infra", body, "pending");
     expect(after).not.toContain("stale-leftover-judge-should-be-replaced");
     // Lockfile cleaned up
     expect(readFileSync(tasksPath, "utf8").includes(".lock")).toBe(false);
+    db.close();
+  });
+
+  // applyEnrichment must snapshot original_body on the first mutation so the
+  // TUI hybrid view can surface the user's terse input alongside the enriched
+  // spec. On subsequent enrichments the column is NOT overwritten.
+  test("applyEnrichment snapshots original_body on first enriched mutation", () => {
+    const db = memDb();
+    const tasksPath = join(workdir, "TASKS.md");
+    writeFileSync(
+      tasksPath,
+      "# Tasks\n\n## Pending\n\n- [?] **any:infra** — short terse body\n\n## Done\n",
+    );
+    const { eid } = seedDraftRow(db, "any:infra", "short terse body");
+
+    applyEnrichment(
+      db,
+      tasksPath,
+      eid,
+      parseEnrichResponse(
+        "First enriched version with real acceptance criteria.\n\nverify: echo ok\njudge: PASS",
+      ),
+    );
+
+    const row1 = db
+      .query("SELECT body, original_body FROM tasks WHERE repo = ?")
+      .get("any:infra") as any;
+    expect(row1.original_body).toBe("short terse body");
+    expect(row1.body).toContain("First enriched version");
+
+    // Second enrichment against the same row (simulating a re-run after a
+    // human tweak) must preserve the ORIGINAL snapshot, not overwrite it
+    // with the already-enriched body.
+    const currentEid = (
+      db
+        .query("SELECT external_id FROM tasks WHERE repo = ?")
+        .get("any:infra") as any
+    ).external_id;
+    applyEnrichment(
+      db,
+      tasksPath,
+      currentEid,
+      parseEnrichResponse(
+        "Second revision of the body.\n\nverify: echo ok2\njudge: PASS2",
+      ),
+    );
+    const row2 = db
+      .query("SELECT body, original_body FROM tasks WHERE repo = ?")
+      .get("any:infra") as any;
+    expect(row2.original_body).toBe("short terse body");
+    expect(row2.body).toContain("Second revision");
+    db.close();
+  });
+
+  test("appendClarifyingAnswers rewrites body, clears questions, snapshots original_body", () => {
+    const db = memDb();
+    const tasksPath = join(workdir, "TASKS.md");
+    writeFileSync(
+      tasksPath,
+      "# Tasks\n\n## Pending\n\n- [?] **any:infra** — terse body\n\n## Done\n",
+    );
+    const { eid } = seedDraftRow(db, "any:infra", "terse body");
+    // Simulate a prior QUESTIONS response having stored questions.
+    db.run(`UPDATE tasks SET enrich_questions = ? WHERE external_id = ?`, [
+      "1. Which dir?\n2. Which port?",
+      eid,
+    ]);
+
+    const out = appendClarifyingAnswers(db, tasksPath, eid, [
+      { question: "Which dir?", answer: "src/cli" },
+      { question: "Which port?", answer: "3000" },
+    ]);
+    expect(out.newExternalId).not.toBe(eid);
+
+    const row = db
+      .query(
+        "SELECT body, enrich_questions, original_body FROM tasks WHERE external_id = ?",
+      )
+      .get(out.newExternalId) as any;
+    expect(row.enrich_questions).toBeNull();
+    expect(row.original_body).toBe("terse body");
+    expect(row.body).toContain("terse body");
+    expect(row.body).toContain("Which dir?");
+    expect(row.body).toContain("src/cli");
+    expect(row.body).toContain("3000");
+    // TASKS.md updated with new body line
+    const md = readFileSync(tasksPath, "utf8");
+    expect(md).toContain("- [?] **any:infra** — terse body [clarifications");
+    db.close();
+  });
+
+  test("appendClarifyingAnswers refuses non-draft rows and empty answer lists", () => {
+    const db = memDb();
+    const tasksPath = join(workdir, "TASKS.md");
+    writeFileSync(tasksPath, "# Tasks\n\n## Pending\n\n## Done\n");
+    const eid = externalId("any:infra", "pending body");
+    db.run(
+      `INSERT INTO tasks (external_id, repo, body, status, created_at) VALUES (?, ?, ?, 'pending', ?)`,
+      [eid, "any:infra", "pending body", "2026-04-23T00:00:00.000Z"],
+    );
+    expect(() =>
+      appendClarifyingAnswers(db, tasksPath, eid, [
+        { question: "q", answer: "a" },
+      ]),
+    ).toThrow(/can only answer drafts/);
+
+    const draftEid = externalId("any:infra", "draft body");
+    db.run(
+      `INSERT INTO tasks (external_id, repo, body, status, created_at) VALUES (?, ?, ?, 'draft', ?)`,
+      [draftEid, "any:infra", "draft body", "2026-04-23T00:00:00.000Z"],
+    );
+    expect(() => appendClarifyingAnswers(db, tasksPath, draftEid, [])).toThrow(
+      /no clarifying answers/,
+    );
+    db.close();
+  });
+
+  // End-to-end draft lifecycle with a MOCKED opus response: submit (TUI
+  // appendTaskToPending with draft) → syncTasks to populate DB → enrichTaskBody
+  // with injected spawn → applyEnrichment → promoteDraftToPending. Exercises
+  // every state transition the TUI keybinds drive behind the scenes, without
+  // shelling out to claude.
+  test("end-to-end: submit → draft → enrich (mocked opus) → promote", () => {
+    const db = memDb();
+    const tasksPath = join(workdir, "TASKS.md");
+    writeFileSync(tasksPath, "# Tasks\n\n## Pending\n\n## Done\n");
+
+    // Step 1 — submit via the TUI form path (appendTaskToPending with draft).
+    const submittedEid = appendTaskToPending(
+      tasksPath,
+      { repo: "any:infra", body: "Build CLI migration runner" },
+      "draft",
+    );
+
+    // Step 2 — syncTasks populates the DB from the MD file.
+    const { tasks: parsed } = parseTasksFile(tasksPath);
+    syncTasks(db, parsed);
+    const afterSync = db
+      .query("SELECT status, body FROM tasks WHERE external_id = ?")
+      .get(submittedEid) as any;
+    expect(afterSync.status).toBe("draft");
+    expect(afterSync.body).toBe("Build CLI migration runner");
+
+    // Step 3 — enrich w/ mocked opus response.
+    const mocked: SpawnFn = () => ({
+      status: 0,
+      signal: null,
+      stdout: [
+        "Implement src/cli/migrate.ts exposing `batonq migrate <file>`.",
+        "Acceptance: running with a sample .sql file prints 'applied'.",
+        "",
+        "verify: bun test tests/migrate.test.ts",
+        "judge: Did the diff add a migrate subcommand? PASS/FAIL.",
+      ].join("\n"),
+      stderr: "",
+      error: null,
+    });
+    const enriched = enrichTaskBody(afterSync.body, workdir, mocked);
+    expect(enriched.kind).toBe("enriched");
+    const applied = applyEnrichment(db, tasksPath, submittedEid, enriched);
+    expect(applied.kind).toBe("enriched");
+
+    // After apply: original_body snapshot, new external_id (body changed),
+    // verify/judge captured, status still draft, enrich_questions cleared.
+    const enrichedRow = db
+      .query(
+        "SELECT status, body, original_body, verify_cmd, judge_cmd, enrich_questions FROM tasks WHERE repo = 'any:infra'",
+      )
+      .get() as any;
+    expect(enrichedRow.status).toBe("draft");
+    expect(enrichedRow.original_body).toBe("Build CLI migration runner");
+    expect(enrichedRow.body).toContain("batonq migrate");
+    expect(enrichedRow.verify_cmd).toBe("bun test tests/migrate.test.ts");
+    expect(enrichedRow.judge_cmd).toContain("PASS/FAIL");
+    expect(enrichedRow.enrich_questions).toBeNull();
+
+    // Step 4 — promote. Status flips to pending in DB AND in TASKS.md.
+    const newEid =
+      applied.kind === "enriched" ? applied.newExternalId : submittedEid;
+    const promoted = promoteDraftToPending(db, tasksPath, newEid);
+    expect(promoted).toBe(true);
+    const finalRow = db
+      .query("SELECT status FROM tasks WHERE external_id = ?")
+      .get(newEid) as any;
+    expect(finalRow.status).toBe("pending");
+    const md = readFileSync(tasksPath, "utf8");
+    expect(md).toMatch(/- \[ \] \*\*any:infra\*\* — .*batonq migrate/);
+    expect(md).not.toMatch(/- \[\?\] \*\*any:infra\*\*/);
+
+    // selectCandidate now sees it (it was a draft before, invisible to pick).
+    const candidate = selectCandidate(db, { repo: "any:infra" }) as any;
+    expect(candidate?.external_id).toBe(newEid);
+    db.close();
+  });
+
+  // End-to-end: QUESTIONS response → answer overlay path → re-enrich. The TUI
+  // would drive this via submitClarifyingAnswers; here we go straight to core.
+  test("end-to-end questions path: QUESTIONS → answers → successful re-enrich", () => {
+    const db = memDb();
+    const tasksPath = join(workdir, "TASKS.md");
+    writeFileSync(
+      tasksPath,
+      "# Tasks\n\n## Pending\n\n- [?] **any:infra** — add a helper\n\n## Done\n",
+    );
+    const { eid } = seedDraftRow(db, "any:infra", "add a helper");
+
+    // 1st opus call → questions.
+    const questionsOut = enrichTaskBody("add a helper", workdir, () => ({
+      status: 0,
+      signal: null,
+      stdout:
+        "QUESTIONS:\n1. Where should the helper live?\n2. What signature?\n",
+      stderr: "",
+      error: null,
+    }));
+    expect(questionsOut.kind).toBe("questions");
+    applyEnrichment(db, tasksPath, eid, questionsOut);
+    const afterQ = db
+      .query(
+        "SELECT status, enrich_questions, original_body FROM tasks WHERE external_id = ?",
+      )
+      .get(eid) as any;
+    expect(afterQ.status).toBe("draft");
+    expect(afterQ.enrich_questions).toContain("Where should the helper live?");
+    expect(afterQ.original_body).toBeNull(); // questions path does NOT snapshot
+
+    // User answers → appendClarifyingAnswers snapshots original_body and
+    // rewrites body + external_id.
+    const { newExternalId } = appendClarifyingAnswers(db, tasksPath, eid, [
+      {
+        question: "Where should the helper live?",
+        answer: "src/util/helper.ts",
+      },
+      { question: "What signature?", answer: "(s: string) => number" },
+    ]);
+    const afterAnswer = db
+      .query(
+        "SELECT status, body, original_body, enrich_questions FROM tasks WHERE external_id = ?",
+      )
+      .get(newExternalId) as any;
+    expect(afterAnswer.enrich_questions).toBeNull();
+    expect(afterAnswer.original_body).toBe("add a helper");
+    expect(afterAnswer.body).toContain("src/util/helper.ts");
+
+    // 2nd opus call with answers in body → now enriched, original_body preserved.
+    const enrichedOut = enrichTaskBody(afterAnswer.body, workdir, () => ({
+      status: 0,
+      signal: null,
+      stdout: [
+        "Write src/util/helper.ts exporting helper(s: string): number.",
+        "",
+        "verify: bun test tests/util.test.ts",
+        "judge: Helper added and typed correctly? PASS/FAIL.",
+      ].join("\n"),
+      stderr: "",
+      error: null,
+    }));
+    const applied = applyEnrichment(db, tasksPath, newExternalId, enrichedOut);
+    expect(applied.kind).toBe("enriched");
+    const finalEid =
+      applied.kind === "enriched" ? applied.newExternalId : newExternalId;
+    const final = db
+      .query(
+        "SELECT status, body, original_body FROM tasks WHERE external_id = ?",
+      )
+      .get(finalEid) as any;
+    expect(final.status).toBe("draft");
+    expect(final.body).toContain("helper(s: string): number");
+    // Original snapshot is still the user's very first terse body,
+    // NOT the Q&A-augmented intermediate.
+    expect(final.original_body).toBe("add a helper");
     db.close();
   });
 });

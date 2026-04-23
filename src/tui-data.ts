@@ -27,11 +27,15 @@ export type TaskRow = {
   external_id: string;
   repo: string;
   body: string;
-  status: "pending" | "claimed" | "done";
+  status: "draft" | "pending" | "claimed" | "done";
   claimed_by: string | null;
   claimed_at: string | null;
   completed_at: string | null;
   created_at: string;
+  verify_cmd?: string | null;
+  judge_cmd?: string | null;
+  enrich_questions?: string | null;
+  original_body?: string | null;
 };
 
 export type EventRow = {
@@ -51,11 +55,17 @@ export type Snapshot = {
   sessions: SessionRow[];
   claims: ClaimRow[];
   tasks: {
+    drafts: TaskRow[];
     pending: TaskRow[];
     claimed: TaskRow[];
     done: TaskRow[];
     latest: TaskRow[];
-    counts: { pending: number; claimed: number; done: number };
+    counts: {
+      drafts: number;
+      pending: number;
+      claimed: number;
+      done: number;
+    };
   };
   events: EventRow[];
 };
@@ -211,6 +221,9 @@ export function loadSnapshot(
     )
     .all() as ClaimRow[];
 
+  const drafts = db
+    .query("SELECT * FROM tasks WHERE status = 'draft' ORDER BY created_at")
+    .all() as TaskRow[];
   const pending = db
     .query("SELECT * FROM tasks WHERE status = 'pending' ORDER BY id")
     .all() as TaskRow[];
@@ -225,7 +238,7 @@ export function loadSnapshot(
     )
     .all() as TaskRow[];
 
-  const latest = latestTasks([...pending, ...claimed, ...done], 5);
+  const latest = latestTasks([...drafts, ...pending, ...claimed, ...done], 6);
 
   const events = opts.eventsPath
     ? readEventsTail(opts.eventsPath, opts.limit ?? 20)
@@ -236,11 +249,13 @@ export function loadSnapshot(
     sessions,
     claims,
     tasks: {
+      drafts,
       pending,
       claimed,
       done,
       latest,
       counts: {
+        drafts: drafts.length,
         pending: pending.length,
         claimed: claimed.length,
         done: done.length,
@@ -300,7 +315,15 @@ export function openStateDb(path: string = DEFAULT_DB_PATH): Database {
         claimed_by TEXT,
         claimed_at TEXT,
         completed_at TEXT,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        verify_cmd TEXT,
+        verify_output TEXT,
+        verify_ran_at TEXT,
+        judge_cmd TEXT,
+        judge_output TEXT,
+        judge_ran_at TEXT,
+        enrich_questions TEXT,
+        original_body TEXT
       );
     `);
     return db;

@@ -101,39 +101,73 @@ export function TasksPanel({
   counts,
   selected,
   focused,
+  expandedOriginals,
 }: {
   latest: TaskRow[];
-  counts: { pending: number; claimed: number; done: number };
+  counts: {
+    drafts: number;
+    pending: number;
+    claimed: number;
+    done: number;
+  };
   selected: number;
   focused: boolean;
+  expandedOriginals?: Set<string>;
 }) {
+  const title =
+    `Tasks  drafts ${counts.drafts} · pending ${counts.pending}` +
+    ` · claimed ${counts.claimed} · done ${counts.done}`;
   return (
-    <Panel
-      title={`Tasks  pending ${counts.pending} · claimed ${counts.claimed} · done ${counts.done}`}
-      focused={focused}
-    >
+    <Panel title={title} focused={focused}>
       {latest.length === 0 ? (
         <Text color={C.dim}>no tasks</Text>
       ) : (
-        latest.slice(0, 5).map((t, i) => {
+        latest.slice(0, 6).map((t, i) => {
           const marker = focused && i === selected ? ">" : " ";
+          // Draft badge uses brand.accent (baton amber) — it's the colour a
+          // human's attention should land on first: drafts block pick-next
+          // until a human enriches + promotes.
           const badge =
-            t.status === "pending" ? (
+            t.status === "draft" ? (
+              <Text color={C.brand} bold>
+                📝draft
+              </Text>
+            ) : t.status === "pending" ? (
               <Text color={C.warn}>pending</Text>
             ) : t.status === "claimed" ? (
               <Text color={C.brand}>claimed</Text>
             ) : (
               <Text color={C.ok}>done </Text>
             );
+          const hasOriginal =
+            t.status === "draft" &&
+            !!t.original_body &&
+            t.original_body !== t.body;
+          const expanded = expandedOriginals?.has(t.external_id) ?? false;
           return (
-            <Box key={t.external_id}>
-              <Text color={C.brand}>{marker} </Text>
-              <Text color={C.dim}>[{t.external_id.slice(0, 8)}] </Text>
-              {badge}
-              <Text color={C.paper}>
-                {" "}
-                {truncate(`${t.repo} · ${t.body}`, 60)}
-              </Text>
+            <Box key={t.external_id} flexDirection="column">
+              <Box>
+                <Text color={C.brand}>{marker} </Text>
+                <Text color={C.dim}>[{t.external_id.slice(0, 8)}] </Text>
+                {badge}
+                <Text color={C.paper}>
+                  {" "}
+                  {truncate(`${t.repo} · ${t.body}`, 60)}
+                </Text>
+              </Box>
+              {hasOriginal && !expanded && (
+                <Box paddingLeft={4}>
+                  <Text color={C.dim}>
+                    Original: {truncate(t.original_body!, 50)} (o: expand)
+                  </Text>
+                </Box>
+              )}
+              {hasOriginal && expanded && (
+                <Box paddingLeft={4}>
+                  <Text color={C.dim}>Original: {t.original_body} </Text>
+                  <Text color={C.dim}>(o: collapse)</Text>
+                </Box>
+              )}
             </Box>
           );
         })
@@ -253,6 +287,18 @@ export function HelpOverlay() {
       </Text>
       <Text>
         <Text color={C.brand}>r</Text> release selected claim (Claims panel)
+      </Text>
+      <Text>
+        <Text color={C.brand}>n</Text> new task (inline form)
+      </Text>
+      <Text>
+        <Text color={C.brand}>e</Text> enrich selected draft (opus, inline)
+      </Text>
+      <Text>
+        <Text color={C.brand}>p</Text> promote selected draft → pending
+      </Text>
+      <Text>
+        <Text color={C.brand}>o</Text> toggle original body on enriched draft
       </Text>
       <Text>
         <Text color={C.brand}>?</Text> toggle this help

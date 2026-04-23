@@ -135,7 +135,8 @@ export function initTaskSchema(db: Database): void {
       judge_cmd TEXT,
       judge_output TEXT,
       judge_ran_at TEXT,
-      enrich_questions TEXT
+      enrich_questions TEXT,
+      original_body TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status);
     CREATE INDEX IF NOT EXISTS idx_task_repo_status ON tasks(repo, status);
@@ -160,6 +161,8 @@ export function initTaskSchema(db: Database): void {
     db.exec("ALTER TABLE tasks ADD COLUMN judge_ran_at TEXT");
   if (!has("enrich_questions"))
     db.exec("ALTER TABLE tasks ADD COLUMN enrich_questions TEXT");
+  if (!has("original_body"))
+    db.exec("ALTER TABLE tasks ADD COLUMN original_body TEXT");
 }
 
 export function initClaimsSchema(db: Database): void {
@@ -840,14 +843,20 @@ export function applyEnrichment(
   const newEid = externalId(row.repo, newBody);
   const verify = result.verify?.trim() || null;
   const judge = result.judge?.trim() || null;
+  // Snapshot original_body on the first mutation so the TUI hybrid view can
+  // still surface the user's initial terse description alongside the enriched
+  // spec. If it's already set (e.g. via appendClarifyingAnswers earlier), we
+  // keep that one — that's the truly-original user input, not the Q&A-appended
+  // intermediate.
+  const originalBody = row.original_body ?? row.body;
 
   // Update DB row first (in a transaction). external_id may shift because
   // body changed; UNIQUE collisions throw and we surface them clearly.
   db.exec("BEGIN");
   try {
     db.run(
-      `UPDATE tasks SET body = ?, external_id = ?, verify_cmd = ?, judge_cmd = ?, enrich_questions = NULL WHERE id = ?`,
-      [newBody, newEid, verify, judge, row.id],
+      `UPDATE tasks SET body = ?, external_id = ?, verify_cmd = ?, judge_cmd = ?, enrich_questions = NULL, original_body = ? WHERE id = ?`,
+      [newBody, newEid, verify, judge, originalBody, row.id],
     );
     db.exec("COMMIT");
   } catch (e) {
@@ -873,6 +882,69 @@ export function applyEnrichment(
     oldExternalId: externalIdLookup,
     newExternalId: newEid,
   };
+}
+
+export interface ClarifyingAnswer {
+  question: string;
+  answer: string;
+}
+
+// Append the clarifying Q&A pairs the user typed in the TUI overlay to the
+// draft body, clear enrich_questions, and snapshot original_body on first
+// mutation. Used by the TUI after the user answers a QUESTIONS: response —
+// the caller then re-runs `batonq enrich <newEid>` so opus can re-try with
+// the extra context.
+//
+// Returns the new external_id (body changed, so the id is rederived).
+export function appendClarifyingAnswers(
+  db: Database,
+  tasksPath: string,
+  externalIdLookup: string,
+  qa: ClarifyingAnswer[],
+): { oldExternalId: string; newExternalId: string } {
+  const row = db
+    .query("SELECT * FROM tasks WHERE external_id = ?")
+    .get(externalIdLookup) as any;
+  if (!row) throw new Error(`no task with external_id ${externalIdLookup}`);
+  if (row.status !== "draft") {
+    throw new Error(
+      `task ${externalIdLookup} is ${row.status}, can only answer drafts`,
+    );
+  }
+  if (qa.length === 0) {
+    throw new Error("no clarifying answers supplied");
+  }
+
+  const originalBody = row.original_body ?? row.body;
+  const block = qa
+    .map(({ question, answer }) => `- ${question.trim()}\n  ${answer.trim()}`)
+    .join("\n");
+  const newBody = `${row.body} [clarifications: ${block.replace(/\n+/g, " ")}]`;
+  const newEid = externalId(row.repo, newBody);
+
+  db.exec("BEGIN");
+  try {
+    db.run(
+      `UPDATE tasks SET body = ?, external_id = ?, enrich_questions = NULL, original_body = ? WHERE id = ?`,
+      [newBody, newEid, originalBody, row.id],
+    );
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+
+  rewriteMdTaskBody(
+    tasksPath,
+    row.repo,
+    row.body,
+    newBody,
+    row.verify_cmd ?? undefined,
+    row.judge_cmd ?? undefined,
+    "draft",
+  );
+
+  return { oldExternalId: externalIdLookup, newExternalId: newEid };
 }
 
 // Flip a draft to pending in BOTH DB and TASKS.md. Returns false (no-op) if

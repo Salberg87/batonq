@@ -1,6 +1,7 @@
 // tui — ink-based dashboard for batonq.
 // 4 panels: Sessions, Tasks, Active claims, Event stream. Auto-refresh every 2s.
-// Keybinds: q quit · Tab cycle · j/k nav · / filter · n new · a abandon · r release · ? help
+// Keybinds: q quit · Tab cycle · j/k nav · / filter · n new · e enrich draft ·
+//           p promote draft · o toggle original · a abandon · r release · ? help
 //
 // ink-text-input vs @inkjs/ui: we use `ink-text-input` for the add-task form.
 // Both list `ink >= 5` as peer (we're on ink 7), so either works. ink-text-input
@@ -17,9 +18,11 @@ import { spawnSync } from "node:child_process";
 import { basename } from "node:path";
 import { homedir } from "node:os";
 import {
+  appendClarifyingAnswers,
   appendTaskToPending,
   externalId,
   validateNewTask,
+  type ClarifyingAnswer,
   type NewTask,
 } from "./tasks-core";
 import {
@@ -50,10 +53,12 @@ import {
 type PanelKey = "sessions" | "tasks" | "claims" | "events";
 const PANELS: PanelKey[] = ["sessions", "tasks", "claims", "events"];
 
-type Mode = "normal" | "filter" | "help" | "confirm" | "add-task";
+type Mode = "normal" | "filter" | "help" | "confirm" | "add-task" | "questions";
 type ConfirmAction =
   | { kind: "abandon"; task: TaskRow }
   | { kind: "release"; claim: ClaimRow };
+
+export type ParsedQuestion = { n: string; text: string };
 
 type FormField = "repo" | "body" | "verify" | "judge";
 const FORM_FIELDS: FormField[] = ["repo", "body", "verify", "judge"];
@@ -115,6 +120,14 @@ export function App() {
   );
   const [confirm, setConfirm] = useState<ConfirmAction | null>(null);
   const [addTaskRepo, setAddTaskRepo] = useState<string>("");
+  const [enrichingEid, setEnrichingEid] = useState<string | null>(null);
+  const [questionsPending, setQuestionsPending] = useState<{
+    eid: string;
+    questions: ParsedQuestion[];
+  } | null>(null);
+  const [expandedOriginals, setExpandedOriginals] = useState<Set<string>>(
+    () => new Set(),
+  );
 
   const filtered = useMemo(() => {
     if (!snap) return null;
@@ -137,8 +150,8 @@ export function App() {
       setMode("normal");
       return;
     }
-    if (mode === "add-task") {
-      // Keys in add-task mode are handled by <AddTaskForm/> itself.
+    if (mode === "add-task" || mode === "questions") {
+      // Keys in these modes are handled by the embedded form/overlay.
       return;
     }
     if (mode === "filter") {
@@ -244,6 +257,114 @@ export function App() {
       }
       setConfirm({ kind: "release", claim: c });
       setMode("confirm");
+      return;
+    }
+    if (input === "e") {
+      if (focus !== "tasks") {
+        setFlash({ msg: "'e' only works on Tasks panel", color: C.warn });
+        return;
+      }
+      const t = filtered?.tasks[selected.tasks];
+      if (!t) {
+        setFlash({ msg: "no task selected", color: C.warn });
+        return;
+      }
+      if (t.status !== "draft") {
+        setFlash({ msg: "'e' only works on draft tasks", color: C.warn });
+        return;
+      }
+      if (t.enrich_questions) {
+        // Stored questions from a prior enrich — open overlay without
+        // re-spawning claude. Saves a round-trip AND keeps the test path
+        // deterministic when DB is pre-seeded.
+        const qs = parseQuestions(t.enrich_questions);
+        if (qs.length === 0) {
+          setFlash({
+            msg: "draft has unparseable questions — re-run enrich",
+            color: C.warn,
+          });
+          return;
+        }
+        setQuestionsPending({ eid: t.external_id, questions: qs });
+        setMode("questions");
+        return;
+      }
+      if (enrichingEid) {
+        setFlash({
+          msg: `already enriching ${enrichingEid.slice(0, 8)}`,
+          color: C.warn,
+        });
+        return;
+      }
+      setEnrichingEid(t.external_id);
+      setFlash({
+        msg: `→ enriching ${t.external_id.slice(0, 8)} (claude --model opus)…`,
+        color: C.brand,
+      });
+      runEnrichAsync(t.external_id)
+        .then((res) => {
+          setEnrichingEid(null);
+          forceRefresh();
+          if (res.kind === "error") {
+            setFlash({ msg: `enrich failed: ${res.error}`, color: C.err });
+            return;
+          }
+          if (res.kind === "questions") {
+            setFlash({
+              msg: `↯ questions stored on ${res.newEid.slice(0, 8)} — press e to answer`,
+              color: C.warn,
+            });
+            return;
+          }
+          setFlash({
+            msg: `✓ enriched → ${res.newEid.slice(0, 8)} (p promote, o see original)`,
+            color: C.ok,
+          });
+        })
+        .catch((e: any) => {
+          setEnrichingEid(null);
+          setFlash({
+            msg: `enrich error: ${e?.message ?? String(e)}`,
+            color: C.err,
+          });
+        });
+      return;
+    }
+    if (input === "p") {
+      if (focus !== "tasks") {
+        setFlash({ msg: "'p' only works on Tasks panel", color: C.warn });
+        return;
+      }
+      const t = filtered?.tasks[selected.tasks];
+      if (!t) {
+        setFlash({ msg: "no task selected", color: C.warn });
+        return;
+      }
+      if (t.status !== "draft") {
+        setFlash({ msg: "'p' only promotes drafts", color: C.warn });
+        return;
+      }
+      runPromote(t, setFlash);
+      forceRefresh();
+      return;
+    }
+    if (input === "o") {
+      if (focus !== "tasks") return;
+      const t = filtered?.tasks[selected.tasks];
+      if (!t || t.status !== "draft" || !t.original_body) {
+        setFlash({
+          msg: "no enriched draft selected (o reveals the user's original body)",
+          color: C.warn,
+        });
+        return;
+      }
+      setExpandedOriginals((s) => {
+        const n = new Set(s);
+        if (n.has(t.external_id)) n.delete(t.external_id);
+        else n.add(t.external_id);
+        return n;
+      });
+      return;
     }
   });
 
@@ -293,6 +414,7 @@ export function App() {
             counts={snap.tasks.counts}
             selected={selected.tasks}
             focused={focus === "tasks"}
+            expandedOriginals={expandedOriginals}
           />
           <EventsPanel
             rows={filtered.events}
@@ -323,10 +445,16 @@ export function App() {
           </Text>
         )}
         {flash && <Text color={flash.color}>{flash.msg}</Text>}
-        {mode === "normal" && !flash && (
+        {enrichingEid && !flash && (
+          <Text color={C.brand}>
+            → enriching {enrichingEid.slice(0, 8)} (claude --model opus,
+            streaming)…
+          </Text>
+        )}
+        {mode === "normal" && !flash && !enrichingEid && (
           <Text color={C.dim}>
-            q quit · Tab focus · j/k nav · / filter · n new · a abandon · r
-            release · ? help
+            q quit · Tab focus · j/k nav · / filter · n new · e enrich · p
+            promote · o original · a abandon · r release · ? help
           </Text>
         )}
       </Box>
@@ -356,11 +484,261 @@ export function App() {
         </Box>
       )}
 
+      {mode === "questions" && questionsPending && (
+        <Box marginTop={1}>
+          <QuestionsOverlay
+            eid={questionsPending.eid}
+            questions={questionsPending.questions}
+            onSubmit={(qa) => {
+              try {
+                const { newExternalId } = submitClarifyingAnswers(
+                  questionsPending.eid,
+                  qa,
+                );
+                setQuestionsPending(null);
+                setMode("normal");
+                forceRefresh();
+                setEnrichingEid(newExternalId);
+                setFlash({
+                  msg: `→ re-enriching ${newExternalId.slice(0, 8)} with answers…`,
+                  color: C.brand,
+                });
+                runEnrichAsync(newExternalId)
+                  .then((res) => {
+                    setEnrichingEid(null);
+                    forceRefresh();
+                    if (res.kind === "error") {
+                      setFlash({
+                        msg: `enrich failed: ${res.error}`,
+                        color: C.err,
+                      });
+                      return;
+                    }
+                    if (res.kind === "questions") {
+                      setFlash({
+                        msg: `↯ more questions on ${res.newEid.slice(0, 8)} — press e again`,
+                        color: C.warn,
+                      });
+                      return;
+                    }
+                    setFlash({
+                      msg: `✓ enriched → ${res.newEid.slice(0, 8)} (p promote, o see original)`,
+                      color: C.ok,
+                    });
+                  })
+                  .catch((e: any) => {
+                    setEnrichingEid(null);
+                    setFlash({
+                      msg: `enrich error: ${e?.message ?? String(e)}`,
+                      color: C.err,
+                    });
+                  });
+              } catch (e: any) {
+                setFlash({
+                  msg: `answer apply failed: ${e?.message ?? String(e)}`,
+                  color: C.err,
+                });
+              }
+            }}
+            onCancel={() => {
+              setQuestionsPending(null);
+              setMode("normal");
+            }}
+          />
+        </Box>
+      )}
+
       {mode === "help" && (
         <Box marginTop={1}>
           <HelpOverlay />
         </Box>
       )}
+    </Box>
+  );
+}
+
+// ── enrich / promote / questions helpers ──────────────────────────────────────
+
+// parseQuestions splits the enrich_questions text (stored by applyEnrichment
+// on the QUESTIONS path) into a list the overlay can iterate. We accept both
+// "1. text" and "1) text" numbering and fold continuation lines into the
+// previous question so opus-style multi-line questions stay intact.
+export function parseQuestions(
+  raw: string | null | undefined,
+): ParsedQuestion[] {
+  if (!raw || !raw.trim()) return [];
+  const out: ParsedQuestion[] = [];
+  for (const line of raw.split("\n")) {
+    const m = line.match(/^\s*(\d+)[.)]\s*(.+)$/);
+    if (m) {
+      out.push({ n: m[1]!, text: m[2]!.trim() });
+    } else if (out.length > 0 && line.trim()) {
+      out[out.length - 1]!.text += " " + line.trim();
+    }
+  }
+  return out;
+}
+
+export type EnrichOutcome =
+  | { kind: "questions"; newEid: string }
+  | { kind: "enriched"; newEid: string }
+  | { kind: "error"; newEid: string; error: string };
+
+// runEnrichAsync spawns `batonq enrich <eid>` and inspects the DB afterwards
+// to determine which branch applyEnrichment took. Used by the TUI's `e`
+// keybind. The CLI's stdout contains "external_id: <old> → <new>" when body
+// rewrote, which lets us locate the updated row even though eid shifted.
+export async function runEnrichAsync(
+  eid: string,
+  dbPath: string = DEFAULT_DB_PATH,
+): Promise<EnrichOutcome> {
+  const proc = Bun.spawn([findBatonqBin(), "enrich", eid], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (code !== 0) {
+    return {
+      kind: "error",
+      newEid: eid,
+      error: stderr.trim() || stdout.trim() || `exit ${code}`,
+    };
+  }
+  const m = stdout.match(/external_id:\s*([0-9a-f]+)\s*→\s*([0-9a-f]+)/i);
+  const currentEid = m ? m[2]! : eid;
+  const db = openStateDb(dbPath);
+  try {
+    const row = db
+      .query(
+        "SELECT enrich_questions, body, original_body FROM tasks WHERE external_id = ?",
+      )
+      .get(currentEid) as any;
+    if (row?.enrich_questions) {
+      return { kind: "questions", newEid: currentEid };
+    }
+    return { kind: "enriched", newEid: currentEid };
+  } finally {
+    db.close();
+  }
+}
+
+export function runPromote(
+  task: TaskRow,
+  setFlash: (f: { msg: string; color: string }) => void,
+): void {
+  const r = spawnSync(findBatonqBin(), ["promote", task.external_id], {
+    encoding: "utf8",
+  });
+  if (r.status === 0) {
+    setFlash({
+      msg: `✓ promoted ${task.external_id.slice(0, 8)} → pending`,
+      color: C.ok,
+    });
+  } else {
+    setFlash({
+      msg: `promote failed: ${(r.stderr ?? "").trim() || `exit ${r.status}`}`,
+      color: C.err,
+    });
+  }
+}
+
+// submitClarifyingAnswers writes the Q&A the user typed into the TUI overlay
+// back to the DB + TASKS.md via tasks-core, so the caller can immediately
+// re-run enrich with the augmented body. Kept here (not in tasks-core) because
+// it opens a real DB handle and is tied to the TUI's DEFAULT_* paths.
+export function submitClarifyingAnswers(
+  eid: string,
+  qa: ClarifyingAnswer[],
+  tasksPath: string = DEFAULT_TASKS_PATH,
+  dbPath: string = DEFAULT_DB_PATH,
+): { oldExternalId: string; newExternalId: string } {
+  const db = openStateDb(dbPath);
+  try {
+    return appendClarifyingAnswers(db, tasksPath, eid, qa);
+  } finally {
+    db.close();
+  }
+}
+
+export function QuestionsOverlay({
+  eid,
+  questions,
+  onSubmit,
+  onCancel,
+}: {
+  eid: string;
+  questions: ParsedQuestion[];
+  onSubmit: (answers: ClarifyingAnswer[]) => void;
+  onCancel: () => void;
+}): React.ReactElement {
+  const [answers, setAnswers] = useState<string[]>(() =>
+    questions.map(() => ""),
+  );
+  const [focusIdx, setFocusIdx] = useState(0);
+
+  useInput((_input, key) => {
+    if (key.escape) {
+      onCancel();
+      return;
+    }
+    if (key.tab) {
+      const next = key.shift
+        ? (focusIdx - 1 + questions.length) % questions.length
+        : (focusIdx + 1) % questions.length;
+      setFocusIdx(next);
+      return;
+    }
+    if (key.return) {
+      if (answers.some((a) => !a.trim())) return;
+      onSubmit(
+        questions.map((q, i) => ({
+          question: q.text,
+          answer: answers[i] ?? "",
+        })),
+      );
+    }
+  });
+
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="double"
+      borderColor={C.brand}
+      paddingX={1}
+    >
+      <Text bold color={C.brand}>
+        Clarifying questions — draft {eid.slice(0, 8)}
+      </Text>
+      {questions.map((q, i) => {
+        const active = focusIdx === i;
+        return (
+          <Box key={i} flexDirection="column" marginTop={1}>
+            <Text color={active ? C.brand : C.paper}>
+              {active ? "› " : "  "}
+              {q.n}. {q.text}
+            </Text>
+            <Box paddingLeft={2}>
+              <Text color={C.dim}>a: </Text>
+              <Box flexGrow={1}>
+                <TextInput
+                  value={answers[i] ?? ""}
+                  onChange={(v) =>
+                    setAnswers((a) => a.map((x, j) => (j === i ? v : x)))
+                  }
+                  focus={active}
+                />
+              </Box>
+            </Box>
+          </Box>
+        );
+      })}
+      <Text color={C.dim}>
+        Tab/Shift-Tab: field · Enter: submit (all required) · Esc: cancel
+      </Text>
     </Box>
   );
 }
