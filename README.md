@@ -108,13 +108,17 @@ left off. Pass `--remove-state` (or `-y`) to delete without prompting, or
 
 ## Quickstart
 
-**1. Write a task to `~/DEV/TASKS.md`:**
+**1. Add a task straight to the queue:**
 
-```md
-## Pending
-
-- [ ] **any:infra** — add release notes for v0.1.1
+```sh
+batonq add --body "add release notes for v0.1.1" --repo any:infra
+# → task added: 51592069b22d
 ```
+
+The DB is the source of truth. `batonq add` validates every task via a
+strict Zod schema (non-empty repo, body ≥ 20 chars, `verify:` / `judge:` ≥ 10
+chars when present, enum priorities) and writes straight to
+`~/.claude/batonq/state.db`. No file parsing, no reformatter risk.
 
 **2. In the repo you want to work from, start a loop:**
 
@@ -136,6 +140,60 @@ batonq tui       # live dashboard
 That's it. Open another terminal, `cd` into a different repo, and run
 `batonq-loop` again — it picks a different task because the first one is
 already claimed.
+
+### Adding tasks
+
+There are three supported entry points, all of which route through the same
+schema gate and write directly to the DB:
+
+```sh
+# Single task, flag-driven. --repo defaults to the cwd's git root.
+batonq add --body "investigate flaky auth test on CI" \
+           --verify "bun test tests/auth.test.ts" \
+           --priority high
+
+# Single task, JSON on stdin — useful from other tools / scripts.
+echo '{"body": "migrate login copy to new schema", "repo": "any:copy"}' \
+  | batonq add --json
+
+# Bulk from YAML (array or { tasks: [...] } wrapper) or markdown.
+batonq import ~/DEV/my-backlog.yaml
+batonq import ~/DEV/TASKS.md
+```
+
+Reasonable YAML shape:
+
+```yaml
+- body: investigate flaky auth test on CI
+  repo: orghub
+  priority: high
+  verify: bun test tests/auth.test.ts
+- body: migrate login copy to new schema
+  repo: any:copy
+  scheduled_for: 2026-05-01T09:00:00Z
+```
+
+Invalid entries are written to `/tmp/batonq-import-<ts>.log` with the Zod
+reason and the offending raw object; valid entries still land in the DB. The
+exit code is non-zero only when at least one entry was invalid — pure
+duplicates are skipped silently (insert-new semantics).
+
+Snapshot the DB back out as markdown at any time:
+
+```sh
+batonq export --md                      # to stdout
+batonq export --md --file snapshot.md   # or to a file
+```
+
+The snapshot leads with a `# Snapshot — read-only, regenerate with 'batonq
+export'` header so it's clear the file is not authoritative input.
+
+> **TASKS.md is deprecated as a live sync target.** Pre-existing
+> `~/DEV/TASKS.md` files still work as a one-way import via
+> `batonq import ~/DEV/TASKS.md` or the legacy `batonq sync-tasks`, but
+> `pick` / `tasks` no longer auto-parse the file on every invocation — the
+> DB is the truth. Existing TASKS.md files get a `> ⚠️ DEPRECATED …` banner
+> prepended on the first `batonq add` / `batonq import`.
 
 ## Concepts
 
@@ -165,29 +223,32 @@ already claimed.
 
 ## Commands
 
-| Command                                                 | Description                                                                                                                                                                              | Example                              |
-| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
-| `batonq pick`                                           | Claim the next task matching the current cwd's repo (or an `any:*` task).                                                                                                                | `batonq pick`                        |
-| `batonq mine`                                           | Show tasks claimed by the current session (pid).                                                                                                                                         | `batonq mine`                        |
-| `batonq done <id>`                                      | Mark a claimed task done. Runs the `verify:` gate if the task has one.                                                                                                                   | `batonq done 51592069b22d`           |
-| `batonq abandon <id>`                                   | Release a claim so another agent can pick the task.                                                                                                                                      | `batonq abandon 51592069b22d`        |
-| `batonq tasks`                                          | List every task in `~/DEV/TASKS.md` with status.                                                                                                                                         | `batonq tasks`                       |
-| `batonq sync-tasks`                                     | Re-parse `TASKS.md` into the SQLite state immediately (usually automatic).                                                                                                               | `batonq sync-tasks`                  |
-| `batonq release <path>`                                 | Release a file lock held by the current session.                                                                                                                                         | `batonq release src/app.ts`          |
-| `batonq sweep`                                          | Purge expired claims and file locks whose owning session is gone.                                                                                                                        | `batonq sweep`                       |
-| `batonq sweep-tasks`                                    | Mark claimed tasks with no progress in 30 min as `lost`; live sessions get a 5-min grace via recovery hook. Logs lost tasks to `/tmp/batonq-escalations.log`. Auto-runs on every `pick`. | `batonq sweep-tasks`                 |
-| `batonq status`                                         | Print overall queue + lock state as a compact summary.                                                                                                                                   | `batonq status`                      |
-| `batonq check`                                          | Health check: schema version, state-db permissions, hook wiring.                                                                                                                         | `batonq check`                       |
-| `batonq doctor`                                         | Structured 5-category diagnostic (Binaries, Installation, State, Scope, Live) with `✓/⚠/✗` per row, a `fix:` hint on every non-pass, and a copy-pasteable summary. Read-only.            | `batonq doctor`                      |
-| `batonq tail [-n N]`                                    | Tail the event log (JSONL).                                                                                                                                                              | `batonq tail -n 50`                  |
-| `batonq logs [-f] [-n N] [--source events\|loop\|both]` | Combined tail of `events.jsonl` + newest `/tmp/batonq-loop*.log`, merged by timestamp. Events cyan, loop yellow, errors red. `-f` follows (500 ms poll).                                 | `batonq logs -f -n 50 --source both` |
-| `batonq report`                                         | Aggregate measurement events over a time range (`--since`, `--until`, `--json`).                                                                                                         | `batonq report --since 2026-04-01`   |
-| `batonq enrich <id>`                                    | Elaborate a draft via `claude --model opus`. Returns clarifying questions OR a spec with `verify:`+`judge:`.                                                                             | `batonq enrich 51592069b22d`         |
-| `batonq promote <id>`                                   | Flip a draft to pending so `pick` will see it. Use after `enrich` once you're happy with the spec.                                                                                       | `batonq promote 51592069b22d`        |
-| `batonq tui`                                            | Live ink-based TUI dashboard with sessions, tasks, claims, locks, events. Press `n` to add a task inline.                                                                                | `batonq tui`                         |
-| `batonq loop-status`                                    | Print the loop footer state one-shot: loop state (running/idle/dead), current claimed task, claude-p pid+uptime, events.jsonl age. Add `--json` for machine-readable output.             | `batonq loop-status --json`          |
-| `batonq-hook`                                           | Claude Code PreToolUse / PostToolUse hook. Not invoked manually.                                                                                                                         | (wired by `install.sh`)              |
-| `batonq-loop`                                           | Fresh-Claude-per-task runner. `cd` into a repo, run, and the loop does the rest.                                                                                                         | `cd ~/DEV/MyRepo && batonq-loop`     |
+| Command                                                 | Description                                                                                                                                                                                                              | Example                              |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------ |
+| `batonq pick`                                           | Claim the next task matching the current cwd's repo (or an `any:*` task).                                                                                                                                                | `batonq pick`                        |
+| `batonq mine`                                           | Show tasks claimed by the current session (pid).                                                                                                                                                                         | `batonq mine`                        |
+| `batonq done <id>`                                      | Mark a claimed task done. Runs the `verify:` gate if the task has one.                                                                                                                                                   | `batonq done 51592069b22d`           |
+| `batonq abandon <id>`                                   | Release a claim so another agent can pick the task.                                                                                                                                                                      | `batonq abandon 51592069b22d`        |
+| `batonq tasks`                                          | List every task in the DB with status.                                                                                                                                                                                   | `batonq tasks`                       |
+| `batonq add --body <text>`                              | Insert a single task directly into the DB. Validates via the task schema (body ≥ 20 chars, priority enum, etc.). Supports `--repo`, `--verify`, `--judge`, `--priority`, `--at`, `--status`, and `--json` (reads stdin). | `batonq add --body "add v0.2 notes"` |
+| `batonq import <file>`                                  | Bulk-import from a YAML or markdown file. Valid entries are inserted; duplicates are skipped; invalid entries go to `/tmp/batonq-import-<ts>.log`.                                                                       | `batonq import ./backlog.yaml`       |
+| `batonq export --md [--file PATH]`                      | Write a read-only markdown snapshot of the DB. Stdout by default, a file with `--file`.                                                                                                                                  | `batonq export --md --file snap.md`  |
+| `batonq sync-tasks`                                     | Legacy one-way import from `~/DEV/TASKS.md` into the DB. Prefer `batonq import <file>` for new workflows — the file itself is deprecated as a live sync target.                                                          | `batonq sync-tasks`                  |
+| `batonq release <path>`                                 | Release a file lock held by the current session.                                                                                                                                                                         | `batonq release src/app.ts`          |
+| `batonq sweep`                                          | Purge expired claims and file locks whose owning session is gone.                                                                                                                                                        | `batonq sweep`                       |
+| `batonq sweep-tasks`                                    | Mark claimed tasks with no progress in 30 min as `lost`; live sessions get a 5-min grace via recovery hook. Logs lost tasks to `/tmp/batonq-escalations.log`. Auto-runs on every `pick`.                                 | `batonq sweep-tasks`                 |
+| `batonq status`                                         | Print overall queue + lock state as a compact summary.                                                                                                                                                                   | `batonq status`                      |
+| `batonq check`                                          | Health check: schema version, state-db permissions, hook wiring.                                                                                                                                                         | `batonq check`                       |
+| `batonq doctor`                                         | Structured 5-category diagnostic (Binaries, Installation, State, Scope, Live) with `✓/⚠/✗` per row, a `fix:` hint on every non-pass, and a copy-pasteable summary. Read-only.                                            | `batonq doctor`                      |
+| `batonq tail [-n N]`                                    | Tail the event log (JSONL).                                                                                                                                                                                              | `batonq tail -n 50`                  |
+| `batonq logs [-f] [-n N] [--source events\|loop\|both]` | Combined tail of `events.jsonl` + newest `/tmp/batonq-loop*.log`, merged by timestamp. Events cyan, loop yellow, errors red. `-f` follows (500 ms poll).                                                                 | `batonq logs -f -n 50 --source both` |
+| `batonq report`                                         | Aggregate measurement events over a time range (`--since`, `--until`, `--json`).                                                                                                                                         | `batonq report --since 2026-04-01`   |
+| `batonq enrich <id>`                                    | Elaborate a draft via `claude --model opus`. Returns clarifying questions OR a spec with `verify:`+`judge:`.                                                                                                             | `batonq enrich 51592069b22d`         |
+| `batonq promote <id>`                                   | Flip a draft to pending so `pick` will see it. Use after `enrich` once you're happy with the spec.                                                                                                                       | `batonq promote 51592069b22d`        |
+| `batonq tui`                                            | Live ink-based TUI dashboard with sessions, tasks, claims, locks, events. Press `n` to add a task inline.                                                                                                                | `batonq tui`                         |
+| `batonq loop-status`                                    | Print the loop footer state one-shot: loop state (running/idle/dead), current claimed task, claude-p pid+uptime, events.jsonl age. Add `--json` for machine-readable output.                                             | `batonq loop-status --json`          |
+| `batonq-hook`                                           | Claude Code PreToolUse / PostToolUse hook. Not invoked manually.                                                                                                                                                         | (wired by `install.sh`)              |
+| `batonq-loop`                                           | Fresh-Claude-per-task runner. `cd` into a repo, run, and the loop does the rest.                                                                                                                                         | `cd ~/DEV/MyRepo && batonq-loop`     |
 
 ## TUI
 

@@ -1286,3 +1286,389 @@ export function promoteDraftToPending(
   rewriteMdTaskStatus(tasksPath, row.repo, row.body, "pending");
   return true;
 }
+
+// ── DB-first task input ───────────────────────────────────────────────────────
+//
+// Everything below this line treats the DB as the single source of truth for
+// tasks. TASKS.md is reduced to an optional one-way input (via `batonq import`
+// or the legacy `batonq sync-tasks`) and an optional read-only snapshot (via
+// `batonq export --md`). These helpers power `batonq add`, `batonq import`,
+// and `batonq export`.
+
+export interface TaskInput {
+  repo: string;
+  body: string;
+  priority?: TaskPriority;
+  scheduledFor?: string;
+  verify?: string;
+  judge?: string;
+  status?: TaskStatus;
+}
+
+// Raised from insertTask when the computed external_id already exists. Carries
+// the offending id so callers (import, add) can surface a helpful message.
+export class DuplicateExternalIdError extends Error {
+  readonly code = "DUPLICATE_EID";
+  constructor(public readonly externalId: string) {
+    super(`duplicate external_id: ${externalId}`);
+  }
+}
+
+// Direct DB insert. Whitespace-normalises body, derives external_id, and
+// rejects duplicates with DuplicateExternalIdError. Callers that want Zod
+// validation should use validatedInsertTask.
+export function insertTask(
+  db: Database,
+  t: TaskInput,
+  nowIso: string = new Date().toISOString(),
+): string {
+  const body = t.body.replace(/\s+/g, " ").trim();
+  const repo = t.repo.trim();
+  const eid = externalId(repo, body);
+  const existing = db
+    .query("SELECT external_id FROM tasks WHERE external_id = ?")
+    .get(eid);
+  if (existing) throw new DuplicateExternalIdError(eid);
+  const status = t.status ?? "pending";
+  const priority = t.priority ?? DEFAULT_PRIORITY;
+  const scheduledFor = t.scheduledFor ?? null;
+  db.run(
+    `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd, priority, scheduled_for)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      eid,
+      repo,
+      body,
+      status,
+      nowIso,
+      t.verify ?? null,
+      t.judge ?? null,
+      priority,
+      scheduledFor,
+    ],
+  );
+  return eid;
+}
+
+// Import an arbitrary plain object, fill in derivable defaults (external_id,
+// priority, status), validate via the strict Zod schema in task-schema.ts,
+// then insert. Throws ZodError on validation failure, DuplicateExternalIdError
+// on id collision. Caller is expected to convert those into exit codes /
+// log lines.
+export function validatedInsertTask(
+  db: Database,
+  raw: unknown,
+  nowIso: string = new Date().toISOString(),
+): string {
+  // Lazy require so tasks-core doesn't create a hard dep cycle at module
+  // parse time; task-schema already imports `zod`, and we only need these
+  // symbols inside the function body.
+  const { parseTaskInput } = require("./task-schema");
+
+  const input: Record<string, unknown> = {
+    ...(raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {}),
+  };
+  const repo =
+    typeof input.repo === "string" ? (input.repo as string).trim() : "";
+  const body =
+    typeof input.body === "string"
+      ? (input.body as string).replace(/\s+/g, " ").trim()
+      : "";
+
+  input.repo = repo;
+  input.body = body;
+  if (!input.external_id) input.external_id = externalId(repo, body);
+  if (!input.status) input.status = "pending";
+  if (!input.priority) input.priority = DEFAULT_PRIORITY;
+
+  // Canonicalise scheduled_for so lexicographic comparison in pick works.
+  // If normaliser returns null we leave the raw value alone — Zod will
+  // reject it with a clean error, which is what we want.
+  if (typeof input.scheduled_for === "string") {
+    const norm = normalizeScheduledFor(input.scheduled_for as string);
+    if (norm) input.scheduled_for = norm;
+  }
+
+  parseTaskInput(input);
+
+  return insertTask(
+    db,
+    {
+      repo,
+      body,
+      priority: input.priority as TaskPriority,
+      scheduledFor:
+        typeof input.scheduled_for === "string"
+          ? (input.scheduled_for as string)
+          : undefined,
+      verify:
+        typeof input.verify === "string" ? (input.verify as string) : undefined,
+      judge:
+        typeof input.judge === "string" ? (input.judge as string) : undefined,
+      status: input.status as TaskStatus,
+    },
+    nowIso,
+  );
+}
+
+// ── TASKS.md deprecation header ───────────────────────────────────────────────
+
+export const TASKS_MD_DEPRECATION_MARKER =
+  "DEPRECATED — this file is no longer authoritative";
+
+export const TASKS_MD_DEPRECATION_HEADER = [
+  `> ⚠️ ${TASKS_MD_DEPRECATION_MARKER}. Use 'batonq add' for new`,
+  `> tasks or 'batonq import <file>' for bulk. File may be out-of-sync with DB.`,
+].join("\n");
+
+// Prepend the deprecation notice to TASKS.md once. Idempotent: a second call
+// is a no-op once the marker is present. Does nothing if the file doesn't
+// exist (the queue works fine without it now that the DB is authoritative).
+export function ensureTasksMdDeprecationHeader(tasksPath: string): boolean {
+  if (!existsSync(tasksPath)) return false;
+  const text = readFileSync(tasksPath, "utf8");
+  if (text.includes(TASKS_MD_DEPRECATION_MARKER)) return false;
+  return withFileLock(tasksPath, () => {
+    const latest = readFileSync(tasksPath, "utf8");
+    if (latest.includes(TASKS_MD_DEPRECATION_MARKER)) return false;
+    const next = `${TASKS_MD_DEPRECATION_HEADER}\n\n${latest}`;
+    atomicWrite(tasksPath, next);
+    return true;
+  });
+}
+
+// ── import ────────────────────────────────────────────────────────────────────
+
+export interface ImportParseResult {
+  tasks: unknown[];
+  format: "yaml" | "markdown";
+}
+
+// Parse a YAML payload into a bare array of task objects. Accepts either a
+// top-level array or a `{ tasks: [...] }` wrapper.
+export function parseYamlTasksText(text: string): unknown[] {
+  // Bun.YAML.parse is the built-in parser; it throws SyntaxError on bad input.
+  const parsed = (globalThis as any).Bun?.YAML?.parse
+    ? (globalThis as any).Bun.YAML.parse(text)
+    : null;
+  if (parsed == null) {
+    throw new Error("YAML parser unavailable (Bun.YAML.parse is required)");
+  }
+  if (Array.isArray(parsed)) return parsed as unknown[];
+  if (parsed && typeof parsed === "object") {
+    const tasks = (parsed as Record<string, unknown>).tasks;
+    if (Array.isArray(tasks)) return tasks as unknown[];
+  }
+  throw new Error(
+    "YAML must be an array of tasks or an object with a top-level `tasks:` array",
+  );
+}
+
+// Convert the existing markdown parser output into TaskInput-shaped objects
+// suitable for validatedInsertTask. Skips `done` rows (no point re-inserting
+// them) and maps `claimed` back to `pending` so the import doesn't resurrect
+// another session's claim state.
+export function parseMarkdownTasksForImport(text: string): TaskInput[] {
+  const { tasks } = parseTasksText(text);
+  const out: TaskInput[] = [];
+  for (const t of tasks) {
+    if (t.status === "done") continue;
+    const status: TaskStatus = t.status === "claimed" ? "pending" : t.status;
+    out.push({
+      repo: t.repo,
+      body: t.body,
+      verify: t.verifyCmd,
+      judge: t.judgeCmd,
+      priority: t.priority,
+      scheduledFor: t.scheduledFor,
+      status,
+    });
+  }
+  return out;
+}
+
+// Shallow sniff of file contents: YAML files typically start with `-` (array)
+// or `key:`. Markdown tasks start with a `- [ ]` / `- [x]` / `## ` block.
+// Falls back to the file extension when the content is ambiguous.
+export function detectImportFormat(
+  path: string,
+  text: string,
+): "yaml" | "markdown" {
+  if (/\.ya?ml$/i.test(path)) return "yaml";
+  if (/\.md$/i.test(path)) return "markdown";
+  // Markdown headers or task checklists win over YAML.
+  if (/^\s*#{1,6}\s/m.test(text)) return "markdown";
+  if (/^\s*-\s+\[[ x~?]\]\s/m.test(text)) return "markdown";
+  return "yaml";
+}
+
+export interface ImportReport {
+  imported: number;
+  invalid: number;
+  duplicates: number;
+  logLines: string[];
+  validExternalIds: string[];
+}
+
+// Run a full import over pre-parsed raw task objects. Pure function — no FS
+// writes, caller persists the log. Used by `batonq import` and exercised
+// directly in tests without spawning the CLI.
+export function runImport(
+  db: Database,
+  raws: unknown[],
+  nowIso: string = new Date().toISOString(),
+): ImportReport {
+  const { ZodError } = require("zod") as typeof import("zod");
+  const report: ImportReport = {
+    imported: 0,
+    invalid: 0,
+    duplicates: 0,
+    logLines: [],
+    validExternalIds: [],
+  };
+  for (let i = 0; i < raws.length; i++) {
+    const raw = raws[i];
+    try {
+      const eid = validatedInsertTask(db, raw, nowIso);
+      report.imported++;
+      report.validExternalIds.push(eid);
+    } catch (e) {
+      if (e instanceof DuplicateExternalIdError) {
+        report.duplicates++;
+        report.logLines.push(
+          `entry ${i}: duplicate external_id=${e.externalId}; skipped`,
+        );
+        continue;
+      }
+      if (e instanceof ZodError) {
+        report.invalid++;
+        const issues = e.issues
+          .map(
+            (iss: any) => `${iss.path.join(".") || "(root)"}: ${iss.message}`,
+          )
+          .join("; ");
+        report.logLines.push(
+          `entry ${i}: schema invalid — ${issues}\n  raw: ${safeJson(raw)}`,
+        );
+        continue;
+      }
+      report.invalid++;
+      const msg = (e as any)?.message ?? String(e);
+      report.logLines.push(`entry ${i}: ${msg}\n  raw: ${safeJson(raw)}`);
+    }
+  }
+  return report;
+}
+
+function safeJson(v: unknown): string {
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+
+// ── export ────────────────────────────────────────────────────────────────────
+
+export const EXPORT_SNAPSHOT_HEADER =
+  "# Snapshot — read-only, regenerate with 'batonq export'";
+
+interface ExportRow {
+  external_id: string;
+  repo: string;
+  body: string;
+  status: TaskStatus;
+  priority: TaskPriority | null;
+  scheduled_for: string | null;
+  verify_cmd: string | null;
+  judge_cmd: string | null;
+  completed_at: string | null;
+}
+
+function renderExportTask(r: ExportRow): string {
+  const mark =
+    r.status === "done"
+      ? "x"
+      : r.status === "draft"
+        ? "?"
+        : r.status === "claimed"
+          ? "~"
+          : " ";
+  const datePrefix =
+    r.status === "done" && r.completed_at
+      ? `${r.completed_at.slice(0, 10)} `
+      : "";
+  const body = r.body.replace(/\s+/g, " ").trim();
+  const lines = [`- [${mark}] ${datePrefix}**${r.repo}** — ${body}`];
+  if (r.verify_cmd) lines.push(`  verify: ${r.verify_cmd}`);
+  if (r.judge_cmd) lines.push(`  judge: ${r.judge_cmd}`);
+  if (r.priority && r.priority !== DEFAULT_PRIORITY) {
+    lines.push(`  priority: ${r.priority}`);
+  }
+  if (r.scheduled_for) lines.push(`  scheduled_for: ${r.scheduled_for}`);
+  return lines.join("\n");
+}
+
+// Snapshot every task in the DB as markdown. Produces a header that warns
+// readers the file is read-only, then one section per status bucket in pick
+// order so the file is useful as documentation + a regeneration target.
+export function exportTasksAsMarkdown(
+  db: Database,
+  nowIso: string = new Date().toISOString(),
+): string {
+  const sections: string[] = [
+    EXPORT_SNAPSHOT_HEADER,
+    "",
+    `Generated: ${nowIso}`,
+    "",
+  ];
+  const buckets: Array<[TaskStatus, string, string]> = [
+    [
+      "pending",
+      "Pending",
+      `SELECT external_id, repo, body, status, priority, scheduled_for, verify_cmd, judge_cmd, completed_at
+       FROM tasks WHERE status = 'pending'
+       ORDER BY
+         CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END ASC,
+         COALESCE(scheduled_for, created_at) ASC,
+         created_at ASC`,
+    ],
+    [
+      "draft",
+      "Drafts",
+      `SELECT external_id, repo, body, status, priority, scheduled_for, verify_cmd, judge_cmd, completed_at
+       FROM tasks WHERE status = 'draft' ORDER BY created_at ASC`,
+    ],
+    [
+      "claimed",
+      "Claimed",
+      `SELECT external_id, repo, body, status, priority, scheduled_for, verify_cmd, judge_cmd, completed_at
+       FROM tasks WHERE status = 'claimed' ORDER BY claimed_at ASC`,
+    ],
+    [
+      "done",
+      "Done",
+      `SELECT external_id, repo, body, status, priority, scheduled_for, verify_cmd, judge_cmd, completed_at
+       FROM tasks WHERE status = 'done' ORDER BY completed_at DESC`,
+    ],
+    [
+      "lost",
+      "Lost",
+      `SELECT external_id, repo, body, status, priority, scheduled_for, verify_cmd, judge_cmd, completed_at
+       FROM tasks WHERE status = 'lost' ORDER BY created_at DESC`,
+    ],
+  ];
+  let wroteAny = false;
+  for (const [, label, sql] of buckets) {
+    const rows = db.query(sql).all() as ExportRow[];
+    if (rows.length === 0) continue;
+    wroteAny = true;
+    sections.push(`## ${label}`, "");
+    for (const r of rows) sections.push(renderExportTask(r));
+    sections.push("");
+  }
+  // Empty DB: still emit a Pending section so downstream sync-tasks doesn't
+  // choke on a file without headings.
+  if (!wroteAny) sections.push("## Pending", "");
+  return sections.join("\n") + "\n";
+}

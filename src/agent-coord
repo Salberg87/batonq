@@ -24,6 +24,14 @@ import {
   applyEnrichment,
   promoteDraftToPending,
   sweepTasks as sweepTasksCore,
+  validatedInsertTask,
+  DuplicateExternalIdError,
+  ensureTasksMdDeprecationHeader,
+  exportTasksAsMarkdown,
+  parseYamlTasksText,
+  parseMarkdownTasksForImport,
+  detectImportFormat,
+  runImport,
   type ParsedTask,
 } from "./tasks-core";
 import { migrate } from "./migrate";
@@ -100,6 +108,15 @@ switch (cmd) {
   case "sync-tasks":
     syncTasks(true);
     break;
+  case "add":
+    addCmd();
+    break;
+  case "import":
+    importCmd(process.argv[3]);
+    break;
+  case "export":
+    exportCmd();
+    break;
   case "pick":
     pickTask();
     break;
@@ -135,7 +152,9 @@ switch (cmd) {
       "usage: batonq\n" +
         "  Coordination:  check | doctor | status | release <path> | sweep | sweep-tasks\n" +
         "  Measurement:   tail [-n N] | logs [-f] [-n N] [--source events|loop|both] | report [--since ISO] [--until ISO] [--json]\n" +
-        "  Tasks:         sync-tasks | pick | mine | done [<id>] | abandon [<id>] | tasks\n" +
+        "  Tasks:         add --body <text> [--repo <name>] [--verify <sh>] [--judge <prompt>] [--priority high|normal|low] [--at <ISO>] [--status draft|pending] [--json]\n" +
+        "                 import <file.yaml|file.md> | export --md [--file PATH]\n" +
+        "                 sync-tasks | pick | mine | done [<id>] | abandon [<id>] | tasks\n" +
         "  Drafts:        enrich <id> | promote <id>\n" +
         "  Dashboard:     tui | loop-status [--json]\n" +
         "  Exit:          uninstall [--remove-state|--keep-state]"
@@ -1236,7 +1255,9 @@ function currentSession(): string {
 }
 
 function pickTask(): void {
-  syncTasks(false);
+  // DB is now the single source of truth for tasks. `batonq sync-tasks` is
+  // still available as an explicit one-shot import from TASKS.md, but the
+  // pick hot path no longer re-parses the file — it trusts the DB.
   const db = openTaskDb();
   try {
     // Auto-sweep task-TTLs before picking so stale claims don't block the
@@ -1502,7 +1523,9 @@ function abandonTask(id?: string): void {
 }
 
 function listTasks(): void {
-  syncTasks(false);
+  // DB-first: `tasks` reads straight from the DB. If the user has edited
+  // TASKS.md and wants the changes to show up, they run `batonq sync-tasks`
+  // explicitly (or use `batonq add` / `batonq import` instead).
   const db = openTaskDb();
   const now = new Date().toISOString();
   const groups: Array<["pending" | "claimed" | "done", string]> = [
@@ -1551,6 +1574,250 @@ function listTasks(): void {
 
 function rewriteMdTaskStatus(repo: string, body: string, newStatus: "done" | "pending"): void {
   rewriteMdTaskStatusCore(TASKS_PATH, repo, body, newStatus);
+}
+
+// ── add / import / export ─────────────────────────────────────────────────────
+//
+// DB-first input path. `add` takes a single task via flags (or JSON on stdin);
+// `import` takes a YAML / markdown file; `export --md` writes the DB back out
+// as a read-only snapshot. These replace TASKS.md as the canonical input
+// surface — the old file becomes an optional one-way import target.
+
+interface AddFlags {
+  body?: string;
+  repo?: string;
+  verify?: string;
+  judge?: string;
+  priority: string;
+  at?: string;
+  status?: string;
+  json: boolean;
+}
+
+function parseAddFlags(args: string[]): AddFlags {
+  const flags: AddFlags = { priority: "normal", json: false };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    const takeNext = (label: string): string => {
+      const v = args[++i];
+      if (v == null) {
+        console.error(`${label} requires a value`);
+        process.exit(2);
+      }
+      return v;
+    };
+    switch (a) {
+      case "--body":
+        flags.body = takeNext("--body");
+        break;
+      case "--repo":
+        flags.repo = takeNext("--repo");
+        break;
+      case "--verify":
+        flags.verify = takeNext("--verify");
+        break;
+      case "--judge":
+        flags.judge = takeNext("--judge");
+        break;
+      case "--priority":
+        flags.priority = takeNext("--priority");
+        break;
+      case "--at":
+        flags.at = takeNext("--at");
+        break;
+      case "--status":
+        flags.status = takeNext("--status");
+        break;
+      case "--json":
+        flags.json = true;
+        break;
+      default:
+        console.error(`add: unknown flag: ${a}`);
+        console.error(
+          "usage: batonq add --body <text> [--repo <name>] [--verify <sh>] [--judge <prompt>] [--priority high|normal|low] [--at <ISO>] [--status draft|pending] [--json]",
+        );
+        process.exit(2);
+    }
+  }
+  return flags;
+}
+
+function addCmd(): void {
+  const args = process.argv.slice(3);
+  const flags = parseAddFlags(args);
+
+  // Build the input object. In --json mode we start from stdin (a complete
+  // task object) and let any explicit flags override individual fields. In
+  // flag mode --body is required up front.
+  let input: Record<string, unknown>;
+  if (flags.json) {
+    const stdin = readFileSync(0, "utf8");
+    if (!stdin.trim()) {
+      console.error("--json: empty stdin (expected a JSON object)");
+      process.exit(1);
+    }
+    try {
+      const parsed = JSON.parse(stdin);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        console.error("--json: stdin must be a JSON object");
+        process.exit(1);
+      }
+      input = parsed as Record<string, unknown>;
+    } catch (e: any) {
+      console.error(`--json: invalid JSON on stdin: ${e.message}`);
+      process.exit(1);
+    }
+  } else {
+    if (!flags.body) {
+      console.error("add: --body is required (or pass --json and pipe a JSON object on stdin)");
+      process.exit(2);
+    }
+    input = {};
+  }
+
+  if (flags.body !== undefined) input.body = flags.body;
+  if (flags.repo !== undefined) input.repo = flags.repo;
+  if (flags.verify !== undefined) input.verify = flags.verify;
+  if (flags.judge !== undefined) input.judge = flags.judge;
+  // Only write priority when it was explicitly passed on the CLI, so
+  // --json payloads can set their own priority without getting clobbered.
+  if (args.includes("--priority")) input.priority = flags.priority;
+  if (flags.at !== undefined) input.scheduled_for = flags.at;
+  if (flags.status !== undefined) input.status = flags.status;
+
+  // Derive repo from the cwd git-root when neither flags nor JSON supplied one.
+  if (!("repo" in input) || !input.repo) {
+    const repo = getRepoForCwd();
+    input.repo = repo ?? "any:infra";
+  }
+
+  const db = openTaskDb();
+  try {
+    const eid = validatedInsertTask(db, input);
+    // Drop the deprecation header onto TASKS.md the first time someone uses
+    // the new DB-first path. Best-effort — a read-only FS or missing file is
+    // fine to ignore.
+    try {
+      ensureTasksMdDeprecationHeader(TASKS_PATH);
+    } catch {
+      /* non-fatal */
+    }
+    console.log(`task added: ${eid}`);
+  } catch (e: any) {
+    if (e instanceof ZodError) {
+      console.error("add: schema validation failed");
+      for (const issue of e.issues) {
+        const path = issue.path.join(".") || "(root)";
+        console.error(`  ${path}: ${issue.message}`);
+      }
+      process.exit(1);
+    }
+    if (e instanceof DuplicateExternalIdError) {
+      console.error(`add: duplicate external_id ${e.externalId} — task already in DB`);
+      process.exit(1);
+    }
+    console.error(`add failed: ${e?.message ?? String(e)}`);
+    process.exit(1);
+  } finally {
+    db.close();
+  }
+}
+
+function importCmd(file?: string): void {
+  if (!file) {
+    console.error("usage: batonq import <file.yaml|file.md>");
+    process.exit(2);
+  }
+  if (!existsSync(file)) {
+    console.error(`import: file not found: ${file}`);
+    process.exit(1);
+  }
+  const text = readFileSync(file, "utf8");
+  const format = detectImportFormat(file, text);
+
+  let raws: unknown[];
+  try {
+    raws =
+      format === "yaml" ? parseYamlTasksText(text) : parseMarkdownTasksForImport(text);
+  } catch (e: any) {
+    console.error(`import: parse error (${format}): ${e.message}`);
+    process.exit(1);
+  }
+
+  const db = openTaskDb();
+  let report;
+  try {
+    report = runImport(db, raws);
+  } finally {
+    db.close();
+  }
+
+  // Persist the per-entry log so the user has a concrete artifact to inspect
+  // on anything other than a clean run. `/tmp` is the right place here: logs
+  // are session-scoped and a disappearing tmpfs is fine.
+  const logfile = `/tmp/batonq-import-${Date.now()}.log`;
+  if (report.logLines.length > 0) {
+    try {
+      writeFileSync(logfile, report.logLines.join("\n") + "\n", { mode: 0o600 });
+    } catch {
+      /* non-fatal */
+    }
+  }
+
+  try {
+    ensureTasksMdDeprecationHeader(TASKS_PATH);
+  } catch {
+    /* non-fatal */
+  }
+
+  const parts: string[] = [`imported ${report.imported} tasks`];
+  const issues: string[] = [];
+  if (report.invalid > 0) issues.push(`${report.invalid} invalid`);
+  if (report.duplicates > 0) issues.push(`${report.duplicates} duplicate`);
+  if (issues.length > 0) {
+    parts.push(`(${issues.join(", ")} — see ${logfile})`);
+  }
+  console.log(parts.join(" "));
+  // Exit non-zero if ANY entry failed validation so CI / scripts can detect
+  // a partial import. Duplicates alone are not an error — insert-new semantics.
+  if (report.invalid > 0) process.exit(1);
+}
+
+function exportCmd(): void {
+  const args = process.argv.slice(3);
+  // --md is the only supported format right now but keep it explicit so
+  // future flags (--json, --csv) have a clean slot.
+  const wantsMd = args.includes("--md");
+  const fileIdx = args.indexOf("--file");
+  const file = fileIdx >= 0 ? args[fileIdx + 1] : undefined;
+  const unknown = args.filter((a, i) => {
+    if (a === "--md") return false;
+    if (a === "--file") return false;
+    if (i > 0 && args[i - 1] === "--file") return false;
+    return true;
+  });
+  if (unknown.length > 0) {
+    console.error(`export: unknown flag(s): ${unknown.join(" ")}`);
+    console.error("usage: batonq export --md [--file PATH]");
+    process.exit(2);
+  }
+  if (!wantsMd) {
+    console.error("export: --md is required (no other formats supported yet)");
+    console.error("usage: batonq export --md [--file PATH]");
+    process.exit(2);
+  }
+  const db = openTaskDb();
+  try {
+    const content = exportTasksAsMarkdown(db);
+    if (file) {
+      writeFileSync(file, content);
+      console.log(`exported to ${file}`);
+    } else {
+      process.stdout.write(content);
+    }
+  } finally {
+    db.close();
+  }
 }
 
 function enrichTask(id?: string): void {

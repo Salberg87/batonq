@@ -19,7 +19,6 @@ import { basename } from "node:path";
 import { homedir } from "node:os";
 import {
   appendClarifyingAnswers,
-  appendTaskToPending,
   externalId,
   validateNewTask,
   type ClarifyingAnswer,
@@ -1046,40 +1045,39 @@ export function defaultRepoForCwd(cwd: string = process.cwd()): string {
 export function submitAddTask(
   form: NewTask,
   setFlash: (f: { msg: string; color: string }) => void,
-  tasksPath: string = DEFAULT_TASKS_PATH,
+  _tasksPath: string = DEFAULT_TASKS_PATH,
 ): void {
+  // Route through `batonq add` so the TUI uses the same DB-first, Zod-gated
+  // path as the CLI. Drafts still flow through the existing enrich/promote
+  // workflow — the `--status draft` flag preserves that semantic. The first
+  // positional arg retained for backwards-compat with the old signature.
+  void _tasksPath;
   const repo = form.repo.trim() || defaultRepoForCwd();
-  const task: NewTask = {
-    repo,
-    body: form.body,
-    verify: form.verify,
-    judge: form.judge,
-  };
-  try {
-    // TUI-created tasks land as drafts so a human can run `batonq enrich <id>`
-    // before the queue starts handing them out to autonomous agents.
-    appendTaskToPending(tasksPath, task, "draft");
-    const eid = externalId(
-      task.repo.trim(),
-      task.body.replace(/\s+/g, " ").trim(),
-    );
-    const sync = spawnSync(findBatonqBin(), ["sync-tasks"], {
-      encoding: "utf8",
-    });
-    if (sync.status !== 0) {
-      setFlash({
-        msg: `added, but sync-tasks failed: ${(sync.stderr ?? "").trim() || `exit ${sync.status}`}`,
-        color: C.warn,
-      });
-      return;
-    }
-    setFlash({
-      msg: `✓ Draft added (id ${eid.slice(0, 8)}). Enrich + promote to queue.`,
-      color: C.ok,
-    });
-  } catch (e: any) {
-    setFlash({ msg: `add failed: ${e.message ?? String(e)}`, color: C.err });
+  const body = form.body.replace(/\s+/g, " ").trim();
+  if (!body) {
+    setFlash({ msg: "add failed: body is required", color: C.err });
+    return;
   }
+  const args = ["add", "--body", body, "--repo", repo, "--status", "draft"];
+  if (form.verify?.trim()) args.push("--verify", form.verify.trim());
+  if (form.judge?.trim()) args.push("--judge", form.judge.trim());
+  const r = spawnSync(findBatonqBin(), args, { encoding: "utf8" });
+  if (r.status !== 0) {
+    const stderr = (r.stderr ?? "").trim();
+    setFlash({
+      msg: `add failed: ${stderr.split("\n").slice(0, 2).join(" ") || `exit ${r.status}`}`,
+      color: C.err,
+    });
+    return;
+  }
+  // Extract external_id from `task added: <eid>` stdout. Fall back to our
+  // own computation if parsing fails (shouldn't, but keeps the flash honest).
+  const m = (r.stdout ?? "").match(/task added:\s+(\S+)/);
+  const eid = m?.[1] ?? externalId(repo, body);
+  setFlash({
+    msg: `✓ Draft added (id ${eid.slice(0, 8)}). Enrich + promote to queue.`,
+    color: C.ok,
+  });
 }
 
 if (import.meta.main) {
