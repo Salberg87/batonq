@@ -466,6 +466,41 @@ of unix verbs around those three files.
 For mermaid-rendered component, state, claim-write-path, and data-flow
 diagrams (with prose), see [`docs/architecture.md`](./docs/architecture.md).
 
+## Ship status
+
+Ship-readiness is not a vibe. `docs/ship-criteria.md` lists every
+machine-checkable assertion that defines "ready to release the next
+version" — Track A TUI surfaces, Track B gates, Track C infra, Track D
+docs, and the Viral V1–V4 marketing artifacts. Each row is a one-line
+shell check.
+
+Run the report:
+
+```sh
+batonq ship-status       # or: scripts/check-ship.sh
+```
+
+Example output:
+
+```
+PASS  SHIP-001  README anti-juks tagline present
+PASS  SHIP-002  install.sh shell-syntax valid
+PASS  SHIP-003  install.sh uses strict mode and chmods binaries
+…
+PASS  SHIP-016  Test suite green under bun test
+FAIL  SHIP-017  TypeScript typecheck clean
+PASS  SHIP-018  Docs: positioning + comparison + architecture + FAQ present
+…
+
+21/22 criteria passing. Blockers: SHIP-017
+```
+
+The script always exits 0 — it is a report, not a gate. Ship-readiness
+is a human decision, but the blocker list tells you exactly what still
+needs attention. To add a criterion, append a `SHIP-<id> | <name> |
+<shell-check>` row to [`docs/ship-criteria.md`](./docs/ship-criteria.md)
+and re-run.
+
 ## FAQ
 
 **Something isn't working — where do I start?**

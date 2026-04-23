@@ -164,6 +164,9 @@ switch (cmd) {
   case "uninstall":
     runUninstall();
     break;
+  case "ship-status":
+    runShipStatus();
+    break;
   default:
     console.error(
       "usage: batonq\n" +
@@ -175,9 +178,28 @@ switch (cmd) {
         "                 sync-tasks | pick | mine | done [<id>] | abandon [<id>] | tasks\n" +
         "  Drafts:        enrich <id> | promote <id>\n" +
         "  Dashboard:     tui | loop-status [--json]\n" +
+        "  Ship:          ship-status\n" +
         "  Exit:          uninstall [--remove-state|--keep-state]"
     );
     process.exit(2);
+}
+
+// Wrapper around scripts/check-ship.sh. Resolves the repo root by walking
+// up from __dirname (src/) rather than cwd — the user runs `batonq
+// ship-status` from anywhere and still expects the repo's criteria to be
+// checked. The script itself is report-mode (always exits 0), so we pipe
+// through stdout/stderr and propagate its exit code verbatim.
+function runShipStatus(): void {
+  const scriptPath = resolve(__dirname, "..", "scripts", "check-ship.sh");
+  if (!existsSync(scriptPath)) {
+    console.error(`ship-status: check-ship.sh not found at ${scriptPath}`);
+    process.exit(2);
+  }
+  const res = spawnSync("sh", [scriptPath], {
+    stdio: "inherit",
+    cwd: resolve(__dirname, ".."),
+  });
+  process.exit(res.status ?? 0);
 }
 
 function runLoopStatus(args: string[]): void {
