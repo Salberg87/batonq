@@ -49,6 +49,8 @@ import {
   SessionsPanel,
   TasksPanel,
 } from "./tui-panels";
+import { computeAlerts, type Alert } from "./alerts";
+import { AlertLane } from "./alert-lane";
 import {
   eventsAgeSec,
   findLoopCurrentTask,
@@ -74,6 +76,9 @@ const FORM_FIELDS: FormField[] = ["repo", "body", "verify", "judge"];
 const REFRESH_MS = 2000;
 const FLASH_MS = 3000;
 const DEFAULT_TASKS_PATH = `${homedir()}/DEV/TASKS.md`;
+// Default loop-log path used by the Alert lane's watchdog-kill detector.
+// Matches runRestartLoop's output redirect so the two stay in sync.
+const DEFAULT_LOOP_LOG_PATH = "/tmp/batonq-loop.log";
 
 function useTick(ms: number): { now: number; bump: () => void } {
   const [t, setT] = useState(() => Date.now());
@@ -99,6 +104,28 @@ function useSnapshot(now: number): Snapshot | null {
       }
     } catch {
       return null;
+    }
+  }, [now]);
+}
+
+// Pull the current alert list off the shared DB on each tick. We open + close
+// a fresh read-only handle so the TUI never sits on a write lock (per §6's
+// implementation-note constraint). A failure to read collapses to no alerts
+// — the TUI should not lie about health if the DB itself is broken.
+function useAlerts(now: number): Alert[] {
+  return useMemo(() => {
+    try {
+      const db = openStateDb(DEFAULT_DB_PATH);
+      try {
+        return computeAlerts(db, {
+          now,
+          loopLogPath: DEFAULT_LOOP_LOG_PATH,
+        });
+      } finally {
+        db.close();
+      }
+    } catch {
+      return [];
     }
   }, [now]);
 }
@@ -143,6 +170,7 @@ export function App() {
   const { now, bump: forceRefresh } = useTick(REFRESH_MS);
   const snap = useSnapshot(now);
   const loopStatus = useLoopStatus(now);
+  const alerts = useAlerts(now);
 
   const [focus, setFocus] = useState<PanelKey>("tasks");
   const [selected, setSelected] = useState<Record<PanelKey, number>>({
@@ -435,6 +463,7 @@ export function App() {
       <Box paddingX={1} flexDirection="column">
         <Logo />
       </Box>
+      <AlertLane alerts={alerts} />
       <Box paddingX={1}>
         <Text color={C.dim}>tui · refresh {REFRESH_MS / 1000}s · </Text>
         <Text color={C.paper}>focus: </Text>

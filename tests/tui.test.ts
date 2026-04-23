@@ -1030,6 +1030,293 @@ describe("findLoopCurrentTask", () => {
   });
 });
 
+// ── alert lane (§1 of docs/tui-ux-v2.md) ──────────────────────────────────────
+
+import {
+  computeAlerts,
+  looksLikeJudgeFail,
+  looksLikeVerifyFail,
+  watchdogKillAgeMinutes,
+  STALE_CLAIM_SEC,
+  EMPTY_QUEUE_SEC,
+  type Alert,
+} from "../src/alerts";
+import { AlertLane, alertSeverityColor } from "../src/alert-lane";
+
+function makeAlertsDb(): Database {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      external_id TEXT UNIQUE NOT NULL,
+      repo TEXT NOT NULL,
+      body TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      claimed_by TEXT,
+      claimed_at TEXT,
+      completed_at TEXT,
+      created_at TEXT NOT NULL,
+      verify_cmd TEXT,
+      verify_output TEXT,
+      verify_ran_at TEXT,
+      judge_cmd TEXT,
+      judge_output TEXT,
+      judge_ran_at TEXT,
+      last_progress_at TEXT
+    );
+  `);
+  return db;
+}
+
+function seedDone(
+  db: Database,
+  ext: string,
+  cols: {
+    completedAgo?: number;
+    verify_cmd?: string | null;
+    verify_output?: string | null;
+    verify_ran_at?: string | null;
+    judge_cmd?: string | null;
+    judge_output?: string | null;
+    judge_ran_at?: string | null;
+  } = {},
+): void {
+  db.run(
+    `INSERT INTO tasks
+     (external_id, repo, body, status, completed_at, created_at,
+      verify_cmd, verify_output, verify_ran_at,
+      judge_cmd, judge_output, judge_ran_at)
+     VALUES (?, ?, ?, 'done', ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      ext,
+      "any:infra",
+      "body " + ext,
+      iso(-(cols.completedAgo ?? 60)),
+      iso(-3600),
+      cols.verify_cmd ?? null,
+      cols.verify_output ?? null,
+      cols.verify_ran_at ?? null,
+      cols.judge_cmd ?? null,
+      cols.judge_output ?? null,
+      cols.judge_ran_at ?? null,
+    ],
+  );
+}
+
+describe("alerts — pure classifiers", () => {
+  test("looksLikeVerifyFail detects FAIL token and non-zero exit codes", () => {
+    expect(looksLikeVerifyFail("assertion FAIL in test 3")).toBe(true);
+    expect(looksLikeVerifyFail("FAIL: expected 1")).toBe(true);
+    expect(looksLikeVerifyFail("command exited with exit 2")).toBe(true);
+    // PASS and empty are fine.
+    expect(looksLikeVerifyFail("PASS 42 tests")).toBe(false);
+    expect(looksLikeVerifyFail("")).toBe(false);
+    // Exit 0 is explicitly NOT a failure.
+    expect(looksLikeVerifyFail("process exit 0")).toBe(false);
+    // FAILSAFE must not match — we only match bare FAIL tokens.
+    expect(looksLikeVerifyFail("watchdog FAILSAFE armed")).toBe(false);
+  });
+
+  test("looksLikeJudgeFail only matches when first token is FAIL", () => {
+    expect(looksLikeJudgeFail("FAIL: missing commits")).toBe(true);
+    expect(looksLikeJudgeFail("\n  FAIL reason here\n")).toBe(true);
+    expect(looksLikeJudgeFail("PASS verified")).toBe(false);
+    // "FAIL" later in the line doesn't count — verdict must come first.
+    expect(looksLikeJudgeFail("verdict: FAIL because reasons")).toBe(false);
+    expect(looksLikeJudgeFail("")).toBe(false);
+  });
+});
+
+describe("computeAlerts", () => {
+  test("juks detection fires when done task has verify_cmd but no gates ran", () => {
+    const db = makeAlertsDb();
+    // Task that had verify_cmd declared, got marked done, but neither
+    // verify_ran_at nor judge_ran_at was ever set. Classic self-close juks.
+    seedDone(db, "juks0001", {
+      completedAgo: 60,
+      verify_cmd: "bun test tests/core.test.ts",
+      verify_ran_at: null,
+      judge_cmd: "did it work?",
+      judge_ran_at: null,
+    });
+
+    const alerts = computeAlerts(db, { now: NOW });
+    const juks = alerts.find((a) => a.kind === "juks-done");
+    expect(juks).toBeDefined();
+    expect(juks!.severity).toBe("red");
+    expect(juks!.text).toContain("juks0001");
+    expect(juks!.text).toContain("without gates");
+    expect(juks!.externalId).toBe("juks0001");
+
+    // A task with verify_cmd but verify_ran_at set does NOT trigger juks.
+    const db2 = makeAlertsDb();
+    seedDone(db2, "clean001", {
+      verify_cmd: "bun test",
+      verify_ran_at: iso(-30),
+      judge_ran_at: iso(-25),
+    });
+    const clean = computeAlerts(db2, { now: NOW });
+    expect(clean.find((a) => a.kind === "juks-done")).toBeUndefined();
+
+    db.close();
+    db2.close();
+  });
+
+  test("alert lane collapses to 0 lines when there are no alerts", () => {
+    const db = makeAlertsDb();
+    // Healthy state: one cleanly-gated done task, one young pending task, no
+    // claimed rows. Nothing should fire.
+    seedDone(db, "good0001", {
+      completedAgo: 30,
+      verify_cmd: "bun test",
+      verify_output: "PASS 10 tests",
+      verify_ran_at: iso(-30),
+      judge_cmd: "did it work?",
+      judge_output: "PASS",
+      judge_ran_at: iso(-25),
+    });
+    db.run(
+      `INSERT INTO tasks (external_id, repo, body, status, created_at)
+       VALUES ('pend0001', 'any:infra', 'ready to pick', 'pending', ?)`,
+      [iso(-60)],
+    );
+
+    const alerts = computeAlerts(db, { now: NOW, loopLogPath: null });
+    expect(alerts).toHaveLength(0);
+
+    // The component must render nothing — ink's lastFrame returns an empty
+    // string when a component tree yields no output.
+    const { lastFrame, unmount } = render(
+      React.createElement(AlertLane, { alerts: [] }),
+    );
+    expect((lastFrame() ?? "").trim()).toBe("");
+    unmount();
+    db.close();
+  });
+
+  test("severity → color threshold switches across red, yellow, gray", () => {
+    // Direct palette mapping: red for juks/failed, yellow for stale/watchdog,
+    // gray for empty-queue. alertSeverityColor is what AlertLane calls.
+    expect(alertSeverityColor("red")).not.toBe(alertSeverityColor("yellow"));
+    expect(alertSeverityColor("yellow")).not.toBe(alertSeverityColor("gray"));
+    expect(alertSeverityColor("red")).not.toBe(alertSeverityColor("gray"));
+
+    // And the end-to-end switch: three scenarios, three different severities.
+    // Red — juks done.
+    const dbRed = makeAlertsDb();
+    seedDone(dbRed, "red00001", {
+      verify_cmd: "bun test",
+      verify_ran_at: null,
+      judge_ran_at: null,
+    });
+    const red = computeAlerts(dbRed, { now: NOW });
+    expect(red[0]?.severity).toBe("red");
+    dbRed.close();
+
+    // Yellow — stale claim (>30m claim + >10m since progress).
+    const dbYellow = makeAlertsDb();
+    dbYellow.run(
+      `INSERT INTO tasks
+       (external_id, repo, body, status, claimed_at, last_progress_at, created_at)
+       VALUES ('stale001', 'any:infra', 'stuck forever', 'claimed', ?, ?, ?)`,
+      [iso(-(STALE_CLAIM_SEC + 60)), iso(-(STALE_CLAIM_SEC + 60)), iso(-3600)],
+    );
+    const yellow = computeAlerts(dbYellow, { now: NOW });
+    expect(yellow[0]?.kind).toBe("stale-claim");
+    expect(yellow[0]?.severity).toBe("yellow");
+    dbYellow.close();
+
+    // Gray — empty queue (pending=0, nothing has happened for >15 min).
+    const dbGray = makeAlertsDb();
+    dbGray.run(
+      `INSERT INTO tasks (external_id, repo, body, status, completed_at, created_at)
+       VALUES ('old00001', 'any:infra', 'shipped long ago', 'done', ?, ?)`,
+      [iso(-(EMPTY_QUEUE_SEC + 120)), iso(-(EMPTY_QUEUE_SEC + 600))],
+    );
+    const gray = computeAlerts(dbGray, { now: NOW });
+    expect(gray[0]?.kind).toBe("empty-queue");
+    expect(gray[0]?.severity).toBe("gray");
+    dbGray.close();
+  });
+
+  test("maxAlerts caps the lane at 2 rows, highest severity first", () => {
+    const db = makeAlertsDb();
+    // Fire three distinct alerts at once: verify-failed, juks, stale-claim.
+    seedDone(db, "failverify", {
+      completedAgo: 5,
+      verify_cmd: "bun test",
+      verify_output: "FAIL: 2 assertions failed",
+      verify_ran_at: iso(-10),
+    });
+    // Different juks task so the juks query picks a separate row.
+    seedDone(db, "juksalso", {
+      completedAgo: 120,
+      verify_cmd: "bun test",
+      verify_ran_at: null,
+      judge_ran_at: null,
+    });
+    db.run(
+      `INSERT INTO tasks
+       (external_id, repo, body, status, claimed_at, last_progress_at, created_at)
+       VALUES ('stale002', 'any:infra', 'stuck', 'claimed', ?, ?, ?)`,
+      [iso(-(STALE_CLAIM_SEC + 60)), iso(-(STALE_CLAIM_SEC + 60)), iso(-3600)],
+    );
+
+    const alerts = computeAlerts(db, { now: NOW });
+    expect(alerts).toHaveLength(2);
+    expect(alerts[0]?.kind).toBe("verify-failed"); // highest priority
+    expect(alerts[1]?.kind).toBe("juks-done"); // next
+    db.close();
+  });
+
+  test("watchdog-kill alert fires when loop-log has '[watchdog] … killing'", () => {
+    const dir = mkdtempSync(join(tmpdir(), "batonq-alerts-"));
+    try {
+      const logPath = join(dir, "loop.log");
+      writeFileSync(
+        logPath,
+        "some loop output\n" +
+          "[watchdog] events.jsonl stale 612s (>600s) — killing claude tree\n" +
+          "post-kill trailing line\n",
+      );
+      const mins = watchdogKillAgeMinutes(logPath, Date.now());
+      expect(mins).not.toBeNull();
+      expect(mins!).toBeGreaterThanOrEqual(0);
+
+      const db = makeAlertsDb();
+      // Seed one pending task so empty-queue alert doesn't also fire.
+      db.run(
+        `INSERT INTO tasks (external_id, repo, body, status, created_at)
+         VALUES ('pend0002', 'any:infra', 'queued', 'pending', ?)`,
+        [iso(-60)],
+      );
+      const alerts = computeAlerts(db, {
+        now: Date.now(),
+        loopLogPath: logPath,
+      });
+      const wd = alerts.find((a) => a.kind === "watchdog-kill");
+      expect(wd).toBeDefined();
+      expect(wd!.severity).toBe("yellow");
+      expect(wd!.text).toContain("watchdog");
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("watchdogKillAgeMinutes returns null when log is missing or clean", () => {
+    const dir = mkdtempSync(join(tmpdir(), "batonq-alerts-"));
+    try {
+      expect(watchdogKillAgeMinutes(join(dir, "no.log"))).toBeNull();
+      const clean = join(dir, "clean.log");
+      writeFileSync(clean, "loop started\nloop idle\nloop idle\n");
+      expect(watchdogKillAgeMinutes(clean)).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("TUI L-keybind opens restart confirm overlay", () => {
   test("pressing L shows the restart-loop confirm prompt", async () => {
     const { stdin, lastFrame, unmount } = render(React.createElement(App));
