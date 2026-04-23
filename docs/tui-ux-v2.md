@@ -93,6 +93,25 @@ Badge alphabet:
 - `⊘` — task had no gates
 - `⚠` — task done without gates running despite gates existing (juks signal, matches alert-lane condition)
 
+**Badge visibility:** `⚠` must be impossible to miss — rendered red + bold,
+all other badges are green (`✓V ✓J`, `✓V —`) or dim (`⊘`). A juks row
+should catch the eye on first glance at the Tasks panel.
+
+**Badges show status, not duration.** A ✓V ✓J row means "both gates ran";
+it does not carry elapsed time (like `3s+12s`). Rationale: if a gate
+failed, the alert lane would already be red with `verify FAILED on <id>`,
+so the only question left for the Tasks panel is "did it run or not."
+Duration + captured output live in the drill-down (§5), not in the list
+row. Keeps each done line to one visual ≤80 char width and avoids forcing
+the operator to parse noise when scanning the queue.
+
+**Output clipping (drill-down only).** `verify_output` is shown
+tail-first (`tailLines(n=30)`) — the failing assertion is almost always
+at the end of a long log. `judge_output` is shown head-first
+(`headLines(n=15)`) — the verdict string starts with PASS/FAIL on line 1
+and reason follows. These two helpers live in `src/tui-data.ts`. The main
+Tasks-panel rows never show output at all; they show the badge only.
+
 `j`/`k` navigates rows. Enter opens drill-down.
 
 ### 4. Live feed
