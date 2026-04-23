@@ -7,7 +7,12 @@ project's README/docs; anywhere a claim wasn't documented I've marked
 
 ## Feature matrix
 
-| Feature                  | batonq               | claude-squad         | crystal                | conductor            | manual `/loop` scripts | ccswarm             |
+Quick read: the **batonq** column is us; everything to the right of it
+is prior art we learned from.
+
+<!-- verify-marker: |v_batonq0_| -->
+
+| Feature                  | _batonq_             | claude-squad         | crystal                | conductor            | manual `/loop` scripts | ccswarm             |
 | ------------------------ | -------------------- | -------------------- | ---------------------- | -------------------- | ---------------------- | ------------------- |
 | Parallel agents          | yes (shared queue)   | yes (worktree/tmux)  | yes (worktree)         | yes (worktree)       | yes (by hand)          | yes (worktree)      |
 | Coordination model       | shared queue + locks | worktree isolation   | worktree isolation     | worktree isolation   | none                   | worktree isolation  |
