@@ -35,6 +35,8 @@ const DB_PATH = `${HOME}/.claude/batonq-state.db`;
 const HOOK_PATH = `${HOME}/bin/batonq-hook`;
 const SETTINGS_PATH = `${HOME}/.claude/settings.json`;
 const TASKS_PATH = `${HOME}/DEV/TASKS.md`;
+const LOOP_LOG_GLOB = "/tmp/batonq-loop*.log";
+const LOGS_POLL_MS = 500;
 
 // One-shot rename migration from legacy `.claude/agent-coord-*` layout.
 // No-op on fresh installs and after the first successful migration.
@@ -61,6 +63,9 @@ switch (cmd) {
     break;
   case "tail":
     tail();
+    break;
+  case "logs":
+    logs();
     break;
   case "report":
     report();
@@ -114,7 +119,7 @@ switch (cmd) {
     console.error(
       "usage: batonq\n" +
         "  Coordination:  check | doctor | status | release <path> | sweep | sweep-tasks\n" +
-        "  Measurement:   tail [-n N] | report [--since ISO] [--until ISO] [--json]\n" +
+        "  Measurement:   tail [-n N] | logs [-f] [-n N] [--source events|loop|both] | report [--since ISO] [--until ISO] [--json]\n" +
         "  Tasks:         sync-tasks | pick | mine | done [<id>] | abandon [<id>] | tasks\n" +
         "  Drafts:        enrich <id> | promote <id>\n" +
         "  Dashboard:     tui | loop-status [--json]\n" +
@@ -813,6 +818,158 @@ function tail() {
     console.log(
       `${e.ts.slice(11, 19)}  ${String(e.session).slice(0, 8)}  ${e.tool.padEnd(9)} ${e.phase.padEnd(4)} ${repo}/${rel}${pat}`
     );
+  }
+}
+
+// ── logs ──────────────────────────────────────────────────────────────────────
+// Combined tail over events.jsonl (hook events) + loop stdout
+// (/tmp/batonq-loop*.log, newest). Lines are merged stably by timestamp and
+// painted: events=cyan, loop=yellow, error-ish lines=red.
+//
+// Flags:
+//   --follow / -f              tail -f-style streaming (500ms poll)
+//   -n <N>                     last N merged lines (default 20)
+//   --source events|loop|both  filter by source (default both)
+
+async function logs(): Promise<void> {
+  const args = process.argv.slice(3);
+  const follow = args.includes("-f") || args.includes("--follow");
+
+  let n = 20;
+  const nIdx = args.findIndex((a) => a === "-n");
+  if (nIdx >= 0 && args[nIdx + 1]) {
+    const parsed = parseInt(args[nIdx + 1], 10);
+    if (Number.isFinite(parsed) && parsed > 0) n = parsed;
+  }
+
+  let source: "events" | "loop" | "both" = "both";
+  const sIdx = args.findIndex((a) => a === "--source");
+  if (sIdx >= 0 && args[sIdx + 1]) {
+    const s = args[sIdx + 1];
+    if (s === "events" || s === "loop" || s === "both") {
+      source = s;
+    } else {
+      console.error(`invalid --source: ${s} (expected events|loop|both)`);
+      process.exit(2);
+    }
+  }
+
+  const {
+    readEvents,
+    readLoop,
+    newestLoopLog,
+    mergeAndTail,
+    colorize,
+    formatEventLine,
+    classifyLoopLine,
+  } = require("./logs-core");
+
+  const useColor = !!process.stdout.isTTY && process.env.NO_COLOR == null;
+
+  // ── one-shot: last N merged lines ────────────────────────────────────────
+  const events = source === "loop" ? [] : readEvents(LOG_PATH);
+  let loopPath: string | null =
+    source === "events" ? null : newestLoopLog(LOOP_LOG_GLOB);
+  const loop = source === "events" ? [] : readLoop(loopPath);
+  const merged = mergeAndTail(events, loop, { source, n });
+  for (const r of merged) console.log(colorize(r, useColor));
+
+  if (!follow) return;
+
+  // ── follow mode: byte-offset tail with 500ms polling ─────────────────────
+  // We anchor on byte offsets (not line counts) so mid-write appends don't
+  // duplicate. On truncation (size shrinks) we reset to 0 and start over.
+  // For events.jsonl we only emit whole lines; a trailing partial stays in
+  // the pending buffer until its newline arrives.
+  let evOffset = existsSync(LOG_PATH) ? statSync(LOG_PATH).size : 0;
+  let evPending = "";
+  let loopOffset = loopPath && existsSync(loopPath) ? statSync(loopPath).size : 0;
+  let loopPending = "";
+
+  const readTail = async (path: string, from: number, to: number): Promise<string> => {
+    // Bun.file().slice() returns a Blob for a byte range — no full re-read.
+    return await Bun.file(path).slice(from, to).text();
+  };
+
+  const pollOnce = async (): Promise<void> => {
+    // Rotation: the newest matching loop log may have changed (or appeared).
+    if (source !== "events") {
+      const current = newestLoopLog(LOOP_LOG_GLOB);
+      if (current !== loopPath) {
+        loopPath = current;
+        loopOffset = 0;
+        loopPending = "";
+      }
+    }
+
+    if (source !== "loop" && existsSync(LOG_PATH)) {
+      const size = statSync(LOG_PATH).size;
+      if (size < evOffset) {
+        evOffset = 0;
+        evPending = "";
+      }
+      if (size > evOffset) {
+        const chunk = await readTail(LOG_PATH, evOffset, size);
+        evOffset = size;
+        const text = evPending + chunk;
+        const lastNl = text.lastIndexOf("\n");
+        const complete = lastNl >= 0 ? text.slice(0, lastNl) : "";
+        evPending = lastNl >= 0 ? text.slice(lastNl + 1) : text;
+        for (const raw of complete.split("\n")) {
+          if (!raw.trim()) continue;
+          const f = formatEventLine(raw);
+          if (!f) continue;
+          console.log(
+            colorize(
+              { ts: f.ts, source: "events", line: f.line, level: f.level },
+              useColor,
+            ),
+          );
+        }
+      }
+    }
+
+    if (source !== "events" && loopPath && existsSync(loopPath)) {
+      const size = statSync(loopPath).size;
+      if (size < loopOffset) {
+        loopOffset = 0;
+        loopPending = "";
+      }
+      if (size > loopOffset) {
+        const chunk = await readTail(loopPath, loopOffset, size);
+        loopOffset = size;
+        const text = loopPending + chunk;
+        const lastNl = text.lastIndexOf("\n");
+        const complete = lastNl >= 0 ? text.slice(0, lastNl) : "";
+        loopPending = lastNl >= 0 ? text.slice(lastNl + 1) : text;
+        for (const line of complete.split("\n")) {
+          if (line.length === 0) continue;
+          console.log(
+            colorize(
+              {
+                ts: Date.now(),
+                source: "loop",
+                line,
+                level: classifyLoopLine(line),
+              },
+              useColor,
+            ),
+          );
+        }
+      }
+    }
+  };
+
+  // Poll forever — SIGINT (Ctrl-C) will terminate the process naturally.
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    await new Promise((r) => setTimeout(r, LOGS_POLL_MS));
+    try {
+      await pollOnce();
+    } catch {
+      // Any transient FS error: swallow and keep polling. Rotation, truncation,
+      // and race conditions already have explicit paths above.
+    }
   }
 }
 
