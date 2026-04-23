@@ -423,6 +423,35 @@ describe("runVerify", () => {
   });
 });
 
+// ── 7b. --version / -v / version prints batonq v<semver> (commit <sha>) ──────
+
+describe("batonq --version", () => {
+  test("prints 'batonq v<semver> (commit <sha>)' on stdout, exits 0", () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "batonq-home-"));
+    mkdirSync(join(fakeHome, ".claude"), { recursive: true });
+    try {
+      for (const flag of ["--version", "-v", "version"]) {
+        const r = spawnSync(BATONQ_BIN, [flag], {
+          env: { ...process.env, HOME: fakeHome, PATH: process.env.PATH ?? "" },
+          encoding: "utf8",
+        });
+        expect(r.status).toBe(0);
+        const out = (r.stdout ?? "").trim();
+        expect(out).toMatch(
+          /^batonq v[0-9]+\.[0-9]+\.[0-9]+ \(commit [^)]+\)$/,
+        );
+        const m = out.match(/^batonq v([0-9]+\.[0-9]+\.[0-9]+)/);
+        expect(m?.[1]).toBe(
+          JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"))
+            .version,
+        );
+      }
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+});
+
 // ── 8. --skip-verify requires AGENT_COORD_ALLOW_SKIP=1 ────────────────────────
 
 describe("done --skip-verify gate", () => {

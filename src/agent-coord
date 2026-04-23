@@ -48,6 +48,11 @@ try {
 const cmd = process.argv[2];
 
 switch (cmd) {
+  case "--version":
+  case "-v":
+  case "version":
+    printVersion();
+    break;
   case "check":
     check();
     break;
@@ -115,6 +120,31 @@ function runTui(): void {
   const here = new URL("./tui.tsx", import.meta.url).pathname;
   const r = spawnSync("bun", ["run", here], { stdio: "inherit" });
   process.exit(r.status ?? 0);
+}
+
+// ── version ───────────────────────────────────────────────────────────────────
+
+function printVersion(): void {
+  const pkgPath = new URL("../package.json", import.meta.url).pathname;
+  let version = "unknown";
+  try {
+    version = JSON.parse(readFileSync(pkgPath, "utf8")).version ?? "unknown";
+  } catch {
+    // keep "unknown"
+  }
+  let commit = "unknown";
+  try {
+    commit = execSync("git rev-parse --short HEAD", {
+      cwd: new URL("..", import.meta.url).pathname,
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim() || "unknown";
+  } catch {
+    // not a git checkout (e.g. tarball install) → keep "unknown"
+  }
+  console.log(`batonq v${version} (commit ${commit})`);
+  process.exit(0);
 }
 
 // ── check ─────────────────────────────────────────────────────────────────────
