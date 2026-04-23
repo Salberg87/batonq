@@ -357,7 +357,7 @@ export type TaskRecoveryHook = (
 // TASK_RECOVERY_HEARTBEAT_MS (5 min) we defer another 5 min — the agent is
 // alive but between tool calls. Otherwise mark_lost so sweepTasks can flip
 // status and log an escalation.
-export function defaultTryRecoverTaskBeforeMarkLost(
+export function tryRecoverTaskBeforeMarkLost(
   ctx: TaskRecoveryContext,
 ): TaskRecoveryDecision {
   const { session, nowMs } = ctx;
@@ -405,7 +405,7 @@ export function sweepTasks(
   const nowIso = opts.nowIso ?? new Date().toISOString();
   const nowMs = Date.parse(nowIso);
   const ttlMs = opts.ttlMs ?? TASK_CLAIM_TTL_MS;
-  const recover = opts.recover ?? defaultTryRecoverTaskBeforeMarkLost;
+  const recover = opts.recover ?? tryRecoverTaskBeforeMarkLost;
   const cutoffIso = new Date(nowMs - ttlMs).toISOString();
 
   const stale = db
