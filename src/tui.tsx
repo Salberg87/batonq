@@ -112,6 +112,15 @@ function useSnapshot(now: number): Snapshot | null {
 // a fresh read-only handle so the TUI never sits on a write lock (per §6's
 // implementation-note constraint). A failure to read collapses to no alerts
 // — the TUI should not lie about health if the DB itself is broken.
+//
+// Classifier lives in src/alerts.ts. Alert kinds surfaced here:
+//   verify-failed / judge-failed — done row with FAIL in captured output
+//   juks-done — done task where verify_cmd IS NOT NULL AND verify_ran_at IS
+//               NULL AND judge_ran_at IS NULL (the task self-closed past
+//               its own gates — highest-trust failure we can detect)
+//   stale-claim — >30m claimed, >10m since last progress
+//   watchdog-kill — "[watchdog] … killing" grep in /tmp/batonq-loop.log
+//   empty-queue — pending=0 for >15m
 function useAlerts(now: number): Alert[] {
   return useMemo(() => {
     try {
