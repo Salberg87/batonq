@@ -1,0 +1,7 @@
+{
+  "id": "001-null-deref-remove",
+  "repo_fixture_path": "fixtures/buggy-cli",
+  "prompt": "In src/commands/remove.js, `todo remove` without an id silently removes 0 items instead of erroring. Fix it so that calling `remove` with no argument (or a non-numeric argument) prints an error to stderr and exits non-zero. Keep the existing behavior when a valid numeric id is supplied.",
+  "verify_cmd": "node -e \"const {spawnSync}=require('node:child_process');const r=spawnSync('node',['src/cli.js','remove'],{encoding:'utf8'});process.exit(r.status===0?1:0)\"",
+  "judge_prompt": "Did the agent validate the id argument in remove.js and surface a clear error (non-zero exit, message to stderr) when it is missing or non-numeric, without breaking the happy path? Answer PASS or FAIL with a one-sentence reason."
+}

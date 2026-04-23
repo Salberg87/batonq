@@ -1,0 +1,7 @@
+{
+  "id": "003-missing-validation-add",
+  "repo_fixture_path": "fixtures/buggy-cli",
+  "prompt": "src/commands/add.js accepts an empty title. Wire in the existing `validateTitle` helper from src/util/validate.js so empty input exits non-zero with a message to stderr. Do not change the happy path.",
+  "verify_cmd": "node -e \"const {spawnSync}=require('node:child_process');const r=spawnSync('node',['src/cli.js','add'],{encoding:'utf8'});process.exit(r.status===0?1:0)\"",
+  "judge_prompt": "Did the agent reuse the validateTitle helper (not reimplement it), surface a clear error on empty input, and leave the happy path working? Answer PASS or FAIL with a one-sentence reason."
+}

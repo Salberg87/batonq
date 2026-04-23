@@ -1,0 +1,7 @@
+{
+  "id": "005-async-race-save",
+  "repo_fixture_path": "fixtures/buggy-cli",
+  "prompt": "`saveAsync` in src/util/validate.js resolves its promise before fs.writeFile finishes — a classic callback-never-awaited race. Fix it so the returned promise only settles once the write completes (resolve on success, reject with the error on failure).",
+  "verify_cmd": "node -e \"import('./src/util/validate.js').then(async({saveAsync})=>{const {mkdtempSync,readFileSync,rmSync}=await import('node:fs');const {tmpdir}=await import('node:os');const {join}=await import('node:path');const d=mkdtempSync(join(tmpdir(),'race-'));const p=join(d,'x');await saveAsync(p,'hello');const got=readFileSync(p,'utf8');rmSync(d,{recursive:true,force:true});process.exit(got==='hello'?0:1)}).catch(()=>process.exit(1))\"",
+  "judge_prompt": "Did the agent make saveAsync await the write (callback or fs/promises), resolving only after completion and rejecting on error? Answer PASS or FAIL with a one-sentence reason."
+}

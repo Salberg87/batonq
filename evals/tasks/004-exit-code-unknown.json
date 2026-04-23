@@ -1,0 +1,7 @@
+{
+  "id": "004-exit-code-unknown",
+  "repo_fixture_path": "fixtures/buggy-cli",
+  "prompt": "src/cli.js exits 0 when an unknown command is given (see the `process.exit(0)` in the `if (!fn)` branch). Fix it so the process exits non-zero on unknown commands while still printing the existing error message.",
+  "verify_cmd": "node -e \"const {spawnSync}=require('node:child_process');const r=spawnSync('node',['src/cli.js','not-a-real-cmd'],{encoding:'utf8'});process.exit(r.status===0?1:0)\"",
+  "judge_prompt": "Did the agent flip the exit code to non-zero for unknown commands without regressing any known command? Answer PASS or FAIL with a one-sentence reason."
+}

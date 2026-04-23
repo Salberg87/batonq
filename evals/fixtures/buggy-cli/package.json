@@ -1,0 +1,12 @@
+{
+  "name": "buggy-cli",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "todo": "./src/cli.js"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  }
+}

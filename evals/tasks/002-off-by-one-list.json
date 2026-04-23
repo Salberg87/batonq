@@ -1,0 +1,7 @@
+{
+  "id": "002-off-by-one-list",
+  "repo_fixture_path": "fixtures/buggy-cli",
+  "prompt": "`todo list` in src/commands/list.js skips the final item because the for-loop uses `i < store.items.length - 1`. Fix the off-by-one so every item is printed.",
+  "verify_cmd": "node -e \"const {spawnSync}=require('node:child_process');spawnSync('node',['src/cli.js','add','alpha']);spawnSync('node',['src/cli.js','add','omega']);const r=spawnSync('node',['src/cli.js','list'],{encoding:'utf8'});process.exit(/omega/.test(r.stdout)?0:1)\"",
+  "judge_prompt": "Did the agent fix the loop bound so both items are listed, without changing output format in ways that break other tasks? Answer PASS or FAIL with a one-sentence reason."
+}

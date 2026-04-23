@@ -21,6 +21,6 @@
     "noEmit": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*", "tests/**/*"],
-  "exclude": ["node_modules", "dist"]
+  "include": ["src/**/*", "tests/**/*", "evals/*.ts"],
+  "exclude": ["node_modules", "dist", "evals/fixtures/**", "evals/results/**"]
 }
