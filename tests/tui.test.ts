@@ -794,6 +794,188 @@ describe("TasksPanel draft display", () => {
   });
 });
 
+// ── §3: Tasks panel — verify/judge badges + priority grouping ─────────────────
+//
+// Spec: docs/tui-ux-v2.md §3. Done rows are decorated with a badge derived
+// from verify_ran_at / judge_ran_at / verify_cmd columns, so the operator can
+// see at a glance whether gates ran. Pending rows are grouped into [H]/[N]/[L]
+// buckets so priority is visible in a dense list. Each badge case below maps
+// back to the `doneBadge` classifier in tui-data.ts.
+
+describe("TasksPanel §3 — done badges + pending priority grouping", () => {
+  const mkDone = (ext: string, overrides: Partial<TaskRow> = {}): TaskRow => ({
+    id: 1,
+    external_id: ext,
+    repo: "any:infra",
+    body: `body ${ext}`,
+    status: "done",
+    claimed_by: null,
+    claimed_at: null,
+    completed_at: iso(-60),
+    created_at: iso(-3600),
+    ...overrides,
+  });
+
+  const mkPending = (
+    ext: string,
+    priority: "high" | "normal" | "low" | null = null,
+  ): TaskRow => ({
+    id: 1,
+    external_id: ext,
+    repo: "any:infra",
+    body: `body ${ext}`,
+    status: "pending",
+    claimed_by: null,
+    claimed_at: null,
+    completed_at: null,
+    created_at: iso(-60),
+    priority,
+  });
+
+  test("done row shows ✓V ✓J when both gates ran", () => {
+    const done = [
+      mkDone("bothgate", {
+        verify_cmd: "bun test",
+        verify_ran_at: iso(-30),
+        judge_cmd: "did it work?",
+        judge_ran_at: iso(-25),
+      }),
+    ];
+    const { lastFrame, unmount } = render(
+      React.createElement(TasksPanel, {
+        latest: [],
+        counts: { drafts: 0, pending: 0, claimed: 0, done: 1 },
+        selected: 0,
+        focused: false,
+        done,
+        now: NOW,
+      }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("Recent done");
+    expect(out).toContain("✓V ✓J");
+    expect(out).toContain("bothgate");
+    // Not a juks and gates were configured — no editorial extras.
+    expect(out).not.toContain("no gates");
+    expect(out).not.toContain("DONE WITHOUT VERIFY");
+    unmount();
+  });
+
+  test("done row shows ✓V — when only verify ran (judge absent)", () => {
+    const done = [
+      mkDone("verifonly", {
+        verify_cmd: "bun test",
+        verify_ran_at: iso(-20),
+      }),
+    ];
+    const { lastFrame, unmount } = render(
+      React.createElement(TasksPanel, {
+        latest: [],
+        counts: { drafts: 0, pending: 0, claimed: 0, done: 1 },
+        selected: 0,
+        focused: false,
+        done,
+        now: NOW,
+      }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("✓V —");
+    expect(out).toContain("verifonly");
+    unmount();
+  });
+
+  test("done row shows ⊘ (no gates) when verify_cmd and both ran_at are null", () => {
+    const done = [mkDone("nogates0")];
+    const { lastFrame, unmount } = render(
+      React.createElement(TasksPanel, {
+        latest: [],
+        counts: { drafts: 0, pending: 0, claimed: 0, done: 1 },
+        selected: 0,
+        focused: false,
+        done,
+        now: NOW,
+      }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("⊘");
+    expect(out).toContain("no gates");
+    expect(out).toContain("nogates0");
+    unmount();
+  });
+
+  test("done row shows ⚠ juks badge when verify_cmd is set but verify_ran_at is null", () => {
+    // verify_cmd present but verify_ran_at NULL = the task was marked done
+    // without the gate ever running. That's the juks signal spec-callout for
+    // §3, and it must render with the DONE WITHOUT VERIFY annotation.
+    const done = [
+      mkDone("juks0001", {
+        verify_cmd: "bun test tests/core.test.ts",
+        verify_ran_at: null,
+        judge_cmd: "did it ship?",
+        judge_ran_at: null,
+      }),
+    ];
+    const { lastFrame, unmount } = render(
+      React.createElement(TasksPanel, {
+        latest: [],
+        counts: { drafts: 0, pending: 0, claimed: 0, done: 1 },
+        selected: 0,
+        focused: false,
+        done,
+        now: NOW,
+      }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("⚠");
+    expect(out).toContain("DONE WITHOUT VERIFY");
+    expect(out).toContain("juks0001");
+    unmount();
+  });
+
+  test("pending section groups by [H] then [N] then [L], preserving input order within each bucket", () => {
+    // Interleaved input: if grouping is unstable or sorts within a bucket,
+    // this ordering check will fail.
+    const pending = [
+      mkPending("lowaaaa1", "low"),
+      mkPending("highaaa1", "high"),
+      mkPending("normaaa1", null), // default → N
+      mkPending("highaaa2", "high"),
+      mkPending("normaaa2", "normal"),
+      mkPending("lowaaaa2", "low"),
+    ];
+    const { lastFrame, unmount } = render(
+      React.createElement(TasksPanel, {
+        latest: [],
+        counts: {
+          drafts: 0,
+          pending: pending.length,
+          claimed: 0,
+          done: 0,
+        },
+        selected: 0,
+        focused: false,
+        pending,
+        now: NOW,
+      }),
+    );
+    const out = lastFrame() ?? "";
+    // All three priority markers rendered.
+    expect(out).toContain("[H]");
+    expect(out).toContain("[N]");
+    expect(out).toContain("[L]");
+    // Order assertions: H rows appear before N rows, N before L,
+    // and within a bucket the original relative order is preserved.
+    const idx = (s: string) => out.indexOf(s);
+    expect(idx("highaaa1")).toBeGreaterThanOrEqual(0);
+    expect(idx("highaaa1")).toBeLessThan(idx("highaaa2"));
+    expect(idx("highaaa2")).toBeLessThan(idx("normaaa1"));
+    expect(idx("normaaa1")).toBeLessThan(idx("normaaa2"));
+    expect(idx("normaaa2")).toBeLessThan(idx("lowaaaa1"));
+    expect(idx("lowaaaa1")).toBeLessThan(idx("lowaaaa2"));
+    unmount();
+  });
+});
+
 // ── test (c): promote flips DB + TASKS.md ─────────────────────────────────────
 //
 // The TUI's `p` keybind shells out to `batonq promote <id>` via runPromote.

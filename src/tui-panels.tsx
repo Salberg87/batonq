@@ -4,13 +4,18 @@
 import React from "react";
 import { Box, Text } from "ink";
 import {
+  doneBadge,
   formatAge,
   formatExpiresIn,
+  groupByPriority,
+  priorityBucket,
   sessionStatus,
   shortId,
   shortPath,
   type ClaimRow,
+  type DoneBadge,
   type EventRow,
+  type PriorityBucket,
   type SessionRow,
   type TaskRow,
 } from "./tui-data";
@@ -103,12 +108,87 @@ export function SessionsPanel({
   );
 }
 
+// Pending rows grouped into [H]/[N]/[L] buckets. Within a bucket the upstream
+// order is preserved (groupByPriority is stable), so whatever sort the caller
+// applied — pick-order, created_at, id — remains visible to the operator.
+// This matches §3 of docs/tui-ux-v2.md.
+function PendingByPriority({ tasks }: { tasks: TaskRow[] }) {
+  if (tasks.length === 0) return null;
+  const grouped = groupByPriority(tasks);
+  const ordered = [...grouped.H, ...grouped.N, ...grouped.L];
+  return (
+    <Box flexDirection="column" marginTop={1}>
+      <Text color={C.dim}>Pending ({tasks.length}) — by priority</Text>
+      {ordered.slice(0, 8).map((t) => {
+        const bucket = priorityBucket(t);
+        const markerColor =
+          bucket === "H" ? C.err : bucket === "L" ? C.dim : C.paper;
+        return (
+          <Box key={t.external_id}>
+            <Text> </Text>
+            <Text color={markerColor} bold={bucket === "H"}>
+              [{bucket}]
+            </Text>
+            <Text color={C.dim}> [{t.external_id.slice(0, 8)}] </Text>
+            <Text color={C.paper}>{truncate(t.body, 60)}</Text>
+          </Box>
+        );
+      })}
+    </Box>
+  );
+}
+
+// Badge colours: ⚠ is red+bold (juks — operator must investigate), ⊘ is dim
+// (no gates configured), everything else is ok-green (gates ran).
+function DoneBadgeCell({ badge }: { badge: DoneBadge }) {
+  const color = badge === "⚠" ? C.err : badge === "⊘" ? C.dim : C.ok;
+  const bold = badge === "⚠";
+  return (
+    <Text color={color} bold={bold}>
+      {badge.padEnd(6)}
+    </Text>
+  );
+}
+
+function RecentDone({ tasks, now }: { tasks: TaskRow[]; now: number }) {
+  if (tasks.length === 0) return null;
+  const shown = tasks.slice(0, 10);
+  return (
+    <Box flexDirection="column" marginTop={1}>
+      <Text color={C.dim}>Recent done (last {shown.length})</Text>
+      {shown.map((t) => {
+        const badge = doneBadge(t);
+        const age = t.completed_at ? formatAge(t.completed_at, now) : "?";
+        const extra =
+          badge === "⚠"
+            ? "  (DONE WITHOUT VERIFY)"
+            : badge === "⊘"
+              ? "  (no gates)"
+              : "";
+        return (
+          <Box key={t.external_id}>
+            <Text> </Text>
+            <DoneBadgeCell badge={badge} />
+            <Text color={C.dim}> [{t.external_id.slice(0, 8)}] </Text>
+            <Text color={C.paper}>{truncate(t.body, 44)}</Text>
+            <Text color={C.dim}> {age.padStart(3)}</Text>
+            {extra ? <Text color={C.dim}>{extra}</Text> : null}
+          </Box>
+        );
+      })}
+    </Box>
+  );
+}
+
 export function TasksPanel({
   latest,
   counts,
   selected,
   focused,
   expandedOriginals,
+  pending,
+  done,
+  now,
 }: {
   latest: TaskRow[];
   counts: {
@@ -120,6 +200,13 @@ export function TasksPanel({
   selected: number;
   focused: boolean;
   expandedOriginals?: Set<string>;
+  // §3: when these are provided, the panel renders dedicated "Pending (by
+  // priority)" and "Recent done (with verify/judge badges)" sub-sections below
+  // the existing `latest` rows. Absent/empty arrays → sections omitted, so the
+  // pre-§3 callers (and their tests) keep rendering the old compact layout.
+  pending?: TaskRow[];
+  done?: TaskRow[];
+  now?: number;
 }) {
   const title =
     `Tasks  drafts ${counts.drafts} · pending ${counts.pending}` +
@@ -179,6 +266,12 @@ export function TasksPanel({
           );
         })
       )}
+      {pending && pending.length > 0 ? (
+        <PendingByPriority tasks={pending} />
+      ) : null}
+      {done && done.length > 0 ? (
+        <RecentDone tasks={done} now={now ?? Date.now()} />
+      ) : null}
     </Panel>
   );
 }

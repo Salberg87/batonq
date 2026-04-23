@@ -2,7 +2,7 @@
 // Kept separate from tui.tsx so it can be unit-tested without rendering ink.
 
 import { Database } from "bun:sqlite";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 
 export type SessionRow = {
   session_id: string;
@@ -33,9 +33,14 @@ export type TaskRow = {
   completed_at: string | null;
   created_at: string;
   verify_cmd?: string | null;
+  verify_output?: string | null;
+  verify_ran_at?: string | null;
   judge_cmd?: string | null;
+  judge_output?: string | null;
+  judge_ran_at?: string | null;
   enrich_questions?: string | null;
   original_body?: string | null;
+  priority?: "high" | "normal" | "low" | null;
 };
 
 export type EventRow = {
@@ -118,6 +123,113 @@ export function shortPath(p: string, max: number = 40): string {
 
 export function shortId(id: string, n: number = 8): string {
   return id.length <= n ? id : id.slice(0, n);
+}
+
+// ── done badges / priority grouping ───────────────────────────────────────────
+
+// Badge for a done task. Branches, in order:
+//   ⚠     — verify_cmd set but never ran (juks — task self-closed without gate)
+//   ✓V ✓J — both gates ran
+//   ✓V —  — verify ran, judge absent
+//   — ✓J  — judge ran, verify absent
+//   ⊘     — no gates at all
+export type DoneBadge = "⚠" | "✓V ✓J" | "✓V —" | "— ✓J" | "⊘";
+
+export function doneBadge(t: TaskRow): DoneBadge {
+  const vRan = !!t.verify_ran_at;
+  const jRan = !!t.judge_ran_at;
+  const vCmd = !!t.verify_cmd;
+  if (vCmd && !vRan) return "⚠";
+  if (vRan && jRan) return "✓V ✓J";
+  if (vRan && !jRan) return "✓V —";
+  if (!vRan && jRan) return "— ✓J";
+  return "⊘";
+}
+
+export type PriorityBucket = "H" | "N" | "L";
+
+export function priorityBucket(t: TaskRow): PriorityBucket {
+  if (t.priority === "high") return "H";
+  if (t.priority === "low") return "L";
+  return "N";
+}
+
+// Group tasks by priority bucket. Within each bucket, original relative order
+// is preserved so upstream sort (e.g. pick-order) stays visible to the user.
+export function groupByPriority(tasks: TaskRow[]): {
+  H: TaskRow[];
+  N: TaskRow[];
+  L: TaskRow[];
+} {
+  const out = { H: [] as TaskRow[], N: [] as TaskRow[], L: [] as TaskRow[] };
+  for (const t of tasks) out[priorityBucket(t)].push(t);
+  return out;
+}
+
+// ── git helpers for drill-down ────────────────────────────────────────────────
+
+// Commits reachable from HEAD whose author-date is at/after `sinceIso`, in
+// the repo rooted at `cwd`. Used by the drill-down overlay's "Commits since
+// claim" section. Failures (not a repo, bad date, git absent) collapse to an
+// empty list — the overlay just shows "(none)" in that case.
+export function commitsSince(
+  sinceIso: string | null | undefined,
+  cwd: string,
+): { sha: string; subject: string }[] {
+  if (!sinceIso) return [];
+  const r = require("node:child_process").spawnSync(
+    "git",
+    [
+      "-C",
+      cwd,
+      "log",
+      `--since=${sinceIso}`,
+      "--pretty=format:%h %s",
+      "-n",
+      "20",
+    ],
+    { encoding: "utf8" },
+  );
+  if (r.status !== 0) return [];
+  const out = (r.stdout ?? "").trim();
+  if (!out) return [];
+  return out
+    .split("\n")
+    .map((line: string) => {
+      const m = line.match(/^(\S+)\s+(.*)$/);
+      return m ? { sha: m[1]!, subject: m[2]! } : null;
+    })
+    .filter((x): x is { sha: string; subject: string } => x !== null);
+}
+
+// ── drill-down helpers ────────────────────────────────────────────────────────
+
+// Return the last N non-empty lines of a captured output blob. Used by the
+// drill-down overlay to show the tail of verify_output (noise at the start of
+// a long log is unhelpful; the failing assertion is almost always near the
+// end). Null/empty input returns empty array.
+export function tailLines(
+  text: string | null | undefined,
+  n: number,
+): string[] {
+  if (!text) return [];
+  const all = text.replace(/\r\n?/g, "\n").split("\n");
+  // Drop trailing blank (common when the captured output ends with "\n").
+  while (all.length && all[all.length - 1] === "") all.pop();
+  return all.slice(Math.max(0, all.length - n));
+}
+
+// First N lines, trimmed of trailing blanks. Used for judge verdict — the
+// verdict string starts with PASS/FAIL on line 1 and reason follows, so the
+// head is what matters.
+export function headLines(
+  text: string | null | undefined,
+  n: number,
+): string[] {
+  if (!text) return [];
+  const all = text.replace(/\r\n?/g, "\n").split("\n");
+  while (all.length && all[all.length - 1] === "") all.pop();
+  return all.slice(0, n);
 }
 
 // ── filters ───────────────────────────────────────────────────────────────────
