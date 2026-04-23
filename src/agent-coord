@@ -15,8 +15,8 @@ import {
   selectCandidate,
   claimCandidate,
   runVerify,
-  runJudge,
-  getGitDiffSinceClaim,
+  runJudge as runJudgeCore,
+  getGitDiffSinceClaim as getGitDiffSinceClaimCore,
   rewriteMdTaskStatus as rewriteMdTaskStatusCore,
   type ParsedTask,
 } from "./tasks-core";
@@ -417,6 +417,22 @@ function resolveRepoPath(repoName: string): string {
     }
   }
   return process.cwd();
+}
+
+// Thin wrappers so the hardening invariant stays discoverable at the call-site
+// in this file. Both delegate to tasks-core where the logic is unit-tested
+// (see tests/core.test.ts → "runJudge fail-modes", "getGitDiffSinceClaim fail-modes").
+function runJudge(judgePrompt: string, gitDiff: string, cwd: string): { passed: boolean; output: string } {
+  // Invariant: PASS requires result.status === 0 && !result.error FIRST —
+  // never trust stdout alone. ETIMEDOUT and other spawn errors → infra FAIL.
+  return runJudgeCore(judgePrompt, gitDiff, cwd);
+}
+
+function getGitDiffSinceClaim(cwd: string, claimedAt: string): string {
+  // Throws on any failure (git error, empty diff). doneTask catches the
+  // throw and surfaces a judge FAIL — we must NEVER feed an empty diff
+  // to the LLM (it typically answers PASS and the gate fail-opens).
+  return getGitDiffSinceClaimCore(cwd, claimedAt);
 }
 
 function doneTask(id?: string): void {
