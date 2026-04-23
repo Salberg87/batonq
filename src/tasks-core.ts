@@ -459,3 +459,69 @@ export function rewriteMdTaskStatus(
   writeFileSync(tasksPath, lines.join("\n"));
   return true;
 }
+
+export interface NewTask {
+  repo: string;
+  body: string;
+  verify?: string;
+  judge?: string;
+}
+
+export function buildTaskLines(t: NewTask): string[] {
+  const body = t.body.replace(/\s+/g, " ").trim();
+  const out = [`- [ ] **${t.repo.trim()}** — ${body}`];
+  const verify = t.verify?.trim();
+  const judge = t.judge?.trim();
+  if (verify) out.push(`  verify: ${verify}`);
+  if (judge) out.push(`  judge: ${judge}`);
+  return out;
+}
+
+export function validateNewTask(t: NewTask): {
+  ok: boolean;
+  reason?: "body-required" | "repo-required";
+} {
+  if (!t.repo.trim()) return { ok: false, reason: "repo-required" };
+  if (!t.body.trim()) return { ok: false, reason: "body-required" };
+  return { ok: true };
+}
+
+// Append a new task to the `## Pending` section of TASKS.md.
+// Returns the external_id of the new task, or throws if the file has no
+// `## Pending` section or validation fails.
+export function appendTaskToPending(tasksPath: string, t: NewTask): string {
+  const v = validateNewTask(t);
+  if (!v.ok) throw new Error(`invalid task: ${v.reason}`);
+
+  const text = existsSync(tasksPath) ? readFileSync(tasksPath, "utf8") : "";
+  const lines = text.split("\n");
+
+  // Locate "## Pending" header.
+  const pendingIdx = lines.findIndex((l) => /^##\s+Pending\s*$/.test(l));
+  if (pendingIdx < 0) {
+    throw new Error(`could not find "## Pending" section in ${tasksPath}`);
+  }
+
+  // Insert point: end of the Pending section (right before the next `## `
+  // heading, or end of file). Walk forward from pendingIdx+1.
+  let insertAt = lines.length;
+  for (let i = pendingIdx + 1; i < lines.length; i++) {
+    if (/^##\s+/.test(lines[i]!)) {
+      insertAt = i;
+      break;
+    }
+  }
+
+  // Trim trailing empty lines inside the section, then ensure exactly one
+  // blank line separates existing content from the new entry.
+  let tail = insertAt;
+  while (tail > pendingIdx + 1 && lines[tail - 1]!.trim() === "") tail--;
+
+  const newLines = buildTaskLines(t);
+  const block = ["", ...newLines, ""];
+  const before = lines.slice(0, tail);
+  const after = lines.slice(insertAt);
+  writeFileSync(tasksPath, [...before, ...block, ...after].join("\n"));
+
+  return externalId(t.repo.trim(), t.body.replace(/\s+/g, " ").trim());
+}

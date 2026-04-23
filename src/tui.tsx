@@ -1,10 +1,27 @@
 // tui — ink-based dashboard for batonq.
 // 4 panels: Sessions, Tasks, Active claims, Event stream. Auto-refresh every 2s.
-// Keybinds: q quit · Tab cycle · j/k nav · / filter · a abandon · r release · ? help
+// Keybinds: q quit · Tab cycle · j/k nav · / filter · n new · a abandon · r release · ? help
+//
+// ink-text-input vs @inkjs/ui: we use `ink-text-input` for the add-task form.
+// Both list `ink >= 5` as peer (we're on ink 7), so either works. ink-text-input
+// is single-purpose with only two transitive deps (chalk, type-fest); @inkjs/ui
+// bundles a full component library plus cli-spinners/figures/deepmerge that we
+// would not otherwise pull in. We only need a single-line input, so the smaller
+// surface wins. Body is rendered with visual wrap but stored as one line — the
+// TASKS.md format is line-oriented anyway.
 
 import React, { useEffect, useMemo, useState } from "react";
 import { Box, Text, render, useApp, useInput } from "ink";
+import TextInput from "ink-text-input";
 import { spawnSync } from "node:child_process";
+import { basename } from "node:path";
+import { homedir } from "node:os";
+import {
+  appendTaskToPending,
+  externalId,
+  validateNewTask,
+  type NewTask,
+} from "./tasks-core";
 import {
   DEFAULT_DB_PATH,
   DEFAULT_EVENTS_PATH,
@@ -33,12 +50,17 @@ import {
 type PanelKey = "sessions" | "tasks" | "claims" | "events";
 const PANELS: PanelKey[] = ["sessions", "tasks", "claims", "events"];
 
-type Mode = "normal" | "filter" | "help" | "confirm";
+type Mode = "normal" | "filter" | "help" | "confirm" | "add-task";
 type ConfirmAction =
   | { kind: "abandon"; task: TaskRow }
   | { kind: "release"; claim: ClaimRow };
 
+type FormField = "repo" | "body" | "verify" | "judge";
+const FORM_FIELDS: FormField[] = ["repo", "body", "verify", "judge"];
+
 const REFRESH_MS = 2000;
+const FLASH_MS = 3000;
+const DEFAULT_TASKS_PATH = `${homedir()}/DEV/TASKS.md`;
 
 function useTick(ms: number): number {
   const [t, setT] = useState(() => Date.now());
@@ -92,6 +114,7 @@ export function App() {
     null,
   );
   const [confirm, setConfirm] = useState<ConfirmAction | null>(null);
+  const [addTaskRepo, setAddTaskRepo] = useState<string>("");
 
   const filtered = useMemo(() => {
     if (!snap) return null;
@@ -105,13 +128,17 @@ export function App() {
 
   useEffect(() => {
     if (!flash) return;
-    const id = setTimeout(() => setFlash(null), 2500);
+    const id = setTimeout(() => setFlash(null), FLASH_MS);
     return () => clearTimeout(id);
   }, [flash]);
 
   useInput((input, key) => {
     if (mode === "help") {
       setMode("normal");
+      return;
+    }
+    if (mode === "add-task") {
+      // Keys in add-task mode are handled by <AddTaskForm/> itself.
       return;
     }
     if (mode === "filter") {
@@ -180,6 +207,11 @@ export function App() {
     if (input === "/") {
       setFilterInput(filters[focus]);
       setMode("filter");
+      return;
+    }
+    if (input === "n") {
+      setAddTaskRepo(defaultRepoForCwd());
+      setMode("add-task");
       return;
     }
     if (input === "a") {
@@ -293,17 +325,123 @@ export function App() {
         {flash && <Text color={flash.color}>{flash.msg}</Text>}
         {mode === "normal" && !flash && (
           <Text color={C.dim}>
-            q quit · Tab focus · j/k nav · / filter · a abandon · r release · ?
-            help
+            q quit · Tab focus · j/k nav · / filter · n new · a abandon · r
+            release · ? help
           </Text>
         )}
       </Box>
+
+      {mode === "add-task" && (
+        <Box marginTop={1}>
+          <AddTaskForm
+            initialRepo={addTaskRepo}
+            onSubmit={(t) => {
+              submitAddTask(t, setFlash);
+              setMode("normal");
+            }}
+            onCancel={() => setMode("normal")}
+            onInvalidSubmit={(reason) =>
+              setFlash({
+                msg:
+                  reason === "body-required"
+                    ? "body is required"
+                    : `invalid: ${reason}`,
+                color: C.warn,
+              })
+            }
+          />
+        </Box>
+      )}
 
       {mode === "help" && (
         <Box marginTop={1}>
           <HelpOverlay />
         </Box>
       )}
+    </Box>
+  );
+}
+
+export function AddTaskForm({
+  initialRepo = "",
+  onSubmit,
+  onCancel,
+  onInvalidSubmit,
+}: {
+  initialRepo?: string;
+  onSubmit: (t: NewTask) => void;
+  onCancel: () => void;
+  onInvalidSubmit?: (reason: string) => void;
+}): React.ReactElement {
+  const [form, setForm] = useState<NewTask>({
+    repo: initialRepo,
+    body: "",
+    verify: "",
+    judge: "",
+  });
+  const [focus, setFocus] = useState<FormField>("body");
+
+  useInput((_input, key) => {
+    if (key.escape) {
+      onCancel();
+      return;
+    }
+    if (key.tab) {
+      const idx = FORM_FIELDS.indexOf(focus);
+      const next = key.shift
+        ? (idx - 1 + FORM_FIELDS.length) % FORM_FIELDS.length
+        : (idx + 1) % FORM_FIELDS.length;
+      setFocus(FORM_FIELDS[next]!);
+      return;
+    }
+    if (key.return) {
+      const v = validateNewTask(form);
+      if (!v.ok) {
+        onInvalidSubmit?.(v.reason ?? "invalid");
+        return;
+      }
+      onSubmit(form);
+    }
+  });
+
+  const rows: { key: FormField; label: string; hint?: string }[] = [
+    { key: "repo", label: "Repo   " },
+    { key: "body", label: "Body   ", hint: "(required)" },
+    { key: "verify", label: "Verify ", hint: "(optional)" },
+    { key: "judge", label: "Judge  ", hint: "(optional)" },
+  ];
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor={C.brand}
+      paddingX={1}
+    >
+      <Text color={C.brand} bold>
+        new task
+      </Text>
+      {rows.map((r) => {
+        const active = focus === r.key;
+        return (
+          <Box key={r.key} flexDirection="row">
+            <Text color={active ? C.brand : C.dim}>
+              {active ? "› " : "  "}
+              {r.label}
+            </Text>
+            <Box flexGrow={1}>
+              <TextInput
+                value={form[r.key] ?? ""}
+                onChange={(v) => setForm((f) => ({ ...f, [r.key]: v }))}
+                focus={active}
+                placeholder={active ? "" : (r.hint ?? "")}
+              />
+            </Box>
+          </Box>
+        );
+      })}
+      <Text color={C.dim}>
+        Tab/Shift-Tab: field · Enter: submit · Esc: cancel
+      </Text>
     </Box>
   );
 }
@@ -366,6 +504,51 @@ export function runRelease(
 
 export function findBatonqBin(): string {
   return new URL("../bin/batonq", import.meta.url).pathname;
+}
+
+export function defaultRepoForCwd(cwd: string = process.cwd()): string {
+  const r = spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
+    encoding: "utf8",
+  });
+  if (r.status === 0) {
+    const root = (r.stdout ?? "").trim();
+    if (root) return basename(root);
+  }
+  return "any:infra";
+}
+
+export function submitAddTask(
+  form: NewTask,
+  setFlash: (f: { msg: string; color: string }) => void,
+  tasksPath: string = DEFAULT_TASKS_PATH,
+): void {
+  const repo = form.repo.trim() || defaultRepoForCwd();
+  const task: NewTask = {
+    repo,
+    body: form.body,
+    verify: form.verify,
+    judge: form.judge,
+  };
+  try {
+    appendTaskToPending(tasksPath, task);
+    const eid = externalId(
+      task.repo.trim(),
+      task.body.replace(/\s+/g, " ").trim(),
+    );
+    const sync = spawnSync(findBatonqBin(), ["sync-tasks"], {
+      encoding: "utf8",
+    });
+    if (sync.status !== 0) {
+      setFlash({
+        msg: `added, but sync-tasks failed: ${(sync.stderr ?? "").trim() || `exit ${sync.status}`}`,
+        color: C.warn,
+      });
+      return;
+    }
+    setFlash({ msg: `✓ Task added (id ${eid.slice(0, 8)})`, color: C.ok });
+  } catch (e: any) {
+    setFlash({ msg: `add failed: ${e.message ?? String(e)}`, color: C.err });
+  }
 }
 
 if (import.meta.main) {

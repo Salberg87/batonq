@@ -131,23 +131,23 @@ already claimed.
 
 ## Commands
 
-| Command                 | Description                                                                      | Example                            |
-| ----------------------- | -------------------------------------------------------------------------------- | ---------------------------------- |
-| `batonq pick`           | Claim the next task matching the current cwd's repo (or an `any:*` task).        | `batonq pick`                      |
-| `batonq mine`           | Show tasks claimed by the current session (pid).                                 | `batonq mine`                      |
-| `batonq done <id>`      | Mark a claimed task done. Runs the `verify:` gate if the task has one.           | `batonq done 51592069b22d`         |
-| `batonq abandon <id>`   | Release a claim so another agent can pick the task.                              | `batonq abandon 51592069b22d`      |
-| `batonq tasks`          | List every task in `~/DEV/TASKS.md` with status.                                 | `batonq tasks`                     |
-| `batonq sync-tasks`     | Re-parse `TASKS.md` into the SQLite state immediately (usually automatic).       | `batonq sync-tasks`                |
-| `batonq release <path>` | Release a file lock held by the current session.                                 | `batonq release src/app.ts`        |
-| `batonq sweep`          | Purge expired claims and file locks whose owning session is gone.                | `batonq sweep`                     |
-| `batonq status`         | Print overall queue + lock state as a compact summary.                           | `batonq status`                    |
-| `batonq check`          | Health check: schema version, state-db permissions, hook wiring.                 | `batonq check`                     |
-| `batonq tail [-n N]`    | Tail the event log (JSONL).                                                      | `batonq tail -n 50`                |
-| `batonq report`         | Aggregate measurement events over a time range (`--since`, `--until`, `--json`). | `batonq report --since 2026-04-01` |
-| `batonq tui`            | Live ink-based TUI dashboard with sessions, tasks, claims, locks, events.        | `batonq tui`                       |
-| `batonq-hook`           | Claude Code PreToolUse / PostToolUse hook. Not invoked manually.                 | (wired by `install.sh`)            |
-| `batonq-loop`           | Fresh-Claude-per-task runner. `cd` into a repo, run, and the loop does the rest. | `cd ~/DEV/MyRepo && batonq-loop`   |
+| Command                 | Description                                                                                               | Example                            |
+| ----------------------- | --------------------------------------------------------------------------------------------------------- | ---------------------------------- |
+| `batonq pick`           | Claim the next task matching the current cwd's repo (or an `any:*` task).                                 | `batonq pick`                      |
+| `batonq mine`           | Show tasks claimed by the current session (pid).                                                          | `batonq mine`                      |
+| `batonq done <id>`      | Mark a claimed task done. Runs the `verify:` gate if the task has one.                                    | `batonq done 51592069b22d`         |
+| `batonq abandon <id>`   | Release a claim so another agent can pick the task.                                                       | `batonq abandon 51592069b22d`      |
+| `batonq tasks`          | List every task in `~/DEV/TASKS.md` with status.                                                          | `batonq tasks`                     |
+| `batonq sync-tasks`     | Re-parse `TASKS.md` into the SQLite state immediately (usually automatic).                                | `batonq sync-tasks`                |
+| `batonq release <path>` | Release a file lock held by the current session.                                                          | `batonq release src/app.ts`        |
+| `batonq sweep`          | Purge expired claims and file locks whose owning session is gone.                                         | `batonq sweep`                     |
+| `batonq status`         | Print overall queue + lock state as a compact summary.                                                    | `batonq status`                    |
+| `batonq check`          | Health check: schema version, state-db permissions, hook wiring.                                          | `batonq check`                     |
+| `batonq tail [-n N]`    | Tail the event log (JSONL).                                                                               | `batonq tail -n 50`                |
+| `batonq report`         | Aggregate measurement events over a time range (`--since`, `--until`, `--json`).                          | `batonq report --since 2026-04-01` |
+| `batonq tui`            | Live ink-based TUI dashboard with sessions, tasks, claims, locks, events. Press `n` to add a task inline. | `batonq tui`                       |
+| `batonq-hook`           | Claude Code PreToolUse / PostToolUse hook. Not invoked manually.                                          | (wired by `install.sh`)            |
+| `batonq-loop`           | Fresh-Claude-per-task runner. `cd` into a repo, run, and the loop does the rest.                          | `cd ~/DEV/MyRepo && batonq-loop`   |
 
 ## TUI
 
@@ -157,16 +157,26 @@ locks, Recent events.
 
 **Keybinds:**
 
-| Key            | Action                                       |
-| -------------- | -------------------------------------------- |
-| `q` / `Ctrl-C` | Quit.                                        |
-| `Tab`          | Cycle panel focus.                           |
-| `j` / `↓`      | Move selection down in focused panel.        |
-| `k` / `↑`      | Move selection up in focused panel.          |
-| `/`            | Filter rows in focused panel. `Esc` cancels. |
-| `a`            | Abandon selected task (Tasks panel only).    |
-| `r`            | Release selected lock (Claims panel only).   |
-| `?`            | Show full help overlay.                      |
+| Key            | Action                                                      |
+| -------------- | ----------------------------------------------------------- |
+| `q` / `Ctrl-C` | Quit.                                                       |
+| `Tab`          | Cycle panel focus.                                          |
+| `j` / `↓`      | Move selection down in focused panel.                       |
+| `k` / `↑`      | Move selection up in focused panel.                         |
+| `/`            | Filter rows in focused panel. `Esc` cancels.                |
+| `n`            | New task — open an inline form to append one to `TASKS.md`. |
+| `a`            | Abandon selected task (Tasks panel only).                   |
+| `r`            | Release selected lock (Claims panel only).                  |
+| `?`            | Show full help overlay.                                     |
+
+**Add-task form (`n`):**
+
+Opens an overlay with four fields — **Repo** (prefilled from the current cwd's
+git-root basename, or `any:infra` when outside a git repo), **Body** (required),
+**Verify** (optional shell gate), **Judge** (optional LLM prompt). `Tab` /
+`Shift-Tab` moves between fields, `Enter` submits (only when Body is non-empty),
+`Esc` cancels without writing. On submit, the new task is appended under
+`## Pending` in `~/DEV/TASKS.md` and `sync-tasks` re-parses the file.
 
 > **TODO:** add `docs/tui.png` once v0.2 ships.
 

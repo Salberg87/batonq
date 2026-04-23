@@ -3,10 +3,12 @@
 // and synthetic events, so no touching of ~/.claude state.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import React from "react";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { render } from "ink-testing-library";
 import {
   filterClaims,
   filterEvents,
@@ -23,6 +25,12 @@ import {
   shortPath,
   type TaskRow,
 } from "../src/tui-data";
+import {
+  appendTaskToPending,
+  validateNewTask,
+  type NewTask,
+} from "../src/tasks-core";
+import { AddTaskForm } from "../src/tui";
 
 // ── schema helpers ────────────────────────────────────────────────────────────
 
@@ -399,5 +407,101 @@ describe("loadSnapshot", () => {
     expect(snap.tasks.counts).toEqual({ pending: 0, claimed: 0, done: 0 });
     expect(snap.tasks.latest).toEqual([]);
     db.close();
+  });
+});
+
+// ── add-task form ─────────────────────────────────────────────────────────────
+
+describe("AddTaskForm", () => {
+  let dir: string;
+  let tasksPath: string;
+  const SEED_PENDING =
+    "# Tasks\n\n## Pending\n\n- [ ] **repo-a** — existing task\n\n## Done\n\n- [x] old task\n";
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "batonq-form-"));
+    tasksPath = join(dir, "TASKS.md");
+    writeFileSync(tasksPath, SEED_PENDING);
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("validates required Body — pressing Enter with empty body does not call onSubmit", async () => {
+    let submitted: NewTask | null = null;
+    let invalidReason: string | null = null as string | null;
+    const { stdin, unmount } = render(
+      React.createElement(AddTaskForm, {
+        initialRepo: "any:infra",
+        onSubmit: (t: NewTask) => {
+          submitted = t;
+        },
+        onCancel: () => {},
+        onInvalidSubmit: (r: string) => {
+          invalidReason = r;
+        },
+      }),
+    );
+    // Press Enter on a fresh form (body is empty).
+    stdin.write("\r");
+    await new Promise((r) => setTimeout(r, 20));
+    unmount();
+
+    expect(submitted).toBeNull();
+    expect(invalidReason).toBe("body-required");
+    // And validator itself agrees:
+    expect(validateNewTask({ repo: "any:infra", body: "" }).ok).toBe(false);
+    // File on disk is untouched:
+    expect(readFileSync(tasksPath, "utf8")).toBe(SEED_PENDING);
+  });
+
+  test("submit appends a task line to TASKS.md", () => {
+    const before = readFileSync(tasksPath, "utf8");
+    expect(before).toBe(SEED_PENDING);
+
+    appendTaskToPending(tasksPath, {
+      repo: "any:infra",
+      body: "add TUI form",
+      verify: "echo ok",
+      judge: "did it work?",
+    });
+
+    const after = readFileSync(tasksPath, "utf8");
+    // New task line is present
+    expect(after).toContain("- [ ] **any:infra** — add TUI form");
+    // verify and judge are indented and attached
+    expect(after).toContain("  verify: echo ok");
+    expect(after).toContain("  judge: did it work?");
+    // Existing pending task is preserved
+    expect(after).toContain("- [ ] **repo-a** — existing task");
+    // Inserted above the ## Done heading
+    const pendingIdx = after.indexOf("## Pending");
+    const doneIdx = after.indexOf("## Done");
+    const newTaskIdx = after.indexOf("add TUI form");
+    expect(pendingIdx).toBeLessThan(newTaskIdx);
+    expect(newTaskIdx).toBeLessThan(doneIdx);
+  });
+
+  test("Esc cancels without writing — onCancel fires, onSubmit does not, file untouched", async () => {
+    const before = readFileSync(tasksPath, "utf8");
+    let submitted: NewTask | null = null;
+    let cancelled = false as boolean;
+    const { stdin, unmount } = render(
+      React.createElement(AddTaskForm, {
+        initialRepo: "any:infra",
+        onSubmit: (t: NewTask) => {
+          submitted = t;
+        },
+        onCancel: () => {
+          cancelled = true;
+        },
+      }),
+    );
+    // ESC = \x1B
+    stdin.write("\x1B");
+    await new Promise((r) => setTimeout(r, 20));
+    unmount();
+
+    expect(cancelled).toBe(true);
+    expect(submitted).toBeNull();
+    expect(readFileSync(tasksPath, "utf8")).toBe(before);
   });
 });
