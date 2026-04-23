@@ -105,7 +105,9 @@ function useSnapshot(now: number): Snapshot | null {
 }
 
 // Build a LoopStatus snapshot — three shell probes + one DB lookup, so it's
-// tied to the main refresh tick and not a separate interval.
+// tied to the main refresh tick and not a separate interval. The events-age
+// cell compares `now` against the events.jsonl mtime; keybind 'L' opens the
+// restart-loop confirm (see useInput below).
 function useLoopStatus(now: number): LoopStatus {
   return useMemo(() => {
     const loopPid = probeLoopPid();
