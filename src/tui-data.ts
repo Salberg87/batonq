@@ -273,6 +273,7 @@ export function openStateDb(path: string = DEFAULT_DB_PATH): Database {
   if (!existsSync(path)) {
     // Create with minimal schema so TUI doesn't crash on fresh install.
     const db = new Database(path, { create: true });
+    db.exec("PRAGMA busy_timeout=3000;");
     db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT PRIMARY KEY,

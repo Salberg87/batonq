@@ -199,6 +199,7 @@ function status() {
     return;
   }
   const db = new Database(DB_PATH, { readonly: true });
+  db.exec("PRAGMA busy_timeout=3000;");
   const sessions = db
     .query("SELECT * FROM sessions ORDER BY last_seen DESC")
     .all() as any[];
@@ -241,6 +242,7 @@ function release(path: string | undefined) {
   }
   const abs = isAbsolute(path) ? path : resolve(process.cwd(), path);
   const db = new Database(DB_PATH);
+  db.exec("PRAGMA busy_timeout=3000;");
   const r = db.run(
     `UPDATE claims SET released_at = ? WHERE file_path = ? AND released_at IS NULL`,
     [new Date().toISOString(), abs]
@@ -257,6 +259,7 @@ function sweepCmd() {
     return;
   }
   const db = new Database(DB_PATH);
+  db.exec("PRAGMA busy_timeout=3000;");
   const now = new Date().toISOString();
   const expired = db.run(
     `UPDATE claims SET released_at = ? WHERE released_at IS NULL AND expires_at < ?`,
@@ -428,46 +431,78 @@ function runJudge(judgePrompt: string, gitDiff: string, cwd: string): { passed: 
 
   const stdout = result.stdout ?? "";
   const stderr = result.stderr ?? "";
-  const output = stdout + (stderr ? `\n[stderr]\n${stderr}` : "");
+  const errCode = (result.error as NodeJS.ErrnoException | undefined)?.code;
 
-  const firstLine = (stdout ?? "").trim().split("\n")[0]?.toUpperCase() ?? "";
-  const passed = firstLine.startsWith("PASS");
+  // Timeout or SIGTERM-by-timeout → infra FAIL with clear message,
+  // never a silent PASS from partial stdout.
+  if (errCode === "ETIMEDOUT" || (result.error && result.signal === "SIGTERM")) {
+    return {
+      passed: false,
+      output: `[judge infra FAIL] claude timed out after 120s (ETIMEDOUT). ` +
+        `stdout=${stdout.length}b stderr=${stderr.length}b\n${stderr}`,
+    };
+  }
+
+  // Any other spawn error (ENOENT, EACCES, …) → FAIL. Don't trust stdout.
+  if (result.error) {
+    return {
+      passed: false,
+      output: `[judge infra FAIL] claude spawn error: ${result.error.message}\n${stderr}`,
+    };
+  }
+
+  const output = stdout + (stderr ? `\n[stderr]\n${stderr}` : "");
+  const firstLine = stdout.trim().split("\n")[0]?.toUpperCase() ?? "";
+
+  // Gate on subprocess success BEFORE inspecting the "PASS" text, so a
+  // non-zero exit whose stdout happens to contain "PASS" cannot open the gate.
+  const passed = result.status === 0 && !result.error && firstLine.startsWith("PASS");
 
   return { passed, output };
 }
 
 function getGitDiffSinceClaim(cwd: string, claimedAt: string): string {
-  try {
-    // Get the commit hash that was at the claimed_at timestamp
-    const { stdout: commitHash } = spawnSync("git", ["rev-list", "-n", "1", `--before=${claimedAt}`, "HEAD"], {
+  // Throws on any failure. doneTask catches and surfaces a judge FAIL with
+  // a clear message — we must NEVER feed an empty diff to the LLM (it will
+  // typically answer PASS on empty input, silently opening the gate).
+  const revListRes = spawnSync(
+    "git",
+    ["rev-list", "-n", "1", `--before=${claimedAt}`, "HEAD"],
+    { cwd, encoding: "utf8", timeout: 10_000 }
+  );
+  if (revListRes.error) throw new Error(`git rev-list failed: ${revListRes.error.message}`);
+
+  let baseCommit = revListRes.stdout?.trim() ?? "";
+  if (!baseCommit) {
+    // Fallback: no commit existed at claim time — diff from repo root.
+    const rootRes = spawnSync("git", ["rev-list", "--max-parents=0", "HEAD"], {
       cwd,
       encoding: "utf8",
+      timeout: 10_000,
     });
-    if (!commitHash?.trim()) {
-      // Fallback: if no commit before claimed_at, use the first commit in repo
-      const { stdout: firstCommit } = spawnSync("git", ["rev-list", "--max-parents=0", "HEAD"], {
-        cwd,
-        encoding: "utf8",
-      });
-      const baseCommit = firstCommit?.trim() || "";
-      if (!baseCommit) return "";
-      const { stdout: diff } = spawnSync("git", ["diff", baseCommit, "HEAD"], {
-        cwd,
-        encoding: "utf8",
-        maxBuffer: 1024 * 1024 * 2,
-      });
-      return diff ?? "";
+    if (rootRes.error) throw new Error(`git rev-list --max-parents=0 failed: ${rootRes.error.message}`);
+    baseCommit = rootRes.stdout?.trim() ?? "";
+    if (!baseCommit) {
+      throw new Error("no diff: could not resolve a base commit (empty repo?)");
     }
-    const baseCommit = commitHash.trim();
-    const { stdout: diff } = spawnSync("git", ["diff", baseCommit, "HEAD"], {
-      cwd,
-      encoding: "utf8",
-      maxBuffer: 1024 * 1024 * 2,
-    });
-    return diff ?? "";
-  } catch (e) {
-    return "";
   }
+
+  const diffRes = spawnSync("git", ["diff", baseCommit, "HEAD"], {
+    cwd,
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024 * 2,
+    timeout: 30_000,
+  });
+  if (diffRes.error) throw new Error(`git diff failed: ${diffRes.error.message}`);
+  if (typeof diffRes.status === "number" && diffRes.status !== 0) {
+    throw new Error(`git diff exited ${diffRes.status}: ${(diffRes.stderr ?? "").trim()}`);
+  }
+
+  const diff = diffRes.stdout ?? "";
+  if (!diff.trim()) {
+    throw new Error("no diff: no committed changes since claim (did you forget to commit?)");
+  }
+  return diff;
 }
 
 function doneTask(id?: string): void {
@@ -541,7 +576,22 @@ function doneTask(id?: string): void {
       console.log(`  (cwd: ${repoPath})`);
       console.log();
 
-      const gitDiff = getGitDiffSinceClaim(repoPath, target.claimed_at);
+      let gitDiff: string;
+      try {
+        gitDiff = getGitDiffSinceClaim(repoPath, target.claimed_at);
+      } catch (e: any) {
+        const msg = `[judge FAIL] ${e?.message ?? String(e)}`;
+        console.error(msg);
+        db.run(
+          `UPDATE tasks SET judge_output = ?, judge_ran_at = ? WHERE id = ?`,
+          [msg, new Date().toISOString(), target.id]
+        );
+        console.error(`✗ judge FAILED. Task stays claimed.`);
+        console.error(`  Fix issues and retry: batonq done ${target.external_id}`);
+        console.error(`  Or release and re-queue: batonq abandon ${target.external_id}`);
+        process.exit(1);
+      }
+
       const { passed, output } = runJudge(target.judge_cmd, gitDiff, repoPath);
 
       const truncated = output.length > 80_000 ? output.slice(0, 80_000) + "\n[truncated]" : output;
@@ -775,6 +825,7 @@ function report() {
   let dbStats: any = null;
   if (existsSync(DB_PATH)) {
     const db = new Database(DB_PATH, { readonly: true });
+    db.exec("PRAGMA busy_timeout=3000;");
     const activeClaims = (db.query("SELECT COUNT(*) AS n FROM claims WHERE released_at IS NULL").get() as any).n;
     const totalClaims = (db.query("SELECT COUNT(*) AS n FROM claims").get() as any).n;
     const totalSessions = (db.query("SELECT COUNT(*) AS n FROM sessions").get() as any).n;
