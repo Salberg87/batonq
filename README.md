@@ -38,35 +38,14 @@ boring on purpose.
 
 ## Demo
 
-```
-┌─ batonq ──────────────────────────── tui · refresh 2s · q quit · ? help ─┐
-│                                                                          │
-│  ┌─ Sessions ──────────────┐  ┌─ Claims ────────────────────────────┐    │
-│  │ ● pid 2047  batonq      │  │  51592069  pid 2047  README (1m)    │    │
-│  │ ● pid 2113  OrgHub      │  │  7a3b9c14  pid 2113  auth fix (4m)  │    │
-│  │ ● pid 2145  any:infra   │  │  e112ff20  pid 2145  CI pipe  (2m)  │    │
-│  └─────────────────────────┘  └─────────────────────────────────────┘    │
-│                                                                          │
-│  ┌─ Tasks ─────────────────────────────────────────────────────────┐     │
-│  │ [ ] any:infra  — publish release notes for v0.1.1               │     │
-│  │ [~] batonq     — README production-grade (claimed pid 2047)     │     │
-│  │ [~] OrgHub     — fix auth redirect loop (claimed pid 2113)      │     │
-│  │ [x] any:infra  — GitHub Actions CI workflow                     │     │
-│  └─────────────────────────────────────────────────────────────────┘     │
-│                                                                          │
-│  ┌─ File locks ─────────────────┐  ┌─ Recent events ────────────────┐    │
-│  │ README.md       pid 2047 45s │  │ 00:04  pick   51592069         │    │
-│  │ auth.ts         pid 2113 2m  │  │ 00:03  lock   README.md 2047   │    │
-│  │ workflows/*.yml pid 2145 1m  │  │ 00:02  done   a9f01c3e         │    │
-│  └──────────────────────────────┘  └────────────────────────────────┘    │
-│                                                                          │
-│   q quit · Tab focus · j/k nav · / filter · a abandon · r release · ?    │
-└──────────────────────────────────────────────────────────────────────────┘
-```
+Run `batonq tui` (or `bun src/tui.tsx` from a checkout) to see the live
+dashboard — sessions, tasks, claims, file locks, and recent events in one
+ink-rendered view, refreshed every 2s. The layout is described under
+[TUI](#tui) below.
 
-> **TODO:** record a real `docs/screencast.gif` once v0.2 is tagged — capture
-> a 3-tab tmux session picking + completing tasks in parallel. Until then,
-> the ASCII block above is the placeholder reference for the TUI layout.
+> **Screenshot / screencast TBD** — PRs welcome. A real `docs/tui.png` and a
+> 3-tab tmux `docs/screencast.gif` (parallel pick → work → done) will land
+> alongside v0.2.
 
 ## Install
 
@@ -189,8 +168,7 @@ locks, Recent events.
 | `r`            | Release selected lock (Claims panel only).   |
 | `?`            | Show full help overlay.                      |
 
-> **TODO:** add `docs/tui.png` once v0.2 ships. The ASCII block at the top of
-> this README is indicative of the layout; a real screenshot will live here.
+> **TODO:** add `docs/tui.png` once v0.2 ships.
 
 ## Architecture
 
