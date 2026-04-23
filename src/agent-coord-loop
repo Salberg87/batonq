@@ -7,8 +7,8 @@ set -euo pipefail
 #
 # Deps: a `timeout` binary (GNU coreutils). macOS ships without one, so
 #   `brew install coreutils` gives you `gtimeout`. Linux ships `timeout`
-#   natively. batonq_timeout_cmd (from batonq-platform-compat.sh) picks the
-#   right name for the current OS at runtime.
+#   natively. batonq_timeout_cmd (from batonq-platform-compat.sh) branches
+#   on `uname` (Darwin vs linux/other) and picks the right name at runtime.
 #
 # Env:
 #   BATONQ_WATCHDOG_STALE_SEC   watchdog mtime-staleness threshold (default 600)
