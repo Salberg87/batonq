@@ -692,10 +692,13 @@ function renderCurrentTaskArea(
     ) ??
     claims[0] ??
     null;
-  const commit = latestCommitSinceClaim(
-    task.claimed_at,
-    claim?.holder_cwd ?? null,
-  );
+  // For multi-repo selectors (`any:infra`, `any:<persona>`) the task has no
+  // single home repo; scan every live claim's cwd so the card isn't blind to
+  // commits landed in a sibling directory.
+  const repoCwds = task.repo.startsWith("any:")
+    ? claims.map((c) => c.holder_cwd).filter((c): c is string => !!c)
+    : (claim?.holder_cwd ?? null);
+  const commit = latestCommitSinceClaim(task.claimed_at, repoCwds);
   const info = buildCurrentTaskInfo({
     task,
     claim,

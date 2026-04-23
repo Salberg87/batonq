@@ -4,6 +4,14 @@
 // verify/judge captured-status, latest commit since claim). When there is
 // no active claim the card collapses to a one-line idle banner.
 //
+// Repo / cwd handling: for single-repo tasks (repo=batonq etc.) the "latest
+// commit" row queries the matching claim's holder_cwd. For multi-repo
+// selectors (`any:infra`, `any:<persona>`) there is no canonical task repo,
+// so the caller passes every live claim's cwd — latestCommitSinceClaim
+// scans each one and picks the newest commit across them. If a multi-repo
+// task is worked in a directory that has no live claim (no hook events),
+// the commit row will miss those commits by design.
+//
 // Pure helpers are exported separately so tests can exercise the event
 // counter and elapsed formatter without ink.
 
@@ -90,12 +98,14 @@ export function countSessionEvents(
 }
 
 // The latest git commit in `cwd` reachable from HEAD with author-date at/after
-// `sinceIso`. Used for the card's "latest commit" row. Returns null when the
-// repo has no commits in that window (the card then hides the row).
-export function latestCommitSinceClaim(
+// `sinceIso`. Returns null when the repo has no commits in that window or git
+// is unreachable. Callers pass a single repo path — multi-repo selectors like
+// `any:infra` should use `latestCommitAcrossClaims` below so the card isn't
+// blind to commits landed outside the first claim's cwd.
+export function latestCommitInRepo(
   sinceIso: string | null | undefined,
   cwd: string | null | undefined,
-): { sha: string; subject: string } | null {
+): { sha: string; subject: string; tsMs: number } | null {
   if (!sinceIso || !cwd) return null;
   try {
     const r = spawnSync(
@@ -105,7 +115,9 @@ export function latestCommitSinceClaim(
         cwd,
         "log",
         `--since=${sinceIso}`,
-        "--pretty=format:%h %s",
+        // %ct = committer unix timestamp; lets us pick the newest commit when
+        // aggregating across multiple repos.
+        "--pretty=format:%h %ct %s",
         "-n",
         "1",
       ],
@@ -113,11 +125,35 @@ export function latestCommitSinceClaim(
     );
     if (r.status !== 0) return null;
     const line = (r.stdout ?? "").trim().split("\n")[0] ?? "";
-    const m = line.match(/^(\S+)\s+(.*)$/);
-    return m ? { sha: m[1]!, subject: m[2]! } : null;
+    const m = line.match(/^(\S+)\s+(\d+)\s+(.*)$/);
+    if (!m) return null;
+    return {
+      sha: m[1]!,
+      tsMs: Number.parseInt(m[2]!, 10) * 1000,
+      subject: m[3]!,
+    };
   } catch {
     return null;
   }
+}
+
+// For multi-repo task selectors (`any:infra`, `any:<persona>`) the task has no
+// single home directory, so we scan every live claim's `holder_cwd` and return
+// the newest commit across all of them. Single-repo callers can just pass the
+// one cwd — the result is identical.
+export function latestCommitSinceClaim(
+  sinceIso: string | null | undefined,
+  cwds: string | string[] | null | undefined,
+): { sha: string; subject: string } | null {
+  if (!sinceIso || !cwds) return null;
+  const list = Array.isArray(cwds) ? cwds : [cwds];
+  const unique = Array.from(new Set(list.filter((s): s is string => !!s)));
+  let best: { sha: string; subject: string; tsMs: number } | null = null;
+  for (const cwd of unique) {
+    const hit = latestCommitInRepo(sinceIso, cwd);
+    if (hit && (!best || hit.tsMs > best.tsMs)) best = hit;
+  }
+  return best ? { sha: best.sha, subject: best.subject } : null;
 }
 
 // Precomputed, render-ready data for the card. Pure — constructed once per

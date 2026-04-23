@@ -10,6 +10,7 @@ import { render } from "ink-testing-library";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import {
   buildCurrentTaskInfo,
   countSessionEvents,
@@ -17,6 +18,7 @@ import {
   formatElapsed,
   IdleBanner,
   lastActivityRelative,
+  latestCommitSinceClaim,
 } from "../src/current-task-card";
 import { readEventsTail, type EventRow, type TaskRow } from "../src/tui-data";
 
@@ -231,6 +233,75 @@ describe("CurrentTaskCard", () => {
     expect(out).toContain("deadbee");
     expect(out).toContain("add current-task card");
     unmount();
+  });
+});
+
+// ── latestCommitSinceClaim — multi-repo any:infra aggregation ────────────────
+
+describe("latestCommitSinceClaim", () => {
+  // Deterministic commit timestamps — we pass GIT_COMMITTER_DATE /
+  // GIT_AUTHOR_DATE so that tests comparing "newest commit" don't flake when
+  // two repos are committed within the same wall-clock second.
+  function initRepo(
+    dir: string,
+    messages: string[],
+    startEpoch: number = 1_500_000_000,
+  ): void {
+    spawnSync("git", ["-C", dir, "init", "-q", "-b", "main"]);
+    spawnSync("git", ["-C", dir, "config", "user.email", "t@t"]);
+    spawnSync("git", ["-C", dir, "config", "user.name", "t"]);
+    spawnSync("git", ["-C", dir, "config", "commit.gpgsign", "false"]);
+    for (let i = 0; i < messages.length; i++) {
+      const f = join(dir, `f${i}.txt`);
+      writeFileSync(f, `${i}\n`);
+      spawnSync("git", ["-C", dir, "add", "."]);
+      const when = `${startEpoch + i} +0000`;
+      spawnSync("git", ["-C", dir, "commit", "-q", "-m", messages[i]!], {
+        env: {
+          ...process.env,
+          GIT_AUTHOR_DATE: when,
+          GIT_COMMITTER_DATE: when,
+        },
+      });
+    }
+  }
+
+  // Tests use a 1970 epoch as `since` so that freshly-authored commits always
+  // fall inside the window regardless of wall-clock drift on the test host.
+  const EPOCH_ISO = "1970-01-01T00:00:00.000Z";
+
+  test("string input returns the single-repo newest commit since claim", () => {
+    const dir = mkdtempSync(join(tmpdir(), "batonq-card-git-"));
+    try {
+      initRepo(dir, ["initial", "feat(card): add current-task card"]);
+      const hit = latestCommitSinceClaim(EPOCH_ISO, dir);
+      expect(hit).not.toBeNull();
+      expect(hit!.subject).toContain("current-task card");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("array input scans all cwds and picks the newest commit (any:infra)", () => {
+    const a = mkdtempSync(join(tmpdir(), "batonq-card-any-a-"));
+    const b = mkdtempSync(join(tmpdir(), "batonq-card-any-b-"));
+    try {
+      initRepo(a, ["repo-a older commit"], 1_500_000_000);
+      // b's commit is stamped 3600s after a's — the aggregator must surface b.
+      initRepo(b, ["repo-b newer commit"], 1_500_003_600);
+      const hit = latestCommitSinceClaim(EPOCH_ISO, [a, b]);
+      expect(hit).not.toBeNull();
+      expect(hit!.subject).toContain("repo-b newer");
+    } finally {
+      rmSync(a, { recursive: true, force: true });
+      rmSync(b, { recursive: true, force: true });
+    }
+  });
+
+  test("null / empty cwd list returns null", () => {
+    expect(latestCommitSinceClaim(EPOCH_ISO, null)).toBeNull();
+    expect(latestCommitSinceClaim(EPOCH_ISO, [])).toBeNull();
+    expect(latestCommitSinceClaim(null, "/tmp")).toBeNull();
   });
 });
 
