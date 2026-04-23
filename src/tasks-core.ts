@@ -3,7 +3,15 @@
 // and a fixture TASKS.md, with no dependency on ~/.claude state.
 
 import { Database } from "bun:sqlite";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 
@@ -489,39 +497,91 @@ export function validateNewTask(t: NewTask): {
 // Append a new task to the `## Pending` section of TASKS.md.
 // Returns the external_id of the new task, or throws if the file has no
 // `## Pending` section or validation fails.
+//
+// Concurrency: guards the read-modify-write with an advisory lockfile
+// (O_EXCL create, retry-on-EEXIST) and finalises with a same-fs rename so
+// two TUI instances clicking `n` at the same time can't lose a task.
 export function appendTaskToPending(tasksPath: string, t: NewTask): string {
   const v = validateNewTask(t);
   if (!v.ok) throw new Error(`invalid task: ${v.reason}`);
 
-  const text = existsSync(tasksPath) ? readFileSync(tasksPath, "utf8") : "";
-  const lines = text.split("\n");
+  return withFileLock(tasksPath, () => {
+    const text = existsSync(tasksPath) ? readFileSync(tasksPath, "utf8") : "";
+    const lines = text.split("\n");
 
-  // Locate "## Pending" header.
-  const pendingIdx = lines.findIndex((l) => /^##\s+Pending\s*$/.test(l));
-  if (pendingIdx < 0) {
-    throw new Error(`could not find "## Pending" section in ${tasksPath}`);
-  }
+    const pendingIdx = lines.findIndex((l) => /^##\s+Pending\s*$/.test(l));
+    if (pendingIdx < 0) {
+      throw new Error(`could not find "## Pending" section in ${tasksPath}`);
+    }
 
-  // Insert point: end of the Pending section (right before the next `## `
-  // heading, or end of file). Walk forward from pendingIdx+1.
-  let insertAt = lines.length;
-  for (let i = pendingIdx + 1; i < lines.length; i++) {
-    if (/^##\s+/.test(lines[i]!)) {
-      insertAt = i;
+    // Insert point: end of the Pending section (right before the next `## `
+    // heading, or end of file).
+    let insertAt = lines.length;
+    for (let i = pendingIdx + 1; i < lines.length; i++) {
+      if (/^##\s+/.test(lines[i]!)) {
+        insertAt = i;
+        break;
+      }
+    }
+
+    // Trim trailing empty lines inside the section so we leave exactly one
+    // blank line between existing content and the new entry.
+    let tail = insertAt;
+    while (tail > pendingIdx + 1 && lines[tail - 1]!.trim() === "") tail--;
+
+    const newLines = buildTaskLines(t);
+    const block = ["", ...newLines, ""];
+    const before = lines.slice(0, tail);
+    const after = lines.slice(insertAt);
+    const next = [...before, ...block, ...after].join("\n");
+
+    atomicWrite(tasksPath, next);
+    return externalId(t.repo.trim(), t.body.replace(/\s+/g, " ").trim());
+  });
+}
+
+function withFileLock<T>(targetPath: string, fn: () => T): T {
+  const lockPath = targetPath + ".lock";
+  const deadline = Date.now() + 3000;
+  let fd: number | null = null;
+  for (;;) {
+    try {
+      fd = openSync(lockPath, "wx");
       break;
+    } catch (e: any) {
+      if (e.code !== "EEXIST") throw e;
+      if (Date.now() > deadline) {
+        throw new Error(
+          `could not acquire lock on ${targetPath}: stale lockfile at ${lockPath}?`,
+        );
+      }
+      // Short busy-wait; this is a UI-driven path, not a hot loop.
+      const end = Date.now() + 25;
+      while (Date.now() < end) {
+        /* spin */
+      }
     }
   }
+  try {
+    return fn();
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      /* lockfile already gone — fine */
+    }
+  }
+}
 
-  // Trim trailing empty lines inside the section, then ensure exactly one
-  // blank line separates existing content from the new entry.
-  let tail = insertAt;
-  while (tail > pendingIdx + 1 && lines[tail - 1]!.trim() === "") tail--;
-
-  const newLines = buildTaskLines(t);
-  const block = ["", ...newLines, ""];
-  const before = lines.slice(0, tail);
-  const after = lines.slice(insertAt);
-  writeFileSync(tasksPath, [...before, ...block, ...after].join("\n"));
-
-  return externalId(t.repo.trim(), t.body.replace(/\s+/g, " ").trim());
+function atomicWrite(targetPath: string, contents: string): void {
+  const tmp = `${targetPath}.tmp.${process.pid}.${Date.now()}`;
+  writeFileSync(tmp, contents);
+  renameSync(tmp, targetPath);
 }

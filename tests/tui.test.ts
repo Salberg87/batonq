@@ -5,7 +5,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import React from "react";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { render } from "ink-testing-library";
@@ -534,5 +540,16 @@ describe("AddTaskForm", () => {
     expect(() => appendTaskToPending(bad, { repo: "r", body: "b" })).toThrow(
       /Pending/,
     );
+  });
+
+  test("appendTaskToPending — two sequential appends keep both tasks (no lost write)", () => {
+    appendTaskToPending(tasksPath, { repo: "any:infra", body: "first" });
+    appendTaskToPending(tasksPath, { repo: "any:infra", body: "second" });
+    const after = readFileSync(tasksPath, "utf8");
+    expect(after).toContain("- [ ] **any:infra** — first");
+    expect(after).toContain("- [ ] **any:infra** — second");
+    expect(after).toContain("- [ ] **repo-a** — existing task");
+    // Lockfile cleaned up after writes.
+    expect(existsSync(tasksPath + ".lock")).toBe(false);
   });
 });

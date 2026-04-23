@@ -62,13 +62,13 @@ const REFRESH_MS = 2000;
 const FLASH_MS = 3000;
 const DEFAULT_TASKS_PATH = `${homedir()}/DEV/TASKS.md`;
 
-function useTick(ms: number): number {
+function useTick(ms: number): { now: number; bump: () => void } {
   const [t, setT] = useState(() => Date.now());
   useEffect(() => {
     const id = setInterval(() => setT(Date.now()), ms);
     return () => clearInterval(id);
   }, [ms]);
-  return t;
+  return { now: t, bump: () => setT(Date.now()) };
 }
 
 function useSnapshot(now: number): Snapshot | null {
@@ -92,7 +92,7 @@ function useSnapshot(now: number): Snapshot | null {
 
 export function App() {
   const { exit } = useApp();
-  const now = useTick(REFRESH_MS);
+  const { now, bump: forceRefresh } = useTick(REFRESH_MS);
   const snap = useSnapshot(now);
 
   const [focus, setFocus] = useState<PanelKey>("tasks");
@@ -338,6 +338,9 @@ export function App() {
             onSubmit={(t) => {
               submitAddTask(t, setFlash);
               setMode("normal");
+              // Re-read the snapshot now instead of waiting up to 2s for
+              // the next tick — otherwise the new task appears to "lag".
+              forceRefresh();
             }}
             onCancel={() => setMode("normal")}
             onInvalidSubmit={(reason) =>
