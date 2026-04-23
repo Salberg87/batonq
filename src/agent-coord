@@ -423,7 +423,7 @@ function runJudge(judgePrompt: string, gitDiff: string, cwd: string): { passed: 
   const MAX_OUTPUT = 1024 * 1024 * 4; // 4 MB
   const prompt = `${judgePrompt}\n\n---\nGit diff:\n\`\`\`\n${gitDiff}\n\`\`\`\n\nRespond with PASS or FAIL on the first line, followed by a brief explanation.`;
 
-  const result = spawnSync("claude", ["-p", "-m", "haiku"], {
+  const result = spawnSync("claude", ["-p", "--model", "haiku"], {
     cwd,
     input: prompt,
     timeout: 120_000, // 2 min
