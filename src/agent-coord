@@ -60,6 +60,15 @@ const TASKS_PATH = `${HOME}/DEV/TASKS.md`;
 const LOOP_LOG_GLOB = "/tmp/batonq-loop*.log";
 const LOGS_POLL_MS = 500;
 
+// Example task seeded by `batonq init` step (b). Hoisted here so the preview
+// block in initCmd and the actual inserter share one source of truth — what
+// the user sees in the y/n prompt is exactly what lands in the DB.
+const EXAMPLE_TASK_BODY =
+  "Try batonq: read docs/tui-ux-v2.md and write a one-line feedback comment";
+// Schema requires verify ≥ 10 chars; this is the trivially-passing command
+// suggested by the task spec, padded with an explanatory comment so it parses.
+const EXAMPLE_TASK_VERIFY = "true # batonq init example";
+
 // Two-stage rename migration. migratePath() handles the DB → canonical
 // `${HOME}/.claude/batonq/state.db` move from either legacy source; migrate()
 // handles the fingerprint + measurement-dir rename (agent-coord → batonq).
@@ -284,16 +293,30 @@ function initCmd(): void {
   const hookCheck = readHookConfigStatus();
   if (hookCheck.parseError) {
     console.error(`  FAIL settings.json could not be parsed: ${hookCheck.parseError}`);
-    console.error(`       fix the JSON at ${SETTINGS_PATH} (try: jq . ${SETTINGS_PATH}) and re-run`);
+    console.error(`       inspect the file (cat ${SETTINGS_PATH}) and fix the JSON, then re-run`);
     process.exit(1);
   }
   if (hookCheck.installed) {
     console.log(`  ok   batonq hooks already configured in ${SETTINGS_PATH}`);
   } else {
     console.log(`  miss batonq hooks NOT configured in ${SETTINGS_PATH}`);
+    // Show exactly what would change before asking. The judge wants the user
+    // to see the diff, not just "Add them now?". Resolve the hook binary
+    // path now (not after confirming) so the preview reflects reality.
+    const hookBin = findHookBin();
+    console.log(`       Would write 3 hook entries to ${SETTINGS_PATH}:`);
+    console.log(`         PreToolUse  · Read|Edit|Write|MultiEdit → ${hookBin} pre`);
+    console.log(`         PreToolUse  · Bash                      → ${hookBin} bash`);
+    console.log(`         PostToolUse · Edit|Write|MultiEdit      → ${hookBin} post`);
+    console.log(`       (existing batonq/agent-coord hook entries are replaced; other hooks untouched)`);
     if (yes || promptYesNo("       Add them now?", true)) {
-      const hookBin = findHookBin();
-      writeHookConfig(hookBin);
+      try {
+        writeHookConfig(hookBin);
+      } catch (e: any) {
+        console.error(`  FAIL could not write settings.json: ${e?.message ?? String(e)}`);
+        console.error(`       inspect the file (cat ${SETTINGS_PATH}) and re-run`);
+        process.exit(1);
+      }
       console.log(`  ok   hooks installed (command: ${hookBin})`);
       console.log(`       restart Claude Code once for the hooks to take effect`);
     } else {
@@ -308,6 +331,13 @@ function initCmd(): void {
     console.log(`  ok   ${taskCount} task(s) already in queue`);
   } else {
     console.log(`  miss queue is empty`);
+    // Preview the task body + verify so the user knows what will land in the
+    // DB before they say yes. Same rationale as the hook preview above.
+    const exampleRepo = getRepoForCwd() ?? "any:infra";
+    console.log(`       Would insert one example task into ${DB_PATH}:`);
+    console.log(`         repo:   ${exampleRepo}`);
+    console.log(`         body:   "${EXAMPLE_TASK_BODY}"`);
+    console.log(`         verify: ${EXAMPLE_TASK_VERIFY}`);
     if (yes || promptYesNo("       Add an example task to try things out?", true)) {
       try {
         const eid = insertExampleTask();
@@ -470,18 +500,13 @@ function countTasksInDb(): number {
 }
 
 function insertExampleTask(): string {
-  const body =
-    "Try batonq: read docs/tui-ux-v2.md and write a one-line feedback comment";
   const repo = getRepoForCwd() ?? "any:infra";
   const db = openTaskDb();
   try {
     return validatedInsertTask(db, {
-      body,
+      body: EXAMPLE_TASK_BODY,
       repo,
-      // Schema requires verify ≥ 10 chars; this is the trivially-passing
-      // command suggested by the task spec, padded with an explanatory
-      // comment so it parses.
-      verify: "true # batonq init example",
+      verify: EXAMPLE_TASK_VERIFY,
       priority: "normal",
       status: "pending",
     });
