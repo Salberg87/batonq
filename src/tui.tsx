@@ -274,7 +274,10 @@ export function App() {
   const [expandedOriginals, setExpandedOriginals] = useState<Set<string>>(
     () => new Set(),
   );
-  const [drillDownTask, setDrillDownTask] = useState<TaskRow | null>(null);
+  // Store only the external_id so the overlay picks up live DB updates on
+  // every tick (a writer process may mutate verify_output / status while the
+  // modal is open). The actual TaskRow is re-resolved from `snap` below.
+  const [drillDownEid, setDrillDownEid] = useState<string | null>(null);
   const [feedState, setFeedState] = useState<FeedState>(INITIAL_FEED_STATE);
 
   // Pull the live set of claim-holder cwds off the snapshot so the feed's
@@ -425,6 +428,21 @@ export function App() {
       setMode("help");
       return;
     }
+    // §5 keybind: `A` jumps to the first alert with an externalId and opens
+    // the drill-down on its task. The Alert lane itself isn't focusable, so
+    // rather than introduce a fifth panel focus just for this we short-circuit
+    // straight to the modal — it's what the operator actually wants (see why
+    // the alert is red).
+    if (input === "A") {
+      const first = alerts.find((a) => a.externalId);
+      if (!first) {
+        setFlash({ msg: "no actionable alert", color: C.warn });
+        return;
+      }
+      setDrillDownEid(first.externalId!);
+      setMode("drill-down");
+      return;
+    }
     if (key.tab) {
       const idx = PANELS.indexOf(focus);
       setFocus(PANELS[(idx + 1) % PANELS.length]!);
@@ -482,7 +500,7 @@ export function App() {
       if (focus === "tasks") {
         const t = filtered?.tasks[selected.tasks];
         if (t) {
-          setDrillDownTask(t);
+          setDrillDownEid(t.external_id);
           setMode("drill-down");
         }
       }
@@ -792,53 +810,82 @@ export function App() {
 
       {/* Drill-down overlay (§5): Escape close · a abandon · r release-claim
           · e enrich. Opened from Tasks panel via Enter; onClose below flips
-          mode back to "normal" so the main keybinds re-activate. */}
-      {mode === "drill-down" && drillDownTask && (
-        <Box marginTop={1}>
-          <DrillDownOverlay
-            view={buildDrillDownView(
-              drillDownTask,
-              resolveTaskCwd(drillDownTask, snap.claims),
-            )}
-            onClose={() => {
-              setDrillDownTask(null);
-              setMode("normal");
-            }}
-            onAbandon={() => {
-              if (drillDownTask.status === "done") {
-                setFlash({
-                  msg: "task already done — cannot abandon",
-                  color: C.warn,
-                });
-                return;
-              }
-              setConfirm({ kind: "abandon", task: drillDownTask });
-              setDrillDownTask(null);
-              setMode("confirm");
-            }}
-            onRelease={() => {
-              const claim = findClaimForTask(drillDownTask, snap.claims);
-              if (!claim) {
-                setFlash({
-                  msg: "no active claim to release for this task",
-                  color: C.warn,
-                });
-                return;
-              }
-              setConfirm({ kind: "release", claim });
-              setDrillDownTask(null);
-              setMode("confirm");
-            }}
-            onEnrich={() => {
-              setDrillDownTask(null);
-              setMode("normal");
-              triggerEnrich(drillDownTask);
-            }}
-          />
-        </Box>
-      )}
+          mode back to "normal" so the main keybinds re-activate. The task
+          is re-resolved from `snap` on every tick so DB updates while the
+          modal is open refresh the view (verify/judge output appearing
+          mid-run is the common case). */}
+      {mode === "drill-down" &&
+        drillDownEid &&
+        (() => {
+          const currentTask = findTaskByEid(snap, drillDownEid);
+          if (!currentTask) {
+            // Task vanished (e.g. abandoned by another process). Snap back to
+            // normal on the next tick — we intentionally do this inline rather
+            // than in a useEffect to keep render-side cleanup close to its cause.
+            return null;
+          }
+          return (
+            <Box marginTop={1}>
+              <DrillDownOverlay
+                view={buildDrillDownView(
+                  currentTask,
+                  resolveTaskCwd(currentTask, snap.claims),
+                )}
+                onClose={() => {
+                  setDrillDownEid(null);
+                  setMode("normal");
+                }}
+                onAbandon={() => {
+                  if (currentTask.status === "done") {
+                    setFlash({
+                      msg: "task already done — cannot abandon",
+                      color: C.warn,
+                    });
+                    return;
+                  }
+                  setConfirm({ kind: "abandon", task: currentTask });
+                  setDrillDownEid(null);
+                  setMode("confirm");
+                }}
+                onRelease={() => {
+                  const claim = findClaimForTask(currentTask, snap.claims);
+                  if (!claim) {
+                    setFlash({
+                      msg: "no active claim to release for this task",
+                      color: C.warn,
+                    });
+                    return;
+                  }
+                  setConfirm({ kind: "release", claim });
+                  setDrillDownEid(null);
+                  setMode("confirm");
+                }}
+                onEnrich={() => {
+                  setDrillDownEid(null);
+                  setMode("normal");
+                  triggerEnrich(currentTask);
+                }}
+              />
+            </Box>
+          );
+        })()}
     </Box>
   );
+}
+
+// Look up the current state of a task by external_id across the snapshot's
+// task buckets. Returns null if the task no longer exists (deleted or status
+// transition that dropped it from `latest`). Used by the drill-down so the
+// overlay always reflects the live row — the overlay itself is stateless wrt
+// the TaskRow.
+export function findTaskByEid(snap: Snapshot, eid: string): TaskRow | null {
+  const all: TaskRow[] = [
+    ...snap.tasks.drafts,
+    ...snap.tasks.pending,
+    ...snap.tasks.claimed,
+    ...snap.tasks.done,
+  ];
+  return all.find((t) => t.external_id === eid) ?? null;
 }
 
 // Find the claim row whose holder_cwd basename matches the task's repo. This

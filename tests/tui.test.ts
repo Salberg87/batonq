@@ -39,6 +39,7 @@ import {
 import {
   AddTaskForm,
   App,
+  findTaskByEid,
   parseQuestions,
   QuestionsOverlay,
   type ParsedQuestion,
@@ -1527,6 +1528,7 @@ describe("TUI L-keybind opens restart confirm overlay", () => {
 
 import {
   buildDrillDownView,
+  clampOffset,
   DrillDownOverlay,
   type DrillDownView,
 } from "../src/drill-down";
@@ -1737,5 +1739,175 @@ describe("buildDrillDownView (pure)", () => {
   test("null repoCwd yields empty commit list (no git spawn)", () => {
     const view = buildDrillDownView(task, null);
     expect(view.commits).toEqual([]);
+  });
+});
+
+describe("DrillDownOverlay — scroll + input isolation", () => {
+  const longTail = Array.from({ length: 30 }, (_, i) => `v-line-${i}`);
+  const makeView = (): DrillDownView => ({
+    externalId: "eeeeeeee",
+    status: "done",
+    badge: "✓V ✓J",
+    body: "body",
+    verifyCmd: "bun test",
+    verifyTail: longTail,
+    judgeCmd: "ok?",
+    judgeHead: ["PASS", "reason"],
+    commits: [],
+  });
+
+  test("long verify output is clipped to viewport with '↓ N more' marker", () => {
+    const { lastFrame, unmount } = render(
+      React.createElement(DrillDownOverlay, {
+        view: makeView(),
+        viewportLines: 5,
+        onClose: () => {},
+        onAbandon: () => {},
+        onRelease: () => {},
+        onEnrich: () => {},
+      }),
+    );
+    const out = lastFrame() ?? "";
+    // At offset 0, first 5 lines shown, "↓ 25 more" below them.
+    expect(out).toContain("v-line-0");
+    expect(out).toContain("v-line-4");
+    expect(out).not.toContain("v-line-5");
+    expect(out).toContain("↓ 25 more");
+    // No "↑ earlier" marker at offset 0.
+    expect(out).not.toContain("earlier");
+    unmount();
+  });
+
+  test("j scrolls verify output forward, showing '↑ N earlier' + '↓ N more'", async () => {
+    const { stdin, lastFrame, unmount } = render(
+      React.createElement(DrillDownOverlay, {
+        view: makeView(),
+        viewportLines: 5,
+        onClose: () => {},
+        onAbandon: () => {},
+        onRelease: () => {},
+        onEnrich: () => {},
+      }),
+    );
+    // Press j three times to advance the offset by 3.
+    stdin.write("j");
+    await new Promise((r) => setTimeout(r, 10));
+    stdin.write("j");
+    await new Promise((r) => setTimeout(r, 10));
+    stdin.write("j");
+    await new Promise((r) => setTimeout(r, 10));
+    const out = lastFrame() ?? "";
+    expect(out).toContain("↑ 3 earlier");
+    expect(out).toContain("v-line-3");
+    expect(out).toContain("v-line-7");
+    expect(out).toContain("↓ 22 more");
+    unmount();
+  });
+
+  test("unhandled keys are swallowed — no callback fires for Tab or random chars", async () => {
+    const fired: string[] = [];
+    const { stdin, unmount } = render(
+      React.createElement(DrillDownOverlay, {
+        view: makeView(),
+        onClose: () => fired.push("close"),
+        onAbandon: () => fired.push("abandon"),
+        onRelease: () => fired.push("release"),
+        onEnrich: () => fired.push("enrich"),
+      }),
+    );
+    // Tab, n, p, L, q — none of these should fire a drill-down callback.
+    stdin.write("\t");
+    stdin.write("n");
+    stdin.write("p");
+    stdin.write("L");
+    stdin.write("q");
+    await new Promise((r) => setTimeout(r, 20));
+    unmount();
+    expect(fired).toEqual([]);
+  });
+});
+
+describe("clampOffset", () => {
+  test("negative offsets clamp to 0", () => {
+    expect(clampOffset(-5, 20, 10)).toBe(0);
+  });
+  test("offset past max clamps to (total - viewport)", () => {
+    expect(clampOffset(100, 20, 10)).toBe(10);
+    expect(clampOffset(100, 5, 10)).toBe(0); // total < viewport → no scroll
+  });
+  test("in-range offset is preserved", () => {
+    expect(clampOffset(3, 20, 10)).toBe(3);
+  });
+});
+
+describe("findTaskByEid (drill-down refresh mechanism)", () => {
+  // Guarantees the drill-down overlay picks up live DB updates: the TUI
+  // stores only the external_id, and this function re-resolves the row
+  // across drafts/pending/claimed/done on every tick.
+  const mkSnap = (tasks: Partial<TaskRow>[]): Snapshot =>
+    ({
+      now: iso(0),
+      sessions: [],
+      claims: [],
+      events: [],
+      tasks: {
+        drafts: tasks.filter((t) => t.status === "draft") as TaskRow[],
+        pending: tasks.filter((t) => t.status === "pending") as TaskRow[],
+        claimed: tasks.filter((t) => t.status === "claimed") as TaskRow[],
+        done: tasks.filter((t) => t.status === "done") as TaskRow[],
+        latest: [],
+        counts: { drafts: 0, pending: 0, claimed: 0, done: 0 },
+      },
+    }) as Snapshot;
+
+  const baseTask = (overrides: Partial<TaskRow>): TaskRow => ({
+    id: 1,
+    external_id: "abc",
+    repo: "any:infra",
+    body: "",
+    status: "pending",
+    claimed_by: null,
+    claimed_at: null,
+    completed_at: null,
+    created_at: iso(0),
+    ...overrides,
+  });
+
+  test("returns the current row after a status transition", () => {
+    const snapT0 = mkSnap([
+      baseTask({ external_id: "xyz", status: "claimed", body: "working…" }),
+    ]);
+    const snapT1 = mkSnap([
+      baseTask({
+        external_id: "xyz",
+        status: "done",
+        body: "working…",
+        verify_cmd: "bun test",
+        verify_output: "PASS",
+        verify_ran_at: iso(10),
+      }),
+    ]);
+    expect(findTaskByEid(snapT0, "xyz")?.status).toBe("claimed");
+    expect(findTaskByEid(snapT1, "xyz")?.status).toBe("done");
+    // And the fresh snap surfaces the newly-captured verify_output.
+    expect(findTaskByEid(snapT1, "xyz")?.verify_output).toBe("PASS");
+  });
+
+  test("returns null when the eid is gone from the snapshot", () => {
+    const snap = mkSnap([baseTask({ external_id: "still-here" })]);
+    expect(findTaskByEid(snap, "vanished")).toBeNull();
+  });
+
+  test("finds rows across all four buckets", () => {
+    const snap = mkSnap([
+      baseTask({ external_id: "d1", status: "draft" }),
+      baseTask({ external_id: "p1", status: "pending" }),
+      baseTask({ external_id: "c1", status: "claimed" }),
+      baseTask({ external_id: "x1", status: "done" }),
+    ]);
+    expect(findTaskByEid(snap, "d1")?.status).toBe("draft");
+    expect(findTaskByEid(snap, "p1")?.status).toBe("pending");
+    expect(findTaskByEid(snap, "c1")?.status).toBe("claimed");
+    expect(findTaskByEid(snap, "x1")?.status).toBe("done");
   });
 });
