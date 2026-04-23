@@ -169,7 +169,7 @@ locks, Recent events.
 | `r`            | Release selected lock (Claims panel only).                  |
 | `?`            | Show full help overlay.                                     |
 
-**Add-task form (`n`):**
+**Add-task form — keybind `n`:**
 
 Opens an overlay with four fields — **Repo** (prefilled from the current cwd's
 git-root basename, or `any:infra` when outside a git repo), **Body** (required),
