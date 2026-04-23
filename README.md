@@ -144,6 +144,7 @@ already claimed.
 | `batonq sweep-tasks`    | Mark claimed tasks with no progress in 30 min as `lost`; live sessions get a 5-min grace via recovery hook. Logs lost tasks to `/tmp/batonq-escalations.log`. Auto-runs on every `pick`. | `batonq sweep-tasks`               |
 | `batonq status`         | Print overall queue + lock state as a compact summary.                                                                                                                                   | `batonq status`                    |
 | `batonq check`          | Health check: schema version, state-db permissions, hook wiring.                                                                                                                         | `batonq check`                     |
+| `batonq doctor`         | Structured 5-category diagnostic (Binaries, Installation, State, Scope, Live) with `✓/⚠/✗` per row, a `fix:` hint on every non-pass, and a copy-pasteable summary. Read-only.            | `batonq doctor`                    |
 | `batonq tail [-n N]`    | Tail the event log (JSONL).                                                                                                                                                              | `batonq tail -n 50`                |
 | `batonq report`         | Aggregate measurement events over a time range (`--since`, `--until`, `--json`).                                                                                                         | `batonq report --since 2026-04-01` |
 | `batonq enrich <id>`    | Elaborate a draft via `claude --model opus`. Returns clarifying questions OR a spec with `verify:`+`judge:`.                                                                             | `batonq enrich 51592069b22d`       |
@@ -263,6 +264,13 @@ timeout, never blocks Claude on its own failure). Everything else is a shell
 of unix verbs around those three files.
 
 ## FAQ
+
+**Something isn't working — where do I start?**
+Run `batonq doctor`. It walks five categories — Binaries, Installation, State,
+Scope, Live — and prints `✓ / ⚠ / ✗` per row with a `fix:` hint on every
+non-pass. Exit code is 0 when nothing critical is wrong, 1 otherwise. The
+output is designed to paste straight into a bug report. Doctor is read-only:
+it never edits settings, recreates the DB, or touches your tasks.
 
 **How does this differ from Claude Squad / ccswarm?**
 Claude Squad and ccswarm are workspace orchestrators: they own the tmux

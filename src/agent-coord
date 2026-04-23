@@ -3,10 +3,11 @@
 // Commands: check | tail | report | status | release | sweep
 
 import { Database } from "bun:sqlite";
-import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync, unlinkSync } from "node:fs";
 import { execSync, spawnSync } from "node:child_process";
 import { basename, isAbsolute, resolve } from "node:path";
 import { homedir } from "node:os";
+import { createHash } from "node:crypto";
 import {
   parseTasksFile as parseTasksFileCore,
   externalId,
@@ -39,6 +40,9 @@ const cmd = process.argv[2];
 switch (cmd) {
   case "check":
     check();
+    break;
+  case "doctor":
+    doctor();
     break;
   case "tail":
     tail();
@@ -88,7 +92,7 @@ switch (cmd) {
   default:
     console.error(
       "usage: batonq\n" +
-        "  Coordination:  check | status | release <path> | sweep | sweep-tasks\n" +
+        "  Coordination:  check | doctor | status | release <path> | sweep | sweep-tasks\n" +
         "  Measurement:   tail [-n N] | report [--since ISO] [--until ISO] [--json]\n" +
         "  Tasks:         sync-tasks | pick | mine | done [<id>] | abandon [<id>] | tasks\n" +
         "  Drafts:        enrich <id> | promote <id>\n" +
@@ -178,6 +182,498 @@ function check() {
   } else warn(`state.db not created yet — will appear on first in-scope tool call`);
 
   process.exit(green ? 0 : 1);
+}
+
+// ── doctor ────────────────────────────────────────────────────────────────────
+//
+// `check` is the legacy single-pass health probe. `doctor` is the structured
+// alternative: 5 categories (Binaries, Installation, State, Scope, Live), every
+// row carries pass/warn/fail + an actionable `fix:` hint, and the closing
+// summary lists every critical and warning so the output is copy-pastable into
+// an issue. Diagnostic-only — never mutates state.
+
+type DoctorStatus = "pass" | "warn" | "fail";
+type DoctorCheck = { label: string; status: DoctorStatus; fix?: string };
+type DoctorCategory = { name: string; checks: DoctorCheck[] };
+
+function doctorSym(s: DoctorStatus): string {
+  return s === "pass" ? "✓" : s === "warn" ? "⚠" : "✗";
+}
+
+function doctor(): void {
+  const cats: DoctorCategory[] = [
+    { name: "Binaries", checks: [] },
+    { name: "Installation", checks: [] },
+    { name: "State", checks: [] },
+    { name: "Scope", checks: [] },
+    { name: "Live", checks: [] },
+  ];
+  const add = (cat: string, label: string, status: DoctorStatus, fix?: string) => {
+    const c = cats.find((x) => x.name === cat);
+    if (!c) return;
+    c.checks.push({ label, status, fix });
+  };
+
+  // ── 1. Binaries ─────────────────────────────────────────────────────────────
+  // bun ≥ 1.0, git ≥ 2.0, jq ≥ 1.0 are hard requirements. claude is warn-only
+  // because the queue itself works without it; only `enrich` and `batonq-loop`
+  // need a Claude Code install.
+  const binCheck = (name: string, cmd: string, minMajor: number, fix: string) => {
+    try {
+      const v = execSync(cmd, { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+      const m = v.match(/(\d+)\.(\d+)(?:\.(\d+))?/);
+      if (m && parseInt(m[1] ?? "0", 10) >= minMajor) {
+        add("Binaries", `${name}: ${v}`, "pass");
+      } else {
+        add("Binaries", `${name}: ${v} (need ≥ ${minMajor}.0)`, "fail", fix);
+      }
+    } catch {
+      add("Binaries", `${name}: not found on PATH`, "fail", fix);
+    }
+  };
+  binCheck("bun", "bun --version", 1, "curl -fsSL https://bun.sh/install | bash");
+  binCheck("git", "git --version", 2, "install git via your package manager (brew install git / apt-get install git)");
+  try {
+    const v = execSync("claude --version", { stdio: ["ignore", "pipe", "ignore"] })
+      .toString()
+      .trim();
+    add("Binaries", `claude: ${v}`, "pass");
+  } catch {
+    add(
+      "Binaries",
+      "claude: not found on PATH (optional — needed only for batonq-loop and `enrich`)",
+      "warn",
+      "install Claude Code: https://docs.claude.com/claude-code"
+    );
+  }
+  binCheck("jq", "jq --version", 1, "brew install jq  (or: sudo apt-get install -y jq)");
+
+  // ── 2. Installation ─────────────────────────────────────────────────────────
+  // batonq must be on PATH and executable; the three install.sh-wired hook
+  // matchers must be present in settings.json (PreToolUse pre, PreToolUse bash,
+  // PostToolUse post); each hook command path must point at an executable.
+  let batonqPath: string | null = null;
+  try {
+    batonqPath = execSync("command -v batonq", { stdio: ["ignore", "pipe", "ignore"] })
+      .toString()
+      .trim();
+  } catch {
+    batonqPath = null;
+  }
+  if (batonqPath) {
+    add("Installation", `batonq on PATH: ${batonqPath}`, "pass");
+    try {
+      const mode = statSync(batonqPath).mode & 0o111;
+      if (mode) add("Installation", `batonq has execute bit set`, "pass");
+      else add("Installation", `batonq missing execute bit`, "fail", `chmod +x ${batonqPath}`);
+    } catch (e: any) {
+      add("Installation", `batonq stat failed: ${e.message}`, "fail");
+    }
+  } else {
+    add(
+      "Installation",
+      `batonq not on PATH`,
+      "fail",
+      `add ~/.local/bin (or ~/bin) to PATH and re-run install.sh`
+    );
+  }
+
+  if (!existsSync(SETTINGS_PATH)) {
+    add(
+      "Installation",
+      `settings.json missing: ${SETTINGS_PATH}`,
+      "fail",
+      `re-run installer: curl -fsSL https://raw.githubusercontent.com/Salberg87/batonq/main/install.sh | sh`
+    );
+  } else {
+    let cfg: any = null;
+    try {
+      cfg = JSON.parse(readFileSync(SETTINGS_PATH, "utf8"));
+    } catch (e: any) {
+      add(
+        "Installation",
+        `settings.json parse error: ${e.message}`,
+        "fail",
+        `fix the JSON at ${SETTINGS_PATH} (jq . ${SETTINGS_PATH} to locate)`
+      );
+    }
+    if (cfg) {
+      const hookRe = /(?:agent-coord-hook|batonq-hook)/;
+      const hookPreRe = /(?:agent-coord-hook|batonq-hook)\s+pre\b/;
+      const hookBashRe = /(?:agent-coord-hook|batonq-hook)\s+bash\b/;
+      const hookPostRe = /(?:agent-coord-hook|batonq-hook)\s+post\b/;
+      const has = (event: string, pat: RegExp) => {
+        const arr = cfg.hooks?.[event] ?? [];
+        return arr.some((b: any) =>
+          (b.hooks ?? []).some((h: any) => typeof h.command === "string" && pat.test(h.command))
+        );
+      };
+      if (has("PreToolUse", hookPreRe))
+        add("Installation", `PreToolUse hook (pre, Read|Edit|Write|MultiEdit)`, "pass");
+      else
+        add(
+          "Installation",
+          `PreToolUse hook (pre) NOT configured`,
+          "fail",
+          `re-run install.sh — it merges hooks idempotently`
+        );
+      if (has("PreToolUse", hookBashRe))
+        add("Installation", `PreToolUse hook (bash, Bash)`, "pass");
+      else
+        add(
+          "Installation",
+          `PreToolUse hook (bash) NOT configured`,
+          "fail",
+          `re-run install.sh`
+        );
+      if (has("PostToolUse", hookPostRe))
+        add("Installation", `PostToolUse hook (post, Edit|Write|MultiEdit)`, "pass");
+      else
+        add(
+          "Installation",
+          `PostToolUse hook (post) NOT configured`,
+          "fail",
+          `re-run install.sh`
+        );
+
+      const hookPaths = new Set<string>();
+      for (const evt of ["PreToolUse", "PostToolUse"]) {
+        for (const block of cfg.hooks?.[evt] ?? []) {
+          for (const h of block.hooks ?? []) {
+            if (typeof h.command === "string" && hookRe.test(h.command)) {
+              const m = h.command.trim().match(/^(\S+)/);
+              if (m) hookPaths.add(m[1]);
+            }
+          }
+        }
+      }
+      for (const hp of hookPaths) {
+        const expanded = hp.replace(/^~/, HOME);
+        if (!existsSync(expanded)) {
+          add(
+            "Installation",
+            `hook binary missing: ${expanded}`,
+            "fail",
+            `re-run install.sh to (re)install batonq-hook`
+          );
+        } else {
+          const mode = statSync(expanded).mode & 0o111;
+          if (mode)
+            add("Installation", `hook binary executable: ${expanded}`, "pass");
+          else
+            add(
+              "Installation",
+              `hook binary not executable: ${expanded}`,
+              "fail",
+              `chmod +x ${expanded}`
+            );
+        }
+      }
+    }
+  }
+
+  // ── 3. State ────────────────────────────────────────────────────────────────
+  // state.db existence is informational (lazy-created by the hook), but if it
+  // exists it must pass integrity_check and contain the three core tables.
+  // TASKS.md must parse cleanly. events.jsonl directory must be writable.
+  if (!existsSync(DB_PATH)) {
+    add(
+      "State",
+      `state.db not created yet: ${DB_PATH}`,
+      "warn",
+      `make any tool call inside a repo under ~/DEV — the hook creates the db lazily`
+    );
+  } else {
+    add(
+      "State",
+      `state.db exists: ${DB_PATH} (${Math.round(statSync(DB_PATH).size / 1024)} KB)`,
+      "pass"
+    );
+    let db: Database | null = null;
+    try {
+      db = new Database(DB_PATH, { readonly: true });
+      db.exec("PRAGMA busy_timeout=3000;");
+      const integrity: any = db.query("PRAGMA integrity_check").get();
+      const integrityOk = integrity?.integrity_check === "ok";
+      if (integrityOk) add("State", `PRAGMA integrity_check: ok`, "pass");
+      else
+        add(
+          "State",
+          `PRAGMA integrity_check: ${JSON.stringify(integrity)}`,
+          "fail",
+          `back up ${DB_PATH} then delete it — the hook recreates it cleanly`
+        );
+      const tables = new Set(
+        (db.query("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map(
+          (r) => r.name
+        )
+      );
+      for (const t of ["sessions", "claims", "tasks"]) {
+        if (tables.has(t)) add("State", `table '${t}' present`, "pass");
+        else
+          add(
+            "State",
+            `table '${t}' missing`,
+            "fail",
+            `delete ${DB_PATH} so the schema initialiser recreates it on next hook run`
+          );
+      }
+    } catch (e: any) {
+      add(
+        "State",
+        `could not open state.db: ${e.message}`,
+        "fail",
+        `check file permissions on ${DB_PATH}; back up and delete to recreate`
+      );
+    } finally {
+      db?.close();
+    }
+  }
+
+  if (!existsSync(TASKS_PATH)) {
+    add(
+      "State",
+      `TASKS.md missing: ${TASKS_PATH}`,
+      "fail",
+      `mkdir -p ~/DEV && printf '## Pending\\n\\n' > ${TASKS_PATH}`
+    );
+  } else {
+    try {
+      const { tasks } = parseTasksFile();
+      add("State", `TASKS.md parses cleanly (${tasks.length} task(s))`, "pass");
+    } catch (e: any) {
+      add(
+        "State",
+        `TASKS.md parse error: ${e.message}`,
+        "fail",
+        `inspect ${TASKS_PATH} for malformed task lines`
+      );
+    }
+  }
+
+  if (!existsSync(LOG_DIR)) {
+    add(
+      "State",
+      `events log dir missing: ${LOG_DIR}`,
+      "warn",
+      `mkdir -p ${LOG_DIR}`
+    );
+  } else {
+    // probe writability with an empty append; clean the probe up so we don't
+    // leave litter beside the real log.
+    const probe = `${LOG_DIR}/.batonq-doctor-probe`;
+    try {
+      writeFileSync(probe, "", { flag: "a" });
+      try { unlinkSync(probe); } catch {}
+      if (existsSync(LOG_PATH)) {
+        add(
+          "State",
+          `events.jsonl append-able (${Math.round(statSync(LOG_PATH).size / 1024)} KB)`,
+          "pass"
+        );
+      } else {
+        add(
+          "State",
+          `events.jsonl not yet created (will appear on first hook run); dir is writable`,
+          "pass"
+        );
+      }
+    } catch (e: any) {
+      add(
+        "State",
+        `events log dir not writable: ${e.message}`,
+        "fail",
+        `chmod u+w ${LOG_DIR}`
+      );
+    }
+  }
+
+  // ── 4. Scope ────────────────────────────────────────────────────────────────
+  // The hook only fires inside a git repo whose toplevel sits under ~/DEV/ or
+  // ~/dev/. Outside that the queue still works for `any:*` tasks but
+  // repo-scoped tasks won't pick.
+  let gitRoot: string | null = null;
+  try {
+    gitRoot = execSync("git rev-parse --show-toplevel", {
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+    if (!gitRoot) gitRoot = null;
+  } catch {
+    gitRoot = null;
+  }
+  if (!gitRoot) {
+    add(
+      "Scope",
+      `cwd is not inside a git repo (${process.cwd()})`,
+      "warn",
+      `cd into a git repo under ~/DEV/ or ~/dev/ before running batonq-loop`
+    );
+  } else {
+    const inDev =
+      gitRoot.startsWith(`${HOME}/DEV/`) ||
+      gitRoot === `${HOME}/DEV` ||
+      gitRoot.startsWith(`${HOME}/dev/`) ||
+      gitRoot === `${HOME}/dev`;
+    if (inDev) add("Scope", `git-root inside ~/DEV: ${gitRoot}`, "pass");
+    else
+      add(
+        "Scope",
+        `git-root outside ~/DEV/ and ~/dev/: ${gitRoot}`,
+        "warn",
+        `move/clone the repo under ~/DEV/ or ~/dev/ to be picked up by repo-scoped tasks`
+      );
+
+    // Repo fingerprint: sha256(remote.origin.url + "|" + first-commit-SHA),
+    // matching the hook's R10 invariant. No network call — pure git plumbing.
+    try {
+      const out = execSync(
+        `git config --get remote.origin.url 2>/dev/null; echo "---"; git rev-list --max-parents=0 HEAD 2>/dev/null | head -1`,
+        { cwd: gitRoot, stdio: ["ignore", "pipe", "ignore"], timeout: 1500, shell: "/bin/sh" }
+      ).toString();
+      const [remote, firstCommit] = out.split("---\n").map((s) => s.trim());
+      if (remote && firstCommit) {
+        const fp = createHash("sha256")
+          .update(`${remote}|${firstCommit}`)
+          .digest("hex")
+          .slice(0, 16);
+        add("Scope", `repo-fingerprint: ${fp}`, "pass");
+      } else {
+        add(
+          "Scope",
+          `repo-fingerprint: falls back to path (no remote or no commits)`,
+          "warn",
+          `git remote add origin <url> — fingerprint becomes stable across clones`
+        );
+      }
+    } catch (e: any) {
+      add("Scope", `repo-fingerprint compute failed: ${e.message}`, "warn");
+    }
+  }
+
+  // ── 5. Live ─────────────────────────────────────────────────────────────────
+  // Snapshot of running activity. Stale sessions (>10 min) and stuck claims
+  // (>10 min) are warnings, not failures — they're recoverable.
+  const STUCK_MS = 10 * 60_000;
+  if (!existsSync(DB_PATH)) {
+    add("Live", `no state.db yet — no live activity`, "pass");
+  } else {
+    let db: Database | null = null;
+    try {
+      db = new Database(DB_PATH, { readonly: true });
+      db.exec("PRAGMA busy_timeout=3000;");
+      const sessions = db
+        .query("SELECT * FROM sessions ORDER BY last_seen DESC")
+        .all() as any[];
+      if (sessions.length === 0) {
+        add("Live", `no active sessions`, "pass");
+      } else {
+        for (const s of sessions) {
+          const ageS = Math.round((Date.now() - Date.parse(s.last_seen)) / 1000);
+          if (ageS > 600) {
+            add(
+              "Live",
+              `session ${s.session_id.slice(0, 12)} stale (last_seen ${ageS}s ago)`,
+              "warn",
+              `batonq sweep — purges sessions and claims past their TTL`
+            );
+          } else {
+            add(
+              "Live",
+              `session ${s.session_id.slice(0, 12)} alive (last_seen ${ageS}s ago, cwd=${s.cwd ?? "?"})`,
+              "pass"
+            );
+          }
+        }
+      }
+      // Claims (file-locks) stuck > 10 min.
+      const stuckClaims = db
+        .query(
+          `SELECT file_path, session_id, acquired_at FROM claims
+           WHERE released_at IS NULL AND acquired_at < ?`
+        )
+        .all(new Date(Date.now() - STUCK_MS).toISOString()) as any[];
+      if (stuckClaims.length === 0) {
+        add("Live", `no file-claims stuck > 10 min`, "pass");
+      } else {
+        for (const c of stuckClaims) {
+          const ageMin = Math.round((Date.now() - Date.parse(c.acquired_at)) / 60_000);
+          add(
+            "Live",
+            `claim on ${c.file_path} held ${ageMin} min by ${c.session_id.slice(0, 12)}`,
+            "warn",
+            `batonq release ${c.file_path}  (or batonq sweep if owner is dead)`
+          );
+        }
+      }
+      // Task-level claims stuck > 10 min.
+      const stuckTasks = db
+        .query(
+          `SELECT external_id, repo, claimed_by, claimed_at FROM tasks
+           WHERE status = 'claimed' AND claimed_at < ?`
+        )
+        .all(new Date(Date.now() - STUCK_MS).toISOString()) as any[];
+      if (stuckTasks.length === 0) {
+        add("Live", `no task-claims stuck > 10 min`, "pass");
+      } else {
+        for (const t of stuckTasks) {
+          const ageMin = Math.round((Date.now() - Date.parse(t.claimed_at)) / 60_000);
+          add(
+            "Live",
+            `task ${t.external_id} [${t.repo}] held ${ageMin} min by ${t.claimed_by.slice(0, 12)}`,
+            "warn",
+            `batonq abandon ${t.external_id}  (re-queues it for another agent)`
+          );
+        }
+      }
+    } catch (e: any) {
+      add(
+        "Live",
+        `could not query state.db: ${e.message}`,
+        "fail",
+        `see State category — db is broken`
+      );
+    } finally {
+      db?.close();
+    }
+  }
+
+  // ── Render ──────────────────────────────────────────────────────────────────
+  let total = 0;
+  let passed = 0;
+  const critical: string[] = [];
+  const warnings: string[] = [];
+  for (const c of cats) {
+    console.log(`\n${c.name}:`);
+    for (const ck of c.checks) {
+      total++;
+      if (ck.status === "pass") passed++;
+      else if (ck.status === "fail") critical.push(`${c.name}: ${ck.label}`);
+      else warnings.push(`${c.name}: ${ck.label}`);
+      console.log(`  ${doctorSym(ck.status)} ${ck.label}`);
+      if (ck.fix && ck.status !== "pass") {
+        console.log(`      fix: ${ck.fix}`);
+      }
+    }
+  }
+
+  console.log();
+  console.log(`Summary — batonq doctor: ${passed}/${total} checks passed.`);
+  if (critical.length === 0) {
+    console.log(`Critical: []`);
+  } else {
+    console.log(`Critical: [${critical.length}]`);
+    for (const c of critical) console.log(`  - ${c}`);
+  }
+  if (warnings.length === 0) {
+    console.log(`Warnings: []`);
+  } else {
+    console.log(`Warnings: [${warnings.length}]`);
+    for (const w of warnings) console.log(`  - ${w}`);
+  }
+
+  process.exit(critical.length === 0 ? 0 : 1);
 }
 
 // ── tail ──────────────────────────────────────────────────────────────────────

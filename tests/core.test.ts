@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -1576,6 +1577,297 @@ describe("sweepTasks (task-claim TTL)", () => {
       after.close();
     } finally {
       rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── batonq doctor ─────────────────────────────────────────────────────────────
+//
+// Doctor is a structured 5-category health check. It must (a) print every
+// category header so the output is copy-pastable into a bug report, (b) exit 0
+// when nothing critical is wrong, (c) exit 1 when something critical is wrong,
+// (d) never mutate state — it's diagnostic-only.
+//
+// We drive the real CLI against an isolated $HOME so the host's actual
+// settings.json / state.db / TASKS.md are never touched. Each test seeds
+// exactly the conditions it needs.
+
+describe("batonq doctor", () => {
+  // Build a $HOME with a complete healthy install: a settings.json with all
+  // three install.sh-wired hook matchers, a stub `batonq-hook` binary that
+  // they reference, an empty TASKS.md, and a writable measurement dir. No DB
+  // (state.db is lazy-created — doctor treats absence as a warn, not a fail).
+  function buildHealthyHome(): { home: string; cleanup: () => void } {
+    const home = mkdtempSync(join(tmpdir(), "batonq-doctor-"));
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    mkdirSync(join(home, ".claude", "agent-coord-measurement"), {
+      recursive: true,
+    });
+    mkdirSync(join(home, "DEV"), { recursive: true });
+    mkdirSync(join(home, "bin"), { recursive: true });
+
+    // Stub hook binary — doctor only checks that the path exists and is
+    // executable; it never executes the hook itself.
+    const hookPath = join(home, "bin", "batonq-hook");
+    writeFileSync(hookPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+    // Empty TASKS.md so parseTasksFile succeeds with 0 tasks.
+    writeFileSync(join(home, "DEV", "TASKS.md"), "## Pending\n\n");
+
+    // settings.json with the exact 3-matcher layout install.sh produces.
+    const settings = {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: "Read|Edit|Write|MultiEdit",
+            hooks: [
+              { type: "command", command: `${hookPath} pre`, timeout: 2 },
+            ],
+          },
+          {
+            matcher: "Bash",
+            hooks: [
+              { type: "command", command: `${hookPath} bash`, timeout: 2 },
+            ],
+          },
+        ],
+        PostToolUse: [
+          {
+            matcher: "Edit|Write|MultiEdit",
+            hooks: [
+              { type: "command", command: `${hookPath} post`, timeout: 2 },
+            ],
+          },
+        ],
+      },
+    };
+    writeFileSync(
+      join(home, ".claude", "settings.json"),
+      JSON.stringify(settings, null, 2),
+    );
+
+    return {
+      home,
+      cleanup: () => rmSync(home, { recursive: true, force: true }),
+    };
+  }
+
+  // PATH that includes a fake bin dir containing a batonq stub — doctor
+  // checks `command -v batonq` so the stub keeps the Installation category
+  // green for the happy-path tests.
+  function pathWithBatonqStub(home: string): string {
+    const stub = join(home, "bin", "batonq");
+    if (!existsSync(stub)) {
+      writeFileSync(stub, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    }
+    return `${join(home, "bin")}:${process.env.PATH ?? ""}`;
+  }
+
+  test("exit 0 when all categories are healthy", () => {
+    const { home, cleanup } = buildHealthyHome();
+    try {
+      // cwd inside the fake $HOME/DEV/somerepo so the Scope check passes.
+      const repoDir = join(home, "DEV", "fake-repo");
+      mkdirSync(repoDir);
+      // git init so `git rev-parse --show-toplevel` resolves.
+      const init = spawnSync("git", ["init", "-q", repoDir], {
+        encoding: "utf8",
+      });
+      expect(init.status).toBe(0);
+      // First commit so repo-fingerprint can be computed.
+      spawnSync(
+        "git",
+        [
+          "-C",
+          repoDir,
+          "commit",
+          "--allow-empty",
+          "-m",
+          "init",
+          "--no-gpg-sign",
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: "test",
+            GIT_AUTHOR_EMAIL: "t@t",
+            GIT_COMMITTER_NAME: "test",
+            GIT_COMMITTER_EMAIL: "t@t",
+          },
+        },
+      );
+
+      const res = spawnSync(BATONQ_BIN, ["doctor"], {
+        encoding: "utf8",
+        cwd: repoDir,
+        env: {
+          ...process.env,
+          HOME: home,
+          PATH: pathWithBatonqStub(home),
+        },
+      });
+
+      const out = (res.stdout ?? "") + (res.stderr ?? "");
+      expect(res.status).toBe(0);
+      expect(out).toContain("Critical: []");
+      expect(out).toMatch(/Summary — batonq doctor: \d+\/\d+ checks passed\./);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("exit 1 when a critical check fails (settings.json malformed)", () => {
+    const { home, cleanup } = buildHealthyHome();
+    try {
+      // Corrupt settings.json — JSON.parse throws → critical fail in
+      // Installation category. Other categories may still pass.
+      writeFileSync(join(home, ".claude", "settings.json"), "{not json");
+
+      const res = spawnSync(BATONQ_BIN, ["doctor"], {
+        encoding: "utf8",
+        cwd: home,
+        env: {
+          ...process.env,
+          HOME: home,
+          PATH: pathWithBatonqStub(home),
+        },
+      });
+
+      const out = (res.stdout ?? "") + (res.stderr ?? "");
+      expect(res.status).toBe(1);
+      expect(out).toContain("settings.json parse error");
+      expect(out).toMatch(/Critical: \[\d+\]/);
+      expect(out).toContain("Installation: settings.json parse error");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("output contains all 5 category headers and pass/warn/fail glyphs", () => {
+    const { home, cleanup } = buildHealthyHome();
+    try {
+      // Run from the temp $HOME (not a git repo) so the Scope category emits
+      // a warn line, exercising the `⚠` glyph alongside the `✓` lines from
+      // the other healthy categories.
+      const res = spawnSync(BATONQ_BIN, ["doctor"], {
+        encoding: "utf8",
+        cwd: home,
+        env: {
+          ...process.env,
+          HOME: home,
+          PATH: pathWithBatonqStub(home),
+        },
+      });
+
+      const out = (res.stdout ?? "") + (res.stderr ?? "");
+      // All 5 category headers must be printed verbatim — this is the
+      // copy-paste contract for issue reports.
+      for (const cat of [
+        "Binaries:",
+        "Installation:",
+        "State:",
+        "Scope:",
+        "Live:",
+      ]) {
+        expect(out).toContain(cat);
+      }
+      // At least the pass and warn glyphs must appear (non-git-repo cwd
+      // forces a warn in Scope; healthy install forces passes elsewhere).
+      expect(out).toMatch(/✓/);
+      expect(out).toMatch(/⚠/);
+      expect(out).toMatch(/Summary — batonq doctor: \d+\/\d+ checks passed\./);
+      expect(out).toMatch(/Critical: (\[\]|\[\d+\])/);
+      expect(out).toMatch(/Warnings: (\[\]|\[\d+\])/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("each non-pass row carries a `fix:` line", () => {
+    const { home, cleanup } = buildHealthyHome();
+    try {
+      // Force two distinct critical fails: (1) missing settings.json,
+      // (2) missing TASKS.md. Each should get its own fix hint.
+      rmSync(join(home, ".claude", "settings.json"));
+      rmSync(join(home, "DEV", "TASKS.md"));
+
+      const res = spawnSync(BATONQ_BIN, ["doctor"], {
+        encoding: "utf8",
+        cwd: home,
+        env: {
+          ...process.env,
+          HOME: home,
+          PATH: pathWithBatonqStub(home),
+        },
+      });
+
+      const out = (res.stdout ?? "") + (res.stderr ?? "");
+      expect(res.status).toBe(1);
+
+      const failLines = (out.match(/^\s*✗ /gm) ?? []).length;
+      const fixLines = (out.match(/^\s+fix: /gm) ?? []).length;
+      expect(failLines).toBeGreaterThan(0);
+      expect(fixLines).toBeGreaterThanOrEqual(failLines);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("doctor never mutates state (idempotent / read-only)", () => {
+    const { home, cleanup } = buildHealthyHome();
+    try {
+      const tasksBefore = readFileSync(join(home, "DEV", "TASKS.md"), "utf8");
+      const settingsBefore = readFileSync(
+        join(home, ".claude", "settings.json"),
+        "utf8",
+      );
+      const measurementBefore = spawnSync(
+        "ls",
+        ["-la", join(home, ".claude", "agent-coord-measurement")],
+        { encoding: "utf8" },
+      ).stdout;
+
+      const env = {
+        ...process.env,
+        HOME: home,
+        PATH: pathWithBatonqStub(home),
+      };
+      const r1 = spawnSync(BATONQ_BIN, ["doctor"], {
+        encoding: "utf8",
+        cwd: home,
+        env,
+      });
+      const r2 = spawnSync(BATONQ_BIN, ["doctor"], {
+        encoding: "utf8",
+        cwd: home,
+        env,
+      });
+
+      expect(readFileSync(join(home, "DEV", "TASKS.md"), "utf8")).toBe(
+        tasksBefore,
+      );
+      expect(readFileSync(join(home, ".claude", "settings.json"), "utf8")).toBe(
+        settingsBefore,
+      );
+
+      // The append-probe in the measurement dir must be cleaned up; no
+      // .batonq-doctor-probe should linger between runs.
+      const measurementAfter = spawnSync(
+        "ls",
+        ["-la", join(home, ".claude", "agent-coord-measurement")],
+        { encoding: "utf8" },
+      ).stdout;
+      expect(measurementAfter).toBe(measurementBefore);
+
+      // Doctor never lazy-creates state.db — that's the hook's job.
+      expect(existsSync(join(home, ".claude", "agent-coord-state.db"))).toBe(
+        false,
+      );
+
+      expect(r1.status).toBe(r2.status);
+    } finally {
+      cleanup();
     }
   });
 });
