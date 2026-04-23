@@ -24,6 +24,16 @@ bun test
 Tests use an in-memory SQLite (`new Database(":memory:")`) so they run
 hermetically. No external services required.
 
+## Coverage
+
+```sh
+bun run test:cov
+```
+
+Thresholds live in `bunfig.toml`: `line >= 70%`, `function >= 60%`. Bun fails
+the run if coverage drops below either bar. CI also posts the coverage table as
+a PR comment (`coverage` job in `.github/workflows/ci.yml`).
+
 ## Typechecking
 
 ```sh

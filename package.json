@@ -43,6 +43,7 @@
   },
   "scripts": {
     "test": "bun test",
+    "test:cov": "bun test --coverage",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
