@@ -177,6 +177,7 @@ already claimed.
 | `batonq enrich <id>`    | Elaborate a draft via `claude --model opus`. Returns clarifying questions OR a spec with `verify:`+`judge:`.                                                                             | `batonq enrich 51592069b22d`       |
 | `batonq promote <id>`   | Flip a draft to pending so `pick` will see it. Use after `enrich` once you're happy with the spec.                                                                                       | `batonq promote 51592069b22d`      |
 | `batonq tui`            | Live ink-based TUI dashboard with sessions, tasks, claims, locks, events. Press `n` to add a task inline.                                                                                | `batonq tui`                       |
+| `batonq loop-status`    | Print the loop footer state one-shot: loop state (running/idle/dead), current claimed task, claude-p pid+uptime, events.jsonl age. Add `--json` for machine-readable output.             | `batonq loop-status --json`        |
 | `batonq-hook`           | Claude Code PreToolUse / PostToolUse hook. Not invoked manually.                                                                                                                         | (wired by `install.sh`)            |
 | `batonq-loop`           | Fresh-Claude-per-task runner. `cd` into a repo, run, and the loop does the rest.                                                                                                         | `cd ~/DEV/MyRepo && batonq-loop`   |
 
@@ -188,20 +189,44 @@ locks, Recent events.
 
 **Keybinds:**
 
-| Key            | Action                                                                 |
-| -------------- | ---------------------------------------------------------------------- |
-| `q` / `Ctrl-C` | Quit.                                                                  |
-| `Tab`          | Cycle panel focus.                                                     |
-| `j` / `↓`      | Move selection down in focused panel.                                  |
-| `k` / `↑`      | Move selection up in focused panel.                                    |
-| `/`            | Filter rows in focused panel. `Esc` cancels.                           |
-| `n`            | New task — open an inline form to append one to `TASKS.md` as draft.   |
-| `e`            | Enrich selected draft via opus. If questions come back, answer inline. |
-| `p`            | Promote selected draft to pending so `pick` will see it.               |
-| `o`            | Toggle "Original: …" expand/collapse on an enriched draft.             |
-| `a`            | Abandon selected task (Tasks panel only).                              |
-| `r`            | Release selected lock (Claims panel only).                             |
-| `?`            | Show full help overlay.                                                |
+| Key            | Action                                                                                                              |
+| -------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `q` / `Ctrl-C` | Quit.                                                                                                               |
+| `Tab`          | Cycle panel focus.                                                                                                  |
+| `j` / `↓`      | Move selection down in focused panel.                                                                               |
+| `k` / `↑`      | Move selection up in focused panel.                                                                                 |
+| `/`            | Filter rows in focused panel. `Esc` cancels.                                                                        |
+| `n`            | New task — open an inline form to append one to `TASKS.md` as draft.                                                |
+| `e`            | Enrich selected draft via opus. If questions come back, answer inline.                                              |
+| `p`            | Promote selected draft to pending so `pick` will see it.                                                            |
+| `o`            | Toggle "Original: …" expand/collapse on an enriched draft.                                                          |
+| `a`            | Abandon selected task (Tasks panel only).                                                                           |
+| `r`            | Release selected lock (Claims panel only).                                                                          |
+| `L`            | Restart `batonq-loop` (confirm y/n). Kills running loop + claude-p, re-spawns via `nohup` → `/tmp/batonq-loop.log`. |
+| `?`            | Show full help overlay.                                                                                             |
+
+**Loop-status footer:**
+
+Below the four panels the TUI shows a two-line live footer tracking the
+`batonq-loop` subsystem, refreshed on the same 2s tick as the panels:
+
+1. **Loop state** — `✅ running` (loop + `claude -p` alive), `⏸ idle` (loop up
+   but no claude), or `❌ dead` (no `agent-coord-loop` process). Detected via
+   `pgrep -f agent-coord-loop`.
+2. **Current task** — the claimed task the loop's PID is working, shown as
+   `<external_id[:8]> · <first 50 chars of body>`. Falls back to `— (idle)`
+   when nothing is claimed.
+3. **Claude-p** — the PID of the oldest-alive `claude -p` process plus its
+   elapsed seconds (`ps -o etimes`).
+4. **Events age** — seconds since `events.jsonl` was last written. Colour
+   flips yellow past **300 s** and red past **600 s** (the watchdog's default
+   `BATONQ_WATCHDOG_STALE_SEC`). Missing log → dim `no events.jsonl`.
+
+Press `L` to restart the loop: the TUI opens a confirm prompt, then on `y`
+runs `pkill -f agent-coord-loop` and re-spawns `batonq-loop` detached via
+`nohup`, logging to `/tmp/batonq-loop.log`. Use this when the events-age cell
+has gone red and the queue stopped moving. For scripting, `batonq loop-status
+--json` prints the same snapshot from the CLI.
 
 **Add-task form — keybind `n`:**
 

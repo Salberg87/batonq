@@ -14,6 +14,13 @@ import {
   type SessionRow,
   type TaskRow,
 } from "./tui-data";
+import {
+  eventsAgeColor,
+  formatEventsAge,
+  loopStateGlyph,
+  taskBodyPreview,
+  type LoopStatus,
+} from "./loop-status";
 
 // Brand colors from /tmp/brand/colors.css
 export const C = {
@@ -257,6 +264,62 @@ export function EventsPanel({
   );
 }
 
+// Loop-status footer — one-line summary of the batonq-loop subsystem so you
+// can tell at a glance whether Claude-p is actively chewing on a task or the
+// queue has stalled. Rendered below the four panels, auto-refreshed by the
+// main App tick. Colors: brand.accent for the running baton-pass, warn/err
+// when the event log goes mtime-stale past the watchdog thresholds.
+export function LoopStatusFooter({ status }: { status: LoopStatus }) {
+  const stateColor =
+    status.state === "running"
+      ? C.ok
+      : status.state === "idle"
+        ? C.warn
+        : C.err;
+  const taskText = status.currentTask
+    ? `${status.currentTask.externalId.slice(0, 8)} · ${taskBodyPreview(status.currentTask.body, 50)}`
+    : "— (idle)";
+  const claudeText = status.claude
+    ? `pid ${status.claude.pid} running ${status.claude.uptimeSec}s`
+    : "— (no claude -p)";
+  const eventsColor = eventsAgeColor(status.eventsAgeSec, {
+    dim: C.dim,
+    warn: C.warn,
+    err: C.err,
+    ok: C.ok,
+  });
+
+  return (
+    <Box flexDirection="column">
+      <Box>
+        <Text color={C.brand} bold>
+          Loop
+        </Text>
+        <Text color={C.dim}> · </Text>
+        <Text color={stateColor}>{loopStateGlyph(status.state)}</Text>
+        {status.loopPid !== null && (
+          <Text color={C.dim}> (pid {status.loopPid})</Text>
+        )}
+        <Text color={C.dim}> · </Text>
+        <Text color={C.paper}>task: </Text>
+        <Text color={C.brand}>{taskText}</Text>
+      </Box>
+      <Box>
+        <Text color={C.paper}>claude: </Text>
+        <Text color={C.brand}>{claudeText}</Text>
+        <Text color={C.dim}> · </Text>
+        <Text color={C.paper}>events: </Text>
+        <Text color={eventsColor}>{formatEventsAge(status.eventsAgeSec)}</Text>
+        <Text color={C.dim}> · press </Text>
+        <Text color={C.brand} bold>
+          L
+        </Text>
+        <Text color={C.dim}> to restart loop</Text>
+      </Box>
+    </Box>
+  );
+}
+
 export function HelpOverlay() {
   return (
     <Box
@@ -299,6 +362,9 @@ export function HelpOverlay() {
       </Text>
       <Text>
         <Text color={C.brand}>o</Text> toggle original body on enriched draft
+      </Text>
+      <Text>
+        <Text color={C.brand}>L</Text> restart batonq-loop (confirm y/n)
       </Text>
       <Text>
         <Text color={C.brand}>?</Text> toggle this help

@@ -104,6 +104,9 @@ switch (cmd) {
   case "tui":
     runTui();
     break;
+  case "loop-status":
+    runLoopStatus(process.argv.slice(3));
+    break;
   case "uninstall":
     runUninstall();
     break;
@@ -114,10 +117,44 @@ switch (cmd) {
         "  Measurement:   tail [-n N] | report [--since ISO] [--until ISO] [--json]\n" +
         "  Tasks:         sync-tasks | pick | mine | done [<id>] | abandon [<id>] | tasks\n" +
         "  Drafts:        enrich <id> | promote <id>\n" +
-        "  Dashboard:     tui\n" +
+        "  Dashboard:     tui | loop-status [--json]\n" +
         "  Exit:          uninstall [--remove-state|--keep-state]"
     );
     process.exit(2);
+}
+
+function runLoopStatus(args: string[]): void {
+  const { eventsAgeSec, findLoopCurrentTask, probeClaudeInfo, probeLoopPid } =
+    require("./loop-status");
+  const loopPid = probeLoopPid();
+  const claude = probeClaudeInfo();
+  const state =
+    loopPid === null ? "dead" : claude === null ? "idle" : "running";
+  const db = openTaskDb();
+  let currentTask: any = null;
+  try {
+    currentTask = findLoopCurrentTask(db, loopPid);
+  } finally {
+    db.close();
+  }
+  const payload = {
+    state,
+    loopPid,
+    currentTask,
+    claude,
+    eventsAgeSec: eventsAgeSec(LOG_PATH),
+  };
+  if (args.includes("--json")) {
+    console.log(JSON.stringify(payload));
+    return;
+  }
+  const age = payload.eventsAgeSec;
+  console.log(
+    `loop: ${state}${loopPid !== null ? ` (pid ${loopPid})` : ""}` +
+      `  claude: ${claude ? `pid ${claude.pid} up ${claude.uptimeSec}s` : "— (none)"}` +
+      `  events: ${age === null ? "—" : `${age}s ago`}` +
+      `  task: ${currentTask ? `${currentTask.externalId.slice(0, 8)} · ${currentTask.body.slice(0, 50)}` : "—"}`
+  );
 }
 
 function runTui(): void {

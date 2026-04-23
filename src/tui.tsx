@@ -14,7 +14,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { Box, Text, render, useApp, useInput } from "ink";
 import TextInput from "ink-text-input";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { basename } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -46,9 +46,17 @@ import {
   ClaimsPanel,
   EventsPanel,
   HelpOverlay,
+  LoopStatusFooter,
   SessionsPanel,
   TasksPanel,
 } from "./tui-panels";
+import {
+  eventsAgeSec,
+  findLoopCurrentTask,
+  probeClaudeInfo,
+  probeLoopPid,
+  type LoopStatus,
+} from "./loop-status";
 
 type PanelKey = "sessions" | "tasks" | "claims" | "events";
 const PANELS: PanelKey[] = ["sessions", "tasks", "claims", "events"];
@@ -56,7 +64,8 @@ const PANELS: PanelKey[] = ["sessions", "tasks", "claims", "events"];
 type Mode = "normal" | "filter" | "help" | "confirm" | "add-task" | "questions";
 type ConfirmAction =
   | { kind: "abandon"; task: TaskRow }
-  | { kind: "release"; claim: ClaimRow };
+  | { kind: "release"; claim: ClaimRow }
+  | { kind: "restart-loop" };
 
 export type ParsedQuestion = { n: string; text: string };
 
@@ -95,10 +104,44 @@ function useSnapshot(now: number): Snapshot | null {
   }, [now]);
 }
 
+// Build a LoopStatus snapshot — three shell probes + one DB lookup, so it's
+// tied to the main refresh tick and not a separate interval.
+function useLoopStatus(now: number): LoopStatus {
+  return useMemo(() => {
+    const loopPid = probeLoopPid();
+    const claude = probeClaudeInfo();
+    let state: LoopStatus["state"];
+    if (loopPid === null) state = "dead";
+    else if (claude === null) state = "idle";
+    else state = "running";
+
+    let currentTask: LoopStatus["currentTask"] = null;
+    try {
+      const db = openStateDb(DEFAULT_DB_PATH);
+      try {
+        currentTask = findLoopCurrentTask(db, loopPid);
+      } finally {
+        db.close();
+      }
+    } catch {
+      currentTask = null;
+    }
+
+    return {
+      state,
+      loopPid,
+      currentTask,
+      claude,
+      eventsAgeSec: eventsAgeSec(DEFAULT_EVENTS_PATH, now),
+    };
+  }, [now]);
+}
+
 export function App() {
   const { exit } = useApp();
   const { now, bump: forceRefresh } = useTick(REFRESH_MS);
   const snap = useSnapshot(now);
+  const loopStatus = useLoopStatus(now);
 
   const [focus, setFocus] = useState<PanelKey>("tasks");
   const [selected, setSelected] = useState<Record<PanelKey, number>>({
@@ -177,7 +220,9 @@ export function App() {
     if (mode === "confirm") {
       if (input === "y" && confirm) {
         if (confirm.kind === "abandon") runAbandon(confirm.task, setFlash);
-        else runRelease(confirm.claim, setFlash);
+        else if (confirm.kind === "release")
+          runRelease(confirm.claim, setFlash);
+        else if (confirm.kind === "restart-loop") runRestartLoop(setFlash);
         setConfirm(null);
         setMode("normal");
         return;
@@ -350,6 +395,11 @@ export function App() {
       forceRefresh();
       return;
     }
+    if (input === "L") {
+      setConfirm({ kind: "restart-loop" });
+      setMode("confirm");
+      return;
+    }
     if (input === "o") {
       if (focus !== "tasks") return;
       const t = filtered?.tasks[selected.tasks];
@@ -373,9 +423,7 @@ export function App() {
   if (!snap || !filtered) {
     return (
       <Box padding={1} flexDirection="column">
-        <Text color={C.brand} bold>
-          batonq
-        </Text>
+        <Logo />
         <Text color={C.dim}>loading state…</Text>
       </Box>
     );
@@ -383,11 +431,11 @@ export function App() {
 
   return (
     <Box flexDirection="column">
+      <Box paddingX={1} flexDirection="column">
+        <Logo />
+      </Box>
       <Box paddingX={1}>
-        <Text color={C.brand} bold>
-          batonq
-        </Text>
-        <Text color={C.dim}> tui · refresh {REFRESH_MS / 1000}s · </Text>
+        <Text color={C.dim}>tui · refresh {REFRESH_MS / 1000}s · </Text>
         <Text color={C.paper}>focus: </Text>
         <Text color={C.brand} bold>
           {focus}
@@ -427,6 +475,10 @@ export function App() {
         </Box>
       </Box>
 
+      <Box paddingX={1}>
+        <LoopStatusFooter status={loopStatus} />
+      </Box>
+
       <Box paddingX={1} flexDirection="column">
         {filters[focus] && (
           <Text color={C.dim}>
@@ -443,7 +495,9 @@ export function App() {
           <Text color={C.warn}>
             {confirm.kind === "abandon"
               ? `abandon task ${confirm.task.external_id}? (y/n)`
-              : `release claim on ${shortPath(confirm.claim.file_path, 50)}? (y/n)`}
+              : confirm.kind === "release"
+                ? `release claim on ${shortPath(confirm.claim.file_path, 50)}? (y/n)`
+                : `restart batonq-loop? this kills the running loop + claude-p (y/n)`}
           </Text>
         )}
         {flash && <Text color={flash.color}>{flash.msg}</Text>}
@@ -456,7 +510,8 @@ export function App() {
         {mode === "normal" && !flash && !enrichingEid && (
           <Text color={C.dim}>
             q quit · Tab focus · j/k nav · / filter · n new · e enrich · p
-            promote · o original · a abandon · r release · ? help
+            promote · o original · a abandon · r release · L restart loop · ?
+            help
           </Text>
         )}
       </Box>
@@ -555,6 +610,29 @@ export function App() {
           <HelpOverlay />
         </Box>
       )}
+    </Box>
+  );
+}
+
+// ── logo ──────────────────────────────────────────────────────────────────────
+
+// Small 3-line wordmark rendered above the dashboard. Box-drawing glyphs keep
+// it monospace-safe across terminals. Trailing "╸" on the q gives it a tail
+// so it reads differently from the o.
+const LOGO_LINES = [
+  "┏┓  ┏━┓ ╺┳╸ ┏━┓ ┏┓╻ ┏━┓ ",
+  "┣┻┓ ┣━┫  ┃  ┃ ┃ ┃┗┫ ┃ ┃ ",
+  "┗━┛ ╹ ╹  ╹  ┗━┛ ╹ ╹ ┗━┻╸",
+] as const;
+
+export function Logo(): React.ReactElement {
+  return (
+    <Box flexDirection="column">
+      {LOGO_LINES.map((line, i) => (
+        <Text key={i} color={C.brand} bold>
+          {line}
+        </Text>
+      ))}
     </Box>
   );
 }
@@ -862,6 +940,64 @@ export function runAbandon(
       msg: `abandon failed: ${(r.stderr ?? "").trim() || `exit ${r.status}`}`,
       color: C.err,
     });
+  }
+}
+
+// runRestartLoop kills any running agent-coord-loop and detaches a fresh one
+// via `nohup`, redirecting stdout/stderr to /tmp/batonq-loop.log. Using
+// `detached: true` + stdio "ignore" keeps the new loop alive after the TUI
+// exits — the whole point is that pressing L fixes a wedged loop without
+// leaving the dashboard.
+export function runRestartLoop(
+  setFlash: (f: { msg: string; color: string }) => void,
+): void {
+  spawnSync("pkill", ["-f", "agent-coord-loop"], { encoding: "utf8" });
+  const bin = resolveLoopBin();
+  if (!bin) {
+    setFlash({
+      msg: "restart failed: agent-coord-loop not found on PATH",
+      color: C.err,
+    });
+    return;
+  }
+  try {
+    const logPath = "/tmp/batonq-loop.log";
+    const fs = require("node:fs");
+    const out = fs.openSync(logPath, "a");
+    const child = spawn("nohup", [bin], {
+      detached: true,
+      stdio: ["ignore", out, out],
+    });
+    child.unref();
+    setFlash({
+      msg: `✓ batonq-loop restarted (pid ${child.pid}, log: ${logPath})`,
+      color: C.ok,
+    });
+  } catch (e: any) {
+    setFlash({
+      msg: `restart failed: ${e?.message ?? String(e)}`,
+      color: C.err,
+    });
+  }
+}
+
+function resolveLoopBin(): string | null {
+  // Prefer `batonq-loop` on PATH (what the installer drops), fall back to the
+  // legacy `agent-coord-loop` name and the in-repo binary for dev checkouts.
+  for (const name of ["batonq-loop", "agent-coord-loop"]) {
+    const r = spawnSync("command", ["-v", name], {
+      encoding: "utf8",
+      shell: "/bin/sh",
+    });
+    const found = (r.stdout ?? "").trim();
+    if (found) return found;
+  }
+  const local = new URL("../bin/batonq-loop", import.meta.url).pathname;
+  try {
+    require("node:fs").accessSync(local);
+    return local;
+  } catch {
+    return null;
   }
 }
 

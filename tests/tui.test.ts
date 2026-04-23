@@ -38,11 +38,25 @@ import {
 } from "../src/tasks-core";
 import {
   AddTaskForm,
+  App,
   parseQuestions,
   QuestionsOverlay,
   type ParsedQuestion,
 } from "../src/tui";
-import { TasksPanel } from "../src/tui-panels";
+import { LoopStatusFooter, TasksPanel } from "../src/tui-panels";
+import {
+  EVENTS_CRIT_SEC,
+  EVENTS_WARN_SEC,
+  eventsAgeColor,
+  eventsAgeSec,
+  findLoopCurrentTask,
+  formatEventsAge,
+  loopStateGlyph,
+  parsePgrepPids,
+  parsePsEtimes,
+  taskBodyPreview,
+  type LoopStatus,
+} from "../src/loop-status";
 
 // ── schema helpers ────────────────────────────────────────────────────────────
 
@@ -830,5 +844,207 @@ describe("promote (TUI keybind `p` backing behavior)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ── loop-status footer ────────────────────────────────────────────────────────
+
+describe("loop-status helpers", () => {
+  test("parsePgrepPids keeps numeric lines only", () => {
+    expect(parsePgrepPids("1234\n5678\n\n  ")).toEqual([1234, 5678]);
+    expect(parsePgrepPids("")).toEqual([]);
+    expect(parsePgrepPids("nope\n")).toEqual([]);
+  });
+  test("parsePsEtimes handles padded output", () => {
+    expect(parsePsEtimes("   3621\n")).toBe(3621);
+    expect(parsePsEtimes("")).toBeNull();
+  });
+  test("loopStateGlyph covers all states", () => {
+    expect(loopStateGlyph("running")).toContain("running");
+    expect(loopStateGlyph("idle")).toContain("idle");
+    expect(loopStateGlyph("dead")).toContain("dead");
+  });
+  test("taskBodyPreview truncates to 50 chars with ellipsis", () => {
+    const long = "a".repeat(80);
+    const out = taskBodyPreview(long, 50);
+    expect(out.length).toBe(50);
+    expect(out.endsWith("…")).toBe(true);
+  });
+  test("formatEventsAge handles null/seconds/minutes/hours", () => {
+    expect(formatEventsAge(null)).toContain("no events");
+    expect(formatEventsAge(30)).toBe("30s ago");
+    expect(formatEventsAge(125)).toBe("2m ago");
+    expect(formatEventsAge(3600 * 3)).toBe("3h ago");
+  });
+  test("eventsAgeSec reads file mtime in seconds", () => {
+    const dir = mkdtempSync(join(tmpdir(), "batonq-events-"));
+    try {
+      const p = join(dir, "events.jsonl");
+      writeFileSync(p, "{}\n");
+      const now = Date.now() + 5000;
+      const age = eventsAgeSec(p, now);
+      expect(age).not.toBeNull();
+      expect(age!).toBeGreaterThanOrEqual(4);
+      // Missing file → null
+      expect(eventsAgeSec(join(dir, "nope.jsonl"))).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("LoopStatusFooter rendering", () => {
+  const palette = { dim: "grayD", warn: "warnY", err: "errR", ok: "okG" };
+  const base: LoopStatus = {
+    state: "running",
+    loopPid: 999,
+    currentTask: {
+      externalId: "abcdef1234567890",
+      body: "TUI live loop-status footer with everything wired up",
+    },
+    claude: { pid: 5555, uptimeSec: 42 },
+    eventsAgeSec: 3,
+  };
+
+  test("renders all four fields: state, task, claude pid+uptime, events age", () => {
+    const { lastFrame, unmount } = render(
+      React.createElement(LoopStatusFooter, { status: base }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("Loop");
+    expect(out).toContain("running");
+    expect(out).toContain("pid 999");
+    expect(out).toContain("abcdef12"); // short external_id
+    expect(out).toContain("TUI live loop-status"); // first chars of body
+    expect(out).toContain("pid 5555 running 42s");
+    expect(out).toContain("3s ago");
+    expect(out).toContain("L");
+    unmount();
+  });
+
+  test("idle state shown when loop pid present but no claude-p", () => {
+    const { lastFrame, unmount } = render(
+      React.createElement(LoopStatusFooter, {
+        status: { ...base, state: "idle", claude: null },
+      }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("idle");
+    expect(out).toContain("no claude -p");
+    unmount();
+  });
+
+  test("dead loop detected when loopPid is null", () => {
+    const { lastFrame, unmount } = render(
+      React.createElement(LoopStatusFooter, {
+        status: {
+          state: "dead",
+          loopPid: null,
+          currentTask: null,
+          claude: null,
+          eventsAgeSec: null,
+        },
+      }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("dead");
+    expect(out).toContain("— (idle)");
+    expect(out).toContain("no claude -p");
+    expect(out).toContain("no events.jsonl");
+    unmount();
+  });
+});
+
+describe("eventsAgeColor threshold", () => {
+  const palette = { dim: "D", warn: "W", err: "E", ok: "O" };
+  test("<=300s → ok", () => {
+    expect(eventsAgeColor(0, palette)).toBe("O");
+    expect(eventsAgeColor(EVENTS_WARN_SEC, palette)).toBe("O");
+  });
+  test(">300s and <=600s → warn", () => {
+    expect(eventsAgeColor(EVENTS_WARN_SEC + 1, palette)).toBe("W");
+    expect(eventsAgeColor(EVENTS_CRIT_SEC, palette)).toBe("W");
+  });
+  test(">600s → err", () => {
+    expect(eventsAgeColor(EVENTS_CRIT_SEC + 1, palette)).toBe("E");
+    expect(eventsAgeColor(99999, palette)).toBe("E");
+  });
+  test("null → dim", () => {
+    expect(eventsAgeColor(null, palette)).toBe("D");
+  });
+});
+
+describe("findLoopCurrentTask", () => {
+  function makeTasksDb(): Database {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        external_id TEXT UNIQUE NOT NULL,
+        repo TEXT NOT NULL,
+        body TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        claimed_by TEXT,
+        claimed_at TEXT,
+        completed_at TEXT,
+        created_at TEXT NOT NULL
+      );
+    `);
+    return db;
+  }
+  test("matches claims whose claimed_by ends in _<loopPid>", () => {
+    const db = makeTasksDb();
+    db.run(
+      `INSERT INTO tasks (external_id, repo, body, status, claimed_by, claimed_at, created_at)
+       VALUES (?, ?, ?, 'claimed', ?, ?, ?)`,
+      [
+        "t1",
+        "any:infra",
+        "build footer",
+        "term_ttys001_80282",
+        "2026-04-23T12:00:00.000Z",
+        "2026-04-23T11:00:00.000Z",
+      ],
+    );
+    db.run(
+      `INSERT INTO tasks (external_id, repo, body, status, claimed_by, claimed_at, created_at)
+       VALUES (?, ?, ?, 'claimed', ?, ?, ?)`,
+      [
+        "t2",
+        "any:infra",
+        "other session task",
+        "pid_11111",
+        "2026-04-23T12:05:00.000Z",
+        "2026-04-23T11:00:00.000Z",
+      ],
+    );
+    const hit = findLoopCurrentTask(db, 80282);
+    expect(hit?.externalId).toBe("t1");
+    expect(hit?.body).toContain("build footer");
+    db.close();
+  });
+  test("returns null when nothing claimed", () => {
+    const db = makeTasksDb();
+    expect(findLoopCurrentTask(db, 42)).toBeNull();
+    db.close();
+  });
+});
+
+describe("TUI L-keybind opens restart confirm overlay", () => {
+  test("pressing L shows the restart-loop confirm prompt", async () => {
+    const { stdin, lastFrame, unmount } = render(React.createElement(App));
+    // Let the initial tick settle so App renders snapshot + footer.
+    await new Promise((r) => setTimeout(r, 50));
+    stdin.write("L");
+    await new Promise((r) => setTimeout(r, 50));
+    const out = lastFrame() ?? "";
+    expect(out).toContain("restart batonq-loop");
+    expect(out).toContain("(y/n)");
+    // Esc should dismiss without actually restarting anything.
+    stdin.write("\x1B");
+    await new Promise((r) => setTimeout(r, 20));
+    const cleared = lastFrame() ?? "";
+    expect(cleared).not.toContain("restart batonq-loop");
+    unmount();
   });
 });
