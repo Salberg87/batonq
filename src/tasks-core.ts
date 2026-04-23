@@ -15,17 +15,21 @@ import {
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 
+export type TaskStatus = "draft" | "pending" | "claimed" | "done";
+
 export interface ParsedTask {
   repo: string;
   body: string;
-  status: "pending" | "claimed" | "done";
+  status: TaskStatus;
   lineIdx: number;
   verifyCmd?: string;
   judgeCmd?: string;
 }
 
+// `?` marks a draft task — TUI-created tasks land here until enrichment +
+// `batonq promote` flips them to pending so `pick` will see them.
 const TASK_RE =
-  /^- \[([ x~])\] (?:\d{4}-\d{2}-\d{2} )?\*\*([^*]+)\*\*\s*[—–-]+\s*(.+?)(?:\s*\([^)]*\))?$/;
+  /^- \[([ x~?])\] (?:\d{4}-\d{2}-\d{2} )?\*\*([^*]+)\*\*\s*[—–-]+\s*(.+?)(?:\s*\([^)]*\))?$/;
 const VERIFY_RE = /^\s+verify:\s*(.+?)\s*$/;
 const JUDGE_RE = /^\s+judge:\s*(.+?)\s*$/;
 
@@ -74,7 +78,13 @@ export function parseTasksText(text: string): {
     const m = line.match(TASK_RE);
     if (m) {
       const status: ParsedTask["status"] =
-        m[1] === " " ? "pending" : m[1] === "~" ? "claimed" : "done";
+        m[1] === " "
+          ? "pending"
+          : m[1] === "~"
+            ? "claimed"
+            : m[1] === "?"
+              ? "draft"
+              : "done";
       current = {
         repo: m[2]!.trim(),
         body: m[3]!.trim(),
@@ -124,12 +134,13 @@ export function initTaskSchema(db: Database): void {
       verify_ran_at TEXT,
       judge_cmd TEXT,
       judge_output TEXT,
-      judge_ran_at TEXT
+      judge_ran_at TEXT,
+      enrich_questions TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status);
     CREATE INDEX IF NOT EXISTS idx_task_repo_status ON tasks(repo, status);
   `);
-  // Migration for pre-existing DBs that lack verify_* and judge_* columns
+  // Migration for pre-existing DBs that lack verify_*, judge_*, enrich_* columns
   const cols = db
     .query("SELECT name FROM pragma_table_info('tasks')")
     .all() as {
@@ -147,6 +158,8 @@ export function initTaskSchema(db: Database): void {
     db.exec("ALTER TABLE tasks ADD COLUMN judge_output TEXT");
   if (!has("judge_ran_at"))
     db.exec("ALTER TABLE tasks ADD COLUMN judge_ran_at TEXT");
+  if (!has("enrich_questions"))
+    db.exec("ALTER TABLE tasks ADD COLUMN enrich_questions TEXT");
 }
 
 export function initClaimsSchema(db: Database): void {
@@ -193,18 +206,14 @@ export function syncTasks(
       .get(eid) as any;
     const verify = t.verifyCmd ?? null;
     const judge = t.judgeCmd ?? null;
+    // Map MD status → DB status. `claimed` in MD is treated as pending on
+    // insert (DB owns claim state); draft and done pass through verbatim.
+    const insertStatus =
+      t.status === "done" ? "done" : t.status === "draft" ? "draft" : "pending";
     if (!existing) {
       db.run(
         `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [
-          eid,
-          t.repo,
-          t.body,
-          t.status === "done" ? "done" : "pending",
-          nowIso,
-          verify,
-          judge,
-        ],
+        [eid, t.repo, t.body, insertStatus, nowIso, verify, judge],
       );
       if (t.status !== "done") added++;
     } else {
@@ -214,6 +223,13 @@ export function syncTasks(
           [nowIso, eid],
         );
         completed++;
+      }
+      // MD-driven promote: if a human flips `[?]` to `[ ]` directly in
+      // TASKS.md, sync should reflect that. Don't touch claimed/done rows.
+      if (t.status === "pending" && existing.status === "draft") {
+        db.run(`UPDATE tasks SET status = 'pending' WHERE external_id = ?`, [
+          eid,
+        ]);
       }
       if (verify !== existing.verify_cmd) {
         db.run(`UPDATE tasks SET verify_cmd = ? WHERE external_id = ?`, [
@@ -237,6 +253,11 @@ export interface PickOptions {
   any?: boolean;
 }
 
+// Pickable status is `pending` only — drafts (status='draft') are intentionally
+// excluded so an autonomous agent never claims a task whose intent has not
+// been enriched and human-approved via `batonq promote`. Do NOT broaden this
+// filter to `status != 'done'` or similar — that would silently re-open the
+// queue to drafts. See test "selectCandidate skips drafts" in core.test.ts.
 export function selectCandidate(db: Database, opts: PickOptions): any {
   const { repo, any } = opts;
   if (any) {
@@ -459,20 +480,30 @@ export function rewriteMdTaskStatus(
   tasksPath: string,
   repo: string,
   body: string,
-  newStatus: "done" | "pending",
+  newStatus: "done" | "pending" | "draft",
   today: string = new Date().toISOString().slice(0, 10),
 ): boolean {
-  const { lines, tasks } = parseTasksFile(tasksPath);
-  if (lines.length === 0) return false;
-  const target = tasks.find((t) => t.repo === repo && t.body === body);
-  if (!target) return false;
-  if (newStatus === "done") {
-    lines[target.lineIdx] = `- [x] ${today} **${repo}** — ${body}`;
-  } else {
-    lines[target.lineIdx] = `- [ ] **${repo}** — ${body}`;
-  }
-  writeFileSync(tasksPath, lines.join("\n"));
-  return true;
+  // Race-safety: read-modify-write inside the same lockfile + atomic rename
+  // pattern used by appendTaskToPending and rewriteMdTaskBody. Without this,
+  // two concurrent done/promote calls could each read stale lines and the
+  // last writer would silently clobber the other's status flip.
+  return withFileLock(tasksPath, () => {
+    if (!existsSync(tasksPath)) return false;
+    const text = readFileSync(tasksPath, "utf8");
+    const { lines, tasks } = parseTasksText(text);
+    if (lines.length === 0) return false;
+    const target = tasks.find((t) => t.repo === repo && t.body === body);
+    if (!target) return false;
+    if (newStatus === "done") {
+      lines[target.lineIdx] = `- [x] ${today} **${repo}** — ${body}`;
+    } else if (newStatus === "draft") {
+      lines[target.lineIdx] = `- [?] **${repo}** — ${body}`;
+    } else {
+      lines[target.lineIdx] = `- [ ] **${repo}** — ${body}`;
+    }
+    atomicWrite(tasksPath, lines.join("\n"));
+    return true;
+  });
 }
 
 export interface NewTask {
@@ -482,9 +513,13 @@ export interface NewTask {
   judge?: string;
 }
 
-export function buildTaskLines(t: NewTask): string[] {
+export function buildTaskLines(
+  t: NewTask,
+  status: "pending" | "draft" = "pending",
+): string[] {
   const body = t.body.replace(/\s+/g, " ").trim();
-  const out = [`- [ ] **${t.repo.trim()}** — ${body}`];
+  const mark = status === "draft" ? "?" : " ";
+  const out = [`- [${mark}] **${t.repo.trim()}** — ${body}`];
   const verify = t.verify?.trim();
   const judge = t.judge?.trim();
   if (verify) out.push(`  verify: ${verify}`);
@@ -508,7 +543,11 @@ export function validateNewTask(t: NewTask): {
 // Concurrency: guards the read-modify-write with an advisory lockfile
 // (O_EXCL create, retry-on-EEXIST) and finalises with a same-fs rename so
 // two TUI instances clicking `n` at the same time can't lose a task.
-export function appendTaskToPending(tasksPath: string, t: NewTask): string {
+export function appendTaskToPending(
+  tasksPath: string,
+  t: NewTask,
+  status: "pending" | "draft" = "pending",
+): string {
   const v = validateNewTask(t);
   if (!v.ok) throw new Error(`invalid task: ${v.reason}`);
 
@@ -536,7 +575,7 @@ export function appendTaskToPending(tasksPath: string, t: NewTask): string {
     let tail = insertAt;
     while (tail > pendingIdx + 1 && lines[tail - 1]!.trim() === "") tail--;
 
-    const newLines = buildTaskLines(t);
+    const newLines = buildTaskLines(t, status);
     const block = ["", ...newLines, ""];
     const before = lines.slice(0, tail);
     const after = lines.slice(insertAt);
@@ -591,4 +630,267 @@ function atomicWrite(targetPath: string, contents: string): void {
   const tmp = `${targetPath}.tmp.${process.pid}.${Date.now()}`;
   writeFileSync(tmp, contents);
   renameSync(tmp, targetPath);
+}
+
+// ── enrichment ────────────────────────────────────────────────────────────────
+//
+// enrichTaskBody spawns `claude -p --model opus --dangerously-skip-permissions`
+// with the prompt below. The model returns either a clarifying-questions
+// response (status stays draft, questions are stored on the task row) or an
+// elaborated spec with `verify:` and `judge:` lines (the task body is rewritten
+// in TASKS.md and DB, but status stays draft until the user runs `promote`).
+
+export const ENRICH_PROMPT_HEADER = [
+  "You are enriching a terse task description into a concrete spec for an autonomous coding agent.",
+  "An agent will pick this task with NO chance to ask follow-up questions, so any ambiguity",
+  "you paper over with a default WILL produce wrong work. Default-bias is the failure mode.",
+  "",
+  "DECISION (do this first, before writing anything):",
+  "- If the task underspecifies WHERE (which file/repo/dir), WHAT shape (function signature,",
+  "  CLI flag, schema, return type), or HOW success is measured — you MUST ask. Ambiguity",
+  "  about scope, library choice, naming, or output format also MUST trigger questions.",
+  "- Only skip questions if every concrete detail an agent needs to start coding is already",
+  "  in the body. When in doubt, ASK — clarifying questions are cheap; wrong work is not.",
+  "",
+  "FORMAT — exactly one of the two:",
+  "",
+  "(A) QUESTIONS mode — when ambiguous. Output MUST start with the literal token",
+  "    'QUESTIONS:' on the very first line, followed by up to 3 short questions, one per",
+  "    line. NO spec, NO verify:, NO judge:, NO prose preamble. Example:",
+  "      QUESTIONS:",
+  "      1. Which package should host the new helper — `core` or `cli`?",
+  "      2. Should errors be thrown, or returned as a Result type?",
+  "",
+  "(B) SPEC mode — when fully specified. Write a concrete body with acceptance criteria,",
+  "    then on the LAST two non-empty lines write EXACTLY (lowercase keys, single space):",
+  "      verify: <one mechanical shell command that returns non-zero on failure>",
+  "      judge: <semantic PASS/FAIL prompt for an LLM judge that will read the git diff>",
+  "    Body goes ABOVE those two lines. Do NOT wrap in markdown fences. Do NOT prepend",
+  "    'QUESTIONS:' in this mode.",
+  "",
+  "TASK BODY (terse, to enrich):",
+  "",
+].join("\n");
+
+export interface EnrichResult {
+  kind: "questions" | "enriched";
+  questions?: string;
+  body?: string;
+  verify?: string;
+  judge?: string;
+  raw: string;
+}
+
+export function parseEnrichResponse(raw: string): EnrichResult {
+  const trimmed = raw.trim();
+  if (/^QUESTIONS:/i.test(trimmed)) {
+    const questions = trimmed.replace(/^QUESTIONS:\s*/i, "").trim();
+    return { kind: "questions", questions, raw };
+  }
+  // Walk lines from the end and pick up the LAST verify: and judge: directives
+  // before the first non-directive non-blank line. This tolerates trailing
+  // whitespace and lets the body include hyphens / colons safely.
+  const lines = trimmed.split("\n");
+  let verify: string | undefined;
+  let judge: string | undefined;
+  let bodyEnd = lines.length;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i]!;
+    if (/^\s*$/.test(l)) {
+      if (bodyEnd === i + 1) bodyEnd = i;
+      continue;
+    }
+    const vm = l.match(/^\s*verify:\s*(.+?)\s*$/i);
+    const jm = l.match(/^\s*judge:\s*(.+?)\s*$/i);
+    if (vm && verify === undefined) {
+      verify = vm[1];
+      if (bodyEnd === i + 1) bodyEnd = i;
+      continue;
+    }
+    if (jm && judge === undefined) {
+      judge = jm[1];
+      if (bodyEnd === i + 1) bodyEnd = i;
+      continue;
+    }
+    break;
+  }
+  const body = lines.slice(0, bodyEnd).join("\n").replace(/\s+/g, " ").trim();
+  return { kind: "enriched", body, verify, judge, raw };
+}
+
+export function enrichTaskBody(
+  taskBody: string,
+  cwd: string,
+  spawn: SpawnFn = defaultSpawn,
+): EnrichResult {
+  const MAX_OUTPUT = 1024 * 1024 * 4;
+  const prompt = `${ENRICH_PROMPT_HEADER}${taskBody}\n`;
+  const result = spawn(
+    "claude",
+    ["-p", "--model", "opus", "--dangerously-skip-permissions"],
+    {
+      cwd,
+      input: prompt,
+      timeout: 300_000,
+      maxBuffer: MAX_OUTPUT,
+    },
+  );
+  if (result.error) {
+    throw new Error(`enrich spawn error: ${result.error.message}`);
+  }
+  if (typeof result.status === "number" && result.status !== 0) {
+    throw new Error(
+      `enrich claude exited ${result.status}: ${(result.stderr ?? "").trim()}`,
+    );
+  }
+  const stdout = result.stdout ?? "";
+  if (!stdout.trim()) {
+    throw new Error("enrich produced empty response");
+  }
+  return parseEnrichResponse(stdout);
+}
+
+// Rewrite a single task line in TASKS.md, replacing its body and inserting
+// fresh `verify:`/`judge:` directives directly below it. Surrounding lines —
+// HTML comments, code fences, neighbouring tasks — are preserved verbatim.
+// Atomic: same lockfile + tmp+rename pattern used by appendTaskToPending.
+export function rewriteMdTaskBody(
+  tasksPath: string,
+  repo: string,
+  oldBody: string,
+  newBody: string,
+  newVerify: string | undefined,
+  newJudge: string | undefined,
+  status: "pending" | "draft" = "draft",
+): boolean {
+  return withFileLock(tasksPath, () => {
+    if (!existsSync(tasksPath)) return false;
+    const text = readFileSync(tasksPath, "utf8");
+    const { lines, tasks } = parseTasksText(text);
+    const target = tasks.find((t) => t.repo === repo && t.body === oldBody);
+    if (!target) return false;
+
+    const mark = status === "draft" ? "?" : " ";
+    const cleanBody = newBody.replace(/\s+/g, " ").trim();
+    const replacement = [`- [${mark}] **${repo}** — ${cleanBody}`];
+    if (newVerify?.trim()) replacement.push(`  verify: ${newVerify.trim()}`);
+    if (newJudge?.trim()) replacement.push(`  judge: ${newJudge.trim()}`);
+
+    // Replace the existing task line plus any contiguous indented `verify:`
+    // / `judge:` directives that immediately follow. Stop at the first line
+    // that is not blank-or-directive (so prose paragraphs in a long task
+    // body are NOT clobbered).
+    let endIdx = target.lineIdx + 1;
+    while (endIdx < lines.length) {
+      const l = lines[endIdx]!;
+      if (/^\s+(verify|judge):/i.test(l)) {
+        endIdx++;
+        continue;
+      }
+      break;
+    }
+
+    const next = [
+      ...lines.slice(0, target.lineIdx),
+      ...replacement,
+      ...lines.slice(endIdx),
+    ].join("\n");
+    atomicWrite(tasksPath, next);
+    return true;
+  });
+}
+
+export type EnrichApplyResult =
+  | { kind: "questions"; questions: string }
+  | { kind: "enriched"; oldExternalId: string; newExternalId: string };
+
+// applyEnrichment is the DB-side half of `batonq enrich <id>`. It looks up the
+// draft task by external_id and either records clarifying questions (status
+// stays draft) or rewrites body + verify_cmd + judge_cmd in BOTH the DB and
+// TASKS.md. Status stays draft in both cases — promote is a separate step.
+export function applyEnrichment(
+  db: Database,
+  tasksPath: string,
+  externalIdLookup: string,
+  result: EnrichResult,
+  nowIso: string = new Date().toISOString(),
+): EnrichApplyResult {
+  const row = db
+    .query("SELECT * FROM tasks WHERE external_id = ?")
+    .get(externalIdLookup) as any;
+  if (!row) throw new Error(`no task with external_id ${externalIdLookup}`);
+  if (row.status !== "draft") {
+    throw new Error(
+      `task ${externalIdLookup} is ${row.status}, can only enrich drafts`,
+    );
+  }
+
+  if (result.kind === "questions") {
+    db.run(`UPDATE tasks SET enrich_questions = ? WHERE external_id = ?`, [
+      result.questions ?? "",
+      externalIdLookup,
+    ]);
+    return { kind: "questions", questions: result.questions ?? "" };
+  }
+
+  const newBody = (result.body ?? "").trim();
+  if (!newBody) {
+    throw new Error("enrichment returned empty body");
+  }
+  const newEid = externalId(row.repo, newBody);
+  const verify = result.verify?.trim() || null;
+  const judge = result.judge?.trim() || null;
+
+  // Update DB row first (in a transaction). external_id may shift because
+  // body changed; UNIQUE collisions throw and we surface them clearly.
+  db.exec("BEGIN");
+  try {
+    db.run(
+      `UPDATE tasks SET body = ?, external_id = ?, verify_cmd = ?, judge_cmd = ?, enrich_questions = NULL WHERE id = ?`,
+      [newBody, newEid, verify, judge, row.id],
+    );
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+
+  // Then rewrite TASKS.md (atomic rename) so the on-disk source-of-truth
+  // matches the DB. If this fails the DB row already moved — caller should
+  // surface and let the user re-run enrich or fix by hand.
+  rewriteMdTaskBody(
+    tasksPath,
+    row.repo,
+    row.body,
+    newBody,
+    verify ?? undefined,
+    judge ?? undefined,
+    "draft",
+  );
+  void nowIso;
+  return {
+    kind: "enriched",
+    oldExternalId: externalIdLookup,
+    newExternalId: newEid,
+  };
+}
+
+// Flip a draft to pending in BOTH DB and TASKS.md. Returns false (no-op) if
+// the task is not draft (already pending / claimed / done) — pick will then
+// see it on the next sync.
+export function promoteDraftToPending(
+  db: Database,
+  tasksPath: string,
+  externalIdLookup: string,
+): boolean {
+  const row = db
+    .query("SELECT * FROM tasks WHERE external_id = ?")
+    .get(externalIdLookup) as any;
+  if (!row) throw new Error(`no task with external_id ${externalIdLookup}`);
+  if (row.status !== "draft") return false;
+  db.run(`UPDATE tasks SET status = 'pending' WHERE external_id = ?`, [
+    externalIdLookup,
+  ]);
+  rewriteMdTaskStatus(tasksPath, row.repo, row.body, "pending");
+  return true;
 }

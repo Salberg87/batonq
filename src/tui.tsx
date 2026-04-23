@@ -533,7 +533,9 @@ export function submitAddTask(
     judge: form.judge,
   };
   try {
-    appendTaskToPending(tasksPath, task);
+    // TUI-created tasks land as drafts so a human can run `batonq enrich <id>`
+    // before the queue starts handing them out to autonomous agents.
+    appendTaskToPending(tasksPath, task, "draft");
     const eid = externalId(
       task.repo.trim(),
       task.body.replace(/\s+/g, " ").trim(),
@@ -548,7 +550,10 @@ export function submitAddTask(
       });
       return;
     }
-    setFlash({ msg: `✓ Task added (id ${eid.slice(0, 8)})`, color: C.ok });
+    setFlash({
+      msg: `✓ Draft added (id ${eid.slice(0, 8)}). Enrich + promote to queue.`,
+      color: C.ok,
+    });
   } catch (e: any) {
     setFlash({ msg: `add failed: ${e.message ?? String(e)}`, color: C.err });
   }

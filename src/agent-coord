@@ -18,6 +18,9 @@ import {
   runJudge as runJudgeCore,
   getGitDiffSinceClaim as getGitDiffSinceClaimCore,
   rewriteMdTaskStatus as rewriteMdTaskStatusCore,
+  enrichTaskBody,
+  applyEnrichment,
+  promoteDraftToPending,
   type ParsedTask,
 } from "./tasks-core";
 
@@ -68,6 +71,12 @@ switch (cmd) {
   case "tasks":
     listTasks();
     break;
+  case "enrich":
+    enrichTask(process.argv[3]);
+    break;
+  case "promote":
+    promoteTask(process.argv[3]);
+    break;
   case "tui":
     runTui();
     break;
@@ -77,6 +86,7 @@ switch (cmd) {
         "  Coordination:  check | status | release <path> | sweep\n" +
         "  Measurement:   tail [-n N] | report [--since ISO] [--until ISO] [--json]\n" +
         "  Tasks:         sync-tasks | pick | mine | done [<id>] | abandon [<id>] | tasks\n" +
+        "  Drafts:        enrich <id> | promote <id>\n" +
         "  Dashboard:     tui"
     );
     process.exit(2);
@@ -610,6 +620,74 @@ function listTasks(): void {
 
 function rewriteMdTaskStatus(repo: string, body: string, newStatus: "done" | "pending"): void {
   rewriteMdTaskStatusCore(TASKS_PATH, repo, body, newStatus);
+}
+
+function enrichTask(id?: string): void {
+  if (!id) {
+    console.error("usage: batonq enrich <external_id>");
+    process.exit(2);
+  }
+  syncTasks(false);
+  const db = openTaskDb();
+  try {
+    const row = db
+      .query("SELECT * FROM tasks WHERE external_id = ?")
+      .get(id) as any;
+    if (!row) {
+      console.error(`No task with external_id ${id}.`);
+      process.exit(1);
+    }
+    if (row.status !== "draft") {
+      console.error(
+        `Task ${id} is ${row.status}, can only enrich drafts. Use TUI to add a draft first.`
+      );
+      process.exit(1);
+    }
+    const repoPath = resolveRepoPath(row.repo);
+    // Spawned by tasks-core: `claude -p --model opus --dangerously-skip-permissions`
+    console.log(`→ enrich (claude --model opus) [${row.repo}]: ${row.body.slice(0, 80)}…`);
+    const result = enrichTaskBody(row.body, repoPath);
+    const applied = applyEnrichment(db, TASKS_PATH, id, result);
+    if (applied.kind === "questions") {
+      console.log(`? questions stored on draft (status unchanged):`);
+      console.log(applied.questions);
+      console.log(``);
+      console.log(`Answer the questions, edit the draft body in TASKS.md, then re-run: batonq enrich ${id}`);
+    } else {
+      console.log(`✓ enriched. Body + verify/judge updated. Status still draft.`);
+      if (applied.newExternalId !== applied.oldExternalId) {
+        console.log(`  external_id: ${applied.oldExternalId} → ${applied.newExternalId}`);
+      }
+      console.log(`  Promote when ready: batonq promote ${applied.newExternalId}`);
+    }
+  } finally {
+    db.close();
+  }
+}
+
+function promoteTask(id?: string): void {
+  if (!id) {
+    console.error("usage: batonq promote <external_id>");
+    process.exit(2);
+  }
+  const db = openTaskDb();
+  try {
+    const ok = promoteDraftToPending(db, TASKS_PATH, id);
+    if (!ok) {
+      const row = db
+        .query("SELECT status FROM tasks WHERE external_id = ?")
+        .get(id) as any;
+      if (!row) {
+        console.error(`No task with external_id ${id}.`);
+      } else {
+        console.error(`Task ${id} is ${row.status}, only drafts can be promoted.`);
+      }
+      process.exit(1);
+    }
+    console.log(`✓ promoted: ${id} (draft → pending). batonq pick will see it now.`);
+  } finally {
+    db.close();
+  }
 }
 
 // ── report ────────────────────────────────────────────────────────────────────

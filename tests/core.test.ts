@@ -14,13 +14,18 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import {
+  appendTaskToPending,
+  applyEnrichment,
   claimCandidate,
+  enrichTaskBody,
   externalId,
   getGitDiffSinceClaim,
   initClaimsSchema,
   initTaskSchema,
+  parseEnrichResponse,
   parseTasksFile,
   parseTasksText,
+  promoteDraftToPending,
   rewriteMdTaskStatus,
   runJudge,
   runVerify,
@@ -728,5 +733,347 @@ describe("getGitDiffSinceClaim fail-modes", () => {
     expect(getGitDiffSinceClaim("/tmp", "2026-01-01", spawn)).toContain(
       "diff --git",
     );
+  });
+});
+
+// ── 15. draft lifecycle: pick skips drafts, enrich + promote round-trip ───────
+
+describe("draft lifecycle", () => {
+  // parseTasksText must recognise `[?]` as draft, distinct from pending/claimed/done.
+  test("parser recognises `[?]` marker as draft", () => {
+    const { tasks } = parseTasksText(
+      [
+        "- [?] **any:infra** — terse draft body",
+        "- [ ] **any:infra** — pending body",
+        "- [~] **any:infra** — claimed body",
+        "- [x] 2026-04-23 **any:infra** — done body",
+      ].join("\n"),
+    );
+    expect(tasks.map((t) => t.status)).toEqual([
+      "draft",
+      "pending",
+      "claimed",
+      "done",
+    ]);
+  });
+
+  // selectCandidate must NOT return drafts. They sit in the queue waiting for
+  // enrichment + promote; if `pick` could grab them, autonomous agents would
+  // run on undefined intent.
+  test("selectCandidate skips drafts (only `pending` is pickable)", () => {
+    const db = memDb();
+    syncTasks(
+      db,
+      [
+        { repo: "any:infra", body: "draft one", status: "draft", lineIdx: 0 },
+        {
+          repo: "any:infra",
+          body: "pending two",
+          status: "pending",
+          lineIdx: 1,
+        },
+      ],
+      "2026-04-23T10:00:00.000Z",
+    );
+    const got = selectCandidate(db, { repo: "any:infra" });
+    expect(got.body).toBe("pending two");
+    // After pending is claimed, falling back must NOT return the draft —
+    // it must return undefined/null.
+    db.run("UPDATE tasks SET status = 'claimed' WHERE body = 'pending two'");
+    const next = selectCandidate(db, { repo: "any:infra" });
+    expect(next).toBeFalsy();
+    db.close();
+  });
+
+  test("appendTaskToPending with status='draft' writes `[?]` marker to TASKS.md", () => {
+    const tasksPath = join(workdir, "TASKS.md");
+    writeFileSync(tasksPath, "# Tasks\n\n## Pending\n\n## Done\n");
+    const eid = appendTaskToPending(
+      tasksPath,
+      { repo: "any:infra", body: "tui-created body" },
+      "draft",
+    );
+    expect(eid).toMatch(/^[0-9a-f]{12}$/);
+    const after = readFileSync(tasksPath, "utf8");
+    expect(after).toContain("- [?] **any:infra** — tui-created body");
+    expect(after).not.toContain("- [ ] **any:infra** — tui-created body");
+    // Default still pending — preserves existing call sites.
+    appendTaskToPending(tasksPath, { repo: "any:infra", body: "default body" });
+    const after2 = readFileSync(tasksPath, "utf8");
+    expect(after2).toContain("- [ ] **any:infra** — default body");
+  });
+
+  // parseEnrichResponse — pure parser. QUESTIONS: short-circuits, otherwise
+  // verify:/judge: are pulled off the tail and the rest is body.
+  test("parseEnrichResponse: QUESTIONS path keeps the questions, drops body", () => {
+    const r = parseEnrichResponse(
+      "QUESTIONS:\n1. Which dir?\n2. Which port?\n",
+    );
+    expect(r.kind).toBe("questions");
+    expect(r.questions).toContain("1. Which dir?");
+    expect(r.questions).toContain("2. Which port?");
+    expect(r.body).toBeUndefined();
+  });
+
+  test("parseEnrichResponse: pulls verify:/judge: off the tail, body keeps the rest", () => {
+    const r = parseEnrichResponse(
+      [
+        "Implement X with acceptance criteria A, B, C.",
+        "",
+        "verify: bun test foo.test.ts",
+        "judge:  Did the diff implement A, B, C? PASS/FAIL.",
+      ].join("\n"),
+    );
+    expect(r.kind).toBe("enriched");
+    expect(r.verify).toBe("bun test foo.test.ts");
+    expect(r.judge).toBe("Did the diff implement A, B, C? PASS/FAIL.");
+    expect(r.body).toContain("acceptance criteria A, B, C");
+    expect(r.body).not.toContain("verify:");
+    expect(r.body).not.toContain("judge:");
+  });
+
+  // Helper: fake spawn returning a canned stdout for the enrichment prompt.
+  const enrichSpawn =
+    (stdout: string, status = 0): SpawnFn =>
+    () => ({ status, signal: null, stdout, stderr: "", error: null });
+
+  function seedDraftRow(
+    db: Database,
+    repo: string,
+    body: string,
+    eid: string = externalId(repo, body),
+  ): { id: number; eid: string } {
+    db.run(
+      `INSERT INTO tasks (external_id, repo, body, status, created_at) VALUES (?, ?, ?, 'draft', ?)`,
+      [eid, repo, body, "2026-04-23T10:00:00.000Z"],
+    );
+    const row = db
+      .query("SELECT id FROM tasks WHERE external_id = ?")
+      .get(eid) as any;
+    return { id: row.id, eid };
+  }
+
+  test("enrich w/ QUESTIONS: keeps draft status + stores enrich_questions", () => {
+    const db = memDb();
+    const tasksPath = join(workdir, "TASKS.md");
+    writeFileSync(
+      tasksPath,
+      "# Tasks\n\n## Pending\n\n- [?] **any:infra** — terse body\n\n## Done\n",
+    );
+    const { eid } = seedDraftRow(db, "any:infra", "terse body");
+
+    const result = enrichTaskBody(
+      "terse body",
+      workdir,
+      enrichSpawn("QUESTIONS:\n1. Where?\n2. When?\n"),
+    );
+    expect(result.kind).toBe("questions");
+    const applied = applyEnrichment(db, tasksPath, eid, result);
+    expect(applied.kind).toBe("questions");
+
+    const row = db
+      .query(
+        "SELECT status, enrich_questions, body FROM tasks WHERE external_id = ?",
+      )
+      .get(eid) as any;
+    expect(row.status).toBe("draft");
+    expect(row.enrich_questions).toContain("1. Where?");
+    expect(row.body).toBe("terse body");
+    // TASKS.md untouched (no body rewrite happened on questions path)
+    expect(readFileSync(tasksPath, "utf8")).toContain(
+      "- [?] **any:infra** — terse body",
+    );
+    db.close();
+  });
+
+  test("enrich w/o questions: rewrites body, sets verify+judge, status stays draft", () => {
+    const db = memDb();
+    const tasksPath = join(workdir, "TASKS.md");
+    writeFileSync(
+      tasksPath,
+      [
+        "# Tasks",
+        "",
+        "## Pending",
+        "",
+        "- [?] **any:infra** — add tests",
+        "",
+        "## Done",
+        "",
+      ].join("\n"),
+    );
+    const { eid } = seedDraftRow(db, "any:infra", "add tests");
+
+    const fakeOutput = [
+      "Add unit tests for foo() in src/foo.ts. Acceptance:",
+      "- happy-path returns 42",
+      "- error path throws TypeError",
+      "",
+      "verify: bun test tests/foo.test.ts",
+      "judge: Were both code paths covered with assertions? PASS/FAIL.",
+    ].join("\n");
+    const result = enrichTaskBody(
+      "add tests",
+      workdir,
+      enrichSpawn(fakeOutput),
+    );
+    expect(result.kind).toBe("enriched");
+
+    const applied = applyEnrichment(db, tasksPath, eid, result);
+    expect(applied.kind).toBe("enriched");
+    const after = db
+      .query(
+        "SELECT status, body, verify_cmd, judge_cmd, enrich_questions FROM tasks WHERE id = (SELECT id FROM tasks WHERE repo = 'any:infra')",
+      )
+      .get() as any;
+    expect(after.status).toBe("draft"); // status untouched until promote
+    expect(after.body).toContain("happy-path returns 42");
+    expect(after.verify_cmd).toBe("bun test tests/foo.test.ts");
+    expect(after.judge_cmd).toBe(
+      "Were both code paths covered with assertions? PASS/FAIL.",
+    );
+    expect(after.enrich_questions).toBeNull();
+
+    const md = readFileSync(tasksPath, "utf8");
+    // Old terse body line is gone, replaced with the enriched body line under [?]
+    expect(md).not.toContain("- [?] **any:infra** — add tests\n");
+    expect(md).toMatch(/- \[\?\] \*\*any:infra\*\* — .*happy-path returns 42/);
+    expect(md).toContain("  verify: bun test tests/foo.test.ts");
+    expect(md).toContain(
+      "  judge: Were both code paths covered with assertions? PASS/FAIL.",
+    );
+    db.close();
+  });
+
+  test("promoteDraftToPending: draft → pending in DB and TASKS.md", () => {
+    const db = memDb();
+    const tasksPath = join(workdir, "TASKS.md");
+    writeFileSync(
+      tasksPath,
+      "# Tasks\n\n## Pending\n\n- [?] **any:infra** — promotable body\n\n## Done\n",
+    );
+    const { eid } = seedDraftRow(db, "any:infra", "promotable body");
+
+    const ok = promoteDraftToPending(db, tasksPath, eid);
+    expect(ok).toBe(true);
+
+    const row = db
+      .query("SELECT status FROM tasks WHERE external_id = ?")
+      .get(eid) as any;
+    expect(row.status).toBe("pending");
+    const after = readFileSync(tasksPath, "utf8");
+    expect(after).toContain("- [ ] **any:infra** — promotable body");
+    expect(after).not.toContain("- [?] **any:infra** — promotable body");
+
+    // Idempotent / no-op on a non-draft row
+    expect(promoteDraftToPending(db, tasksPath, eid)).toBe(false);
+    db.close();
+  });
+
+  // Regression: rewriteMdTaskStatus is the path `done` and `promote` both
+  // mutate TASKS.md through. It must take the same lockfile + atomic-rename
+  // pattern as appendTaskToPending so two concurrent flips don't clobber.
+  test("rewriteMdTaskStatus is race-safe under concurrent promote/done", async () => {
+    const tasksPath = join(workdir, "TASKS.md");
+    const N = 5;
+    const bodies = Array.from({ length: N }, (_, i) => `race-task-${i}`);
+    const seedLines = [
+      "# Tasks",
+      "",
+      "## Pending",
+      "",
+      ...bodies.map((b) => `- [?] **any:infra** — ${b}`),
+      "",
+      "## Done",
+      "",
+    ].join("\n");
+    writeFileSync(tasksPath, seedLines);
+    const corePath = join(import.meta.dir, "..", "src", "tasks-core.ts");
+    const helperPath = join(workdir, "race-promote.ts");
+    writeFileSync(
+      helperPath,
+      `import { rewriteMdTaskStatus } from ${JSON.stringify(corePath)};
+const [tasksPath, body] = process.argv.slice(2);
+rewriteMdTaskStatus(tasksPath, "any:infra", body, "pending");
+`,
+    );
+    const procs = bodies.map((b) =>
+      Bun.spawn(["bun", "run", helperPath, tasksPath, b], {
+        stdout: "pipe",
+        stderr: "pipe",
+      }),
+    );
+    await Promise.all(procs.map((p) => p.exited));
+    const after = readFileSync(tasksPath, "utf8");
+    // All N drafts must have flipped to pending — none lost to a clobber.
+    for (const b of bodies) {
+      expect(after).toContain(`- [ ] **any:infra** — ${b}`);
+      expect(after).not.toContain(`- [?] **any:infra** — ${b}`);
+    }
+    // Lockfile cleaned up.
+    expect(after.includes(".lock")).toBe(false);
+  });
+
+  // The atomic-rename path must preserve everything outside the rewritten task
+  // block — HTML comments, code fences, neighbouring tasks, headings.
+  test("enrich rewrite preserves HTML comments, code fences, and neighbouring tasks", () => {
+    const db = memDb();
+    const tasksPath = join(workdir, "TASKS.md");
+    const before = [
+      "# Queue",
+      "",
+      "<!-- Header note: do NOT delete; humans need this -->",
+      "",
+      "## Pending",
+      "",
+      "```md",
+      "- [ ] **fence:example** — example task inside a fence — must stay",
+      "```",
+      "",
+      "- [ ] **other** — neighbour pending task that must survive",
+      "- [?] **any:infra** — body to enrich",
+      "  judge: stale-leftover-judge-should-be-replaced",
+      "- [ ] **trailing** — another neighbour after the draft",
+      "",
+      "## Done",
+      "",
+    ].join("\n");
+    writeFileSync(tasksPath, before);
+    const { eid } = seedDraftRow(db, "any:infra", "body to enrich");
+
+    const out = [
+      "Elaborated body that explains the work in detail.",
+      "",
+      "verify: echo ok",
+      "judge: Did body get elaborated? PASS/FAIL.",
+    ].join("\n");
+    applyEnrichment(db, tasksPath, eid, parseEnrichResponse(out));
+
+    const after = readFileSync(tasksPath, "utf8");
+    // Preserved bits
+    expect(after).toContain(
+      "<!-- Header note: do NOT delete; humans need this -->",
+    );
+    expect(after).toContain("```md");
+    expect(after).toContain(
+      "- [ ] **fence:example** — example task inside a fence — must stay",
+    );
+    expect(after).toContain(
+      "- [ ] **other** — neighbour pending task that must survive",
+    );
+    expect(after).toContain(
+      "- [ ] **trailing** — another neighbour after the draft",
+    );
+    expect(after).toContain("## Pending");
+    expect(after).toContain("## Done");
+    // Rewritten bits
+    expect(after).toMatch(/- \[\?\] \*\*any:infra\*\* — .*Elaborated body/);
+    expect(after).toContain("  verify: echo ok");
+    expect(after).toContain("  judge: Did body get elaborated? PASS/FAIL.");
+    // Stale judge directive replaced (not duplicated)
+    expect(after).not.toContain("stale-leftover-judge-should-be-replaced");
+    // Lockfile cleaned up
+    expect(readFileSync(tasksPath, "utf8").includes(".lock")).toBe(false);
+    db.close();
   });
 });
