@@ -52,6 +52,12 @@ import {
 import { computeAlerts, type Alert } from "./alerts";
 import { AlertLane } from "./alert-lane";
 import {
+  buildCurrentTaskInfo,
+  CurrentTaskCard,
+  IdleBanner,
+  latestCommitSinceClaim,
+} from "./current-task-card";
+import {
   eventsAgeSec,
   findLoopCurrentTask,
   probeClaudeInfo,
@@ -490,20 +496,28 @@ export function App() {
             focused={focus === "sessions"}
             now={now}
           />
-          <ClaimsPanel
-            rows={filtered.claims}
-            selected={selected.claims}
-            focused={focus === "claims"}
-            now={now}
-          />
+          {renderCurrentTaskArea(
+            snap,
+            filtered.claims,
+            now,
+            focus === "claims",
+          )}
         </Box>
         <Box flexDirection="column" flexGrow={1}>
+          {/* §3: TasksPanel gets pending + done so it can render the
+              priority-grouped pending list ([H]/[N]/[L]) and the recent-done
+              rows with verify/judge badges (✓V ✓J / ✓V — / ⊘ / ⚠). The ⚠ juks
+              badge fires when verify_cmd is set but verify_ran_at is null —
+              same signal the alert lane uses, surfaced inline here. */}
           <TasksPanel
             latest={filtered.tasks}
             counts={snap.tasks.counts}
             selected={selected.tasks}
             focused={focus === "tasks"}
             expandedOriginals={expandedOriginals}
+            pending={snap.tasks.pending}
+            done={snap.tasks.done}
+            now={now}
           />
           <EventsPanel
             rows={filtered.events}
@@ -651,6 +665,45 @@ export function App() {
       )}
     </Box>
   );
+}
+
+// ── current-task area (§2 of docs/tui-ux-v2.md) ──────────────────────────────
+
+// Pick the most-recent claimed task + its matching claim row and render the
+// CurrentTaskCard. Falls back to the IdleBanner ("— idle (queue: N pending)
+// —") when nothing is claimed. Kept inline in tui.tsx because it needs the
+// live Snapshot + filtered claim list on every tick.
+function renderCurrentTaskArea(
+  snap: Snapshot,
+  claims: ClaimRow[],
+  now: number,
+  focused: boolean,
+): React.ReactElement {
+  const task = snap.tasks.claimed[0] ?? null;
+  if (!task) {
+    return <IdleBanner pendingCount={snap.tasks.counts.pending} />;
+  }
+  // Pair the task with a claim — tasks.claimed_by encodes a PPID
+  // (`pid_…` / `term_…_…`) while claims.session_id is a Claude UUID, so we
+  // match by cwd basename and fall back to the newest live claim.
+  const claim =
+    claims.find(
+      (c) => c.holder_cwd && task.repo.endsWith(basename(c.holder_cwd)),
+    ) ??
+    claims[0] ??
+    null;
+  const commit = latestCommitSinceClaim(
+    task.claimed_at,
+    claim?.holder_cwd ?? null,
+  );
+  const info = buildCurrentTaskInfo({
+    task,
+    claim,
+    events: snap.events,
+    now,
+    commit,
+  });
+  return <CurrentTaskCard info={info} focused={focused} />;
 }
 
 // ── logo ──────────────────────────────────────────────────────────────────────
