@@ -104,6 +104,9 @@ switch (cmd) {
   case "tui":
     runTui();
     break;
+  case "uninstall":
+    runUninstall();
+    break;
   default:
     console.error(
       "usage: batonq\n" +
@@ -111,7 +114,8 @@ switch (cmd) {
         "  Measurement:   tail [-n N] | report [--since ISO] [--until ISO] [--json]\n" +
         "  Tasks:         sync-tasks | pick | mine | done [<id>] | abandon [<id>] | tasks\n" +
         "  Drafts:        enrich <id> | promote <id>\n" +
-        "  Dashboard:     tui"
+        "  Dashboard:     tui\n" +
+        "  Exit:          uninstall [--remove-state|--keep-state]"
     );
     process.exit(2);
 }
@@ -119,6 +123,37 @@ switch (cmd) {
 function runTui(): void {
   const here = new URL("./tui.tsx", import.meta.url).pathname;
   const r = spawnSync("bun", ["run", here], { stdio: "inherit" });
+  process.exit(r.status ?? 0);
+}
+
+// `uninstall` delegates to uninstall.sh so install and uninstall share one
+// source of truth for bindir layout and the settings.json hook filter.
+// Resolution order:
+//   1. $BATONQ_UNINSTALL_SCRIPT (tests, vendored installs)
+//   2. ../uninstall.sh relative to this module (dev checkout)
+//   3. curl-pipe the script from GitHub (installed binary — no local repo)
+function runUninstall(): void {
+  const extraArgs = process.argv.slice(3);
+  const override = process.env.BATONQ_UNINSTALL_SCRIPT;
+  if (override && existsSync(override)) {
+    const r = spawnSync("sh", [override, ...extraArgs], { stdio: "inherit" });
+    process.exit(r.status ?? 0);
+  }
+  const local = new URL("../uninstall.sh", import.meta.url).pathname;
+  if (existsSync(local)) {
+    const r = spawnSync("sh", [local, ...extraArgs], { stdio: "inherit" });
+    process.exit(r.status ?? 0);
+  }
+  console.log("Running remote uninstaller from GitHub…");
+  const args = extraArgs.length > 0 ? ` ${extraArgs.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ")}` : "";
+  const r = spawnSync(
+    "sh",
+    [
+      "-c",
+      `curl -fsSL https://raw.githubusercontent.com/Salberg87/batonq/main/uninstall.sh | sh -s --${args}`,
+    ],
+    { stdio: "inherit" }
+  );
   process.exit(r.status ?? 0);
 }
 

@@ -2050,3 +2050,114 @@ describe("migrate (agent-coord → batonq)", () => {
     }
   });
 });
+
+// ── uninstall.sh ──────────────────────────────────────────────────────────────
+//
+// The uninstaller is the exit-plan half of install.sh: removes binaries, strips
+// the three batonq hook blocks from settings.json, and optionally removes state
+// after an interactive confirm. Default for state is preserve — a reinstall
+// picks up where the user left off.
+
+describe("uninstall.sh", () => {
+  const UNINSTALL = join(REPO_ROOT, "uninstall.sh");
+
+  test("passes `sh -n` syntax check", () => {
+    const r = spawnSync("sh", ["-n", UNINSTALL], { encoding: "utf8" });
+    expect(r.status).toBe(0);
+    expect(r.stderr ?? "").toBe("");
+  });
+
+  test("non-interactive stdin defaults to 'keep state' — state files survive", () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "batonq-uninstall-"));
+    try {
+      const claude = join(fakeHome, ".claude");
+      mkdirSync(claude, { recursive: true });
+
+      // Seed the three state artefacts install.sh / the hook would create.
+      const stateDb = join(claude, "batonq-state.db");
+      const measurement = join(claude, "batonq-measurement");
+      const fingerprint = join(claude, "batonq-fingerprint.json");
+      writeFileSync(stateDb, "fake-db");
+      mkdirSync(measurement, { recursive: true });
+      writeFileSync(join(measurement, "events.jsonl"), '{"ts":"seed"}\n');
+      writeFileSync(fingerprint, "{}");
+
+      // settings.json with one batonq hook AND one unrelated hook. The
+      // uninstaller must strip the batonq entry and leave the other alone.
+      const settings = join(claude, "settings.json");
+      writeFileSync(
+        settings,
+        JSON.stringify(
+          {
+            hooks: {
+              PreToolUse: [
+                {
+                  matcher: "Read|Edit|Write|MultiEdit",
+                  hooks: [
+                    {
+                      type: "command",
+                      command: "/usr/local/bin/batonq-hook pre",
+                      timeout: 2,
+                    },
+                  ],
+                },
+                {
+                  matcher: "Read",
+                  hooks: [
+                    {
+                      type: "command",
+                      command: "/usr/local/bin/my-other-hook",
+                      timeout: 2,
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+          null,
+          2,
+        ),
+      );
+
+      // Mock stdin: pipe empty input, which is also non-TTY → script takes
+      // the `[ ! -t 0 ]` branch and defaults to keep without prompting.
+      const r = spawnSync("sh", [UNINSTALL], {
+        env: { ...process.env, HOME: fakeHome, PATH: process.env.PATH ?? "" },
+        input: "",
+        encoding: "utf8",
+      });
+      expect(r.status).toBe(0);
+
+      // 1. State files are still there — the "no" default held.
+      expect(existsSync(stateDb)).toBe(true);
+      expect(existsSync(measurement)).toBe(true);
+      expect(existsSync(fingerprint)).toBe(true);
+
+      // 2. settings.json was rewritten: batonq hook gone, other hook preserved.
+      const cfg = JSON.parse(readFileSync(settings, "utf8"));
+      const pre = cfg.hooks?.PreToolUse ?? [];
+      const hasBatonq = pre.some((b: any) =>
+        (b.hooks ?? []).some(
+          (h: any) =>
+            typeof h.command === "string" &&
+            /batonq-hook|agent-coord-hook/.test(h.command),
+        ),
+      );
+      const hasOther = pre.some((b: any) =>
+        (b.hooks ?? []).some(
+          (h: any) =>
+            typeof h.command === "string" &&
+            h.command.includes("my-other-hook"),
+        ),
+      );
+      expect(hasBatonq).toBe(false);
+      expect(hasOther).toBe(true);
+
+      // 3. The script announced that it kept state (signal to the user).
+      const out = (r.stdout ?? "") + (r.stderr ?? "");
+      expect(out).toMatch(/keeping state|state preserved/i);
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+});

@@ -80,6 +80,22 @@ install -m 0755 src/agent-coord-loop ~/.local/bin/batonq-loop
 
 Requires [Bun](https://bun.sh) ≥ 1.0 and `jq` (for the hooks merge).
 
+**Uninstall (if you change your mind):**
+
+```sh
+batonq uninstall
+# or, without batonq on PATH:
+curl -fsSL https://raw.githubusercontent.com/Salberg87/batonq/main/uninstall.sh | sh
+```
+
+The uninstaller removes the batonq binaries from `~/.local/bin/` (or `~/bin/`)
+and strips the three hook blocks from `~/.claude/settings.json` via `jq`, so
+unrelated hooks survive. It then asks whether to delete state
+(`~/.claude/batonq-state.db`, `batonq-measurement/`, `batonq-fingerprint.json`).
+The default is **no** — data is kept so a later reinstall picks up where you
+left off. Pass `--remove-state` (or `-y`) to delete without prompting, or
+`--keep-state` to skip the prompt non-interactively.
+
 ## Quickstart
 
 **1. Write a task to `~/DEV/TASKS.md`:**
