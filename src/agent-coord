@@ -43,6 +43,11 @@ import {
 } from "./migrate-path";
 import { parseTaskInput } from "./task-schema";
 import { ZodError } from "zod";
+// Static import so `bun build --compile` inlines the version into the binary.
+// At dev-runtime bun resolves it from disk; at compile-time the bundler
+// embeds the JSON, so installed binaries report a real version even though
+// no package.json sits next to them on the user's filesystem.
+import pkgJson from "../package.json";
 
 const HOME = homedir();
 const LOG_DIR = `${HOME}/.claude/batonq-measurement`;
@@ -78,7 +83,7 @@ switch (cmd) {
   case "version":
     printVersion();
     break;
-  case "init":
+  case 'init':
     initCmd();
     break;
   case "check":
@@ -506,13 +511,13 @@ function promptYesNo(question: string, def: boolean): boolean {
 // ── version ───────────────────────────────────────────────────────────────────
 
 function printVersion(): void {
-  const pkgPath = new URL("../package.json", import.meta.url).pathname;
-  let version = "unknown";
-  try {
-    version = JSON.parse(readFileSync(pkgPath, "utf8")).version ?? "unknown";
-  } catch {
-    // keep "unknown"
-  }
+  // pkgJson is statically imported (top of file) so the bundler inlines it.
+  // The previous implementation read package.json via import.meta.url, which
+  // resolves to /$bunfs/root/ inside a `bun build --compile` binary — the
+  // file is not on disk there, so installed binaries always printed
+  // "vunknown". Static import works in both dev (bun run) and compiled mode.
+  const version =
+    (pkgJson as { version?: string }).version ?? "unknown";
   let commit = "unknown";
   try {
     commit = execSync("git rev-parse --short HEAD", {
