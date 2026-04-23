@@ -27,20 +27,35 @@ import {
   type ParsedTask,
 } from "./tasks-core";
 import { migrate } from "./migrate";
+import {
+  canonicalDbPath,
+  canonicalDbDir,
+  legacySources,
+  migratePath,
+} from "./migrate-path";
+import { parseTaskInput } from "./task-schema";
+import { ZodError } from "zod";
 
 const HOME = homedir();
 const LOG_DIR = `${HOME}/.claude/batonq-measurement`;
 const LOG_PATH = `${LOG_DIR}/events.jsonl`;
-const DB_PATH = `${HOME}/.claude/batonq-state.db`;
+const DB_DIR = canonicalDbDir(HOME);
+const DB_PATH = canonicalDbPath(HOME);
 const HOOK_PATH = `${HOME}/bin/batonq-hook`;
 const SETTINGS_PATH = `${HOME}/.claude/settings.json`;
 const TASKS_PATH = `${HOME}/DEV/TASKS.md`;
 const LOOP_LOG_GLOB = "/tmp/batonq-loop*.log";
 const LOGS_POLL_MS = 500;
 
-// One-shot rename migration from legacy `.claude/agent-coord-*` layout.
-// No-op on fresh installs and after the first successful migration.
-// Runs before any command dispatch so every entry point sees the new paths.
+// Two-stage rename migration. migratePath() handles the DB → canonical
+// `${HOME}/.claude/batonq/state.db` move from either legacy source; migrate()
+// handles the fingerprint + measurement-dir rename (agent-coord → batonq).
+// Both are idempotent and best-effort.
+try {
+  migratePath();
+} catch {
+  // migration is best-effort; never block the CLI
+}
 try {
   migrate();
 } catch {
@@ -544,6 +559,87 @@ function doctor(): void {
       );
     } finally {
       db?.close();
+    }
+  }
+
+  // Path consistency: the rename bug left three DB files under `.claude/`.
+  // Any legacy source still present after canonical-path install is a signal
+  // that an older binary is still in the PATH writing to the stale file.
+  const stray: string[] = [];
+  for (const legacy of legacySources(HOME)) {
+    if (existsSync(legacy)) stray.push(legacy);
+  }
+  if (stray.length === 0) {
+    add("State", `DB path consistency: canonical ${DB_PATH} only`, "pass");
+  } else {
+    add(
+      "State",
+      `stale legacy DB(s) present: ${stray.join(", ")}`,
+      "warn",
+      `re-run install.sh to overwrite any stale binaries, then run 'batonq' once — migrate-path will back them up as *.legacy.bak`
+    );
+  }
+
+  // Schema integrity: run the strict Zod schema across every task row. Rows
+  // that fail are counted but not listed individually (a broken TASKS.md
+  // parser can easily flag hundreds at once — listing them drowns out the
+  // rest of the doctor report).
+  if (existsSync(DB_PATH)) {
+    let schemaDb: Database | null = null;
+    try {
+      schemaDb = new Database(DB_PATH, { readonly: true });
+      schemaDb.exec("PRAGMA busy_timeout=3000;");
+      const rows = schemaDb
+        .query(
+          `SELECT external_id, repo, body, status, priority, scheduled_for,
+                  verify_cmd AS verify, judge_cmd AS judge
+           FROM tasks`,
+        )
+        .all() as Array<Record<string, unknown>>;
+      let invalid = 0;
+      for (const r of rows) {
+        // Skip null/undefined optionals so the schema's .optional() branches
+        // apply instead of tripping on "not a string".
+        const input: Record<string, unknown> = {
+          external_id: r.external_id,
+          repo: r.repo,
+          body: r.body,
+          status: r.status,
+          priority: r.priority ?? "normal",
+        };
+        if (r.scheduled_for != null) input.scheduled_for = r.scheduled_for;
+        if (r.verify != null) input.verify = r.verify;
+        if (r.judge != null) input.judge = r.judge;
+        try {
+          parseTaskInput(input);
+        } catch (e) {
+          if (e instanceof ZodError) invalid++;
+        }
+      }
+      if (rows.length === 0) {
+        add("State", `schema integrity: 0 tasks to validate`, "pass");
+      } else if (invalid === 0) {
+        add(
+          "State",
+          `schema integrity: ${rows.length}/${rows.length} task(s) valid`,
+          "pass",
+        );
+      } else {
+        add(
+          "State",
+          `schema integrity: ${invalid}/${rows.length} task(s) fail Zod validation`,
+          "warn",
+          `inspect TASKS.md for short bodies, bad priority/status, or verify/judge stubs; re-sync with 'batonq sync-tasks'`,
+        );
+      }
+    } catch (e: any) {
+      add(
+        "State",
+        `schema integrity: could not scan tasks: ${e.message}`,
+        "warn",
+      );
+    } finally {
+      schemaDb?.close();
     }
   }
 
@@ -1080,6 +1176,10 @@ function parseTasksFile(): { lines: string[]; tasks: ParsedTask[] } {
 }
 
 function openTaskDb(): Database {
+  // DB_PATH is directory-based; ensure the parent dir exists before bun:sqlite
+  // tries to create the file. mkdirSync is a no-op when the dir already exists
+  // so callers don't need to gate on existsSync.
+  mkdirSync(DB_DIR, { recursive: true });
   const db = new Database(DB_PATH, { create: true });
   db.exec("PRAGMA busy_timeout=3000;");
   initTaskSchema(db);

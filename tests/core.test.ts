@@ -1570,7 +1570,7 @@ describe("sweepTasks (task-claim TTL)", () => {
       ].join("\n"),
     );
 
-    const dbPath = join(fakeHome, ".claude", "batonq-state.db");
+    const dbPath = join(fakeHome, ".claude", "batonq", "state.db");
     try {
       // First: sync populates the DB with the pending task, then we mutate
       // it to a stale claimed state and watch `pick` sweep it.
@@ -1894,7 +1894,9 @@ describe("batonq doctor", () => {
       expect(measurementAfter).toBe(measurementBefore);
 
       // Doctor never lazy-creates state.db — that's the hook's job.
-      expect(existsSync(join(home, ".claude", "batonq-state.db"))).toBe(false);
+      expect(existsSync(join(home, ".claude", "batonq", "state.db"))).toBe(
+        false,
+      );
 
       expect(r1.status).toBe(r2.status);
     } finally {

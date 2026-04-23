@@ -23,6 +23,9 @@ TMP_DIR="/tmp/${NAME}-install"
 CLAUDE_DIR="${HOME}/.claude"
 SETTINGS="${CLAUDE_DIR}/settings.json"
 MEASUREMENT_DIR="${CLAUDE_DIR}/batonq-measurement"
+STATE_DIR="${CLAUDE_DIR}/batonq"
+STATE_DB="${STATE_DIR}/state.db"
+LEGACY_DBS="${CLAUDE_DIR}/agent-coord-state.db ${CLAUDE_DIR}/batonq-state.db"
 
 # ── Pretty output ─────────────────────────────────────────────────────────────
 
@@ -116,10 +119,13 @@ install_bins() {
 
   # Map src file → installed name (matches README install instructions).
   # We install the src/* scripts directly (they are self-contained bun scripts).
+  # ALWAYS overwrite — on upgrades users routinely end up with stale binaries
+  # at the legacy `agent-coord` name pointing at old DB paths. Refusing to
+  # overwrite would re-create the three-DBs-in-one-dir bug the rename fixed.
   install_one() {
     from="$1"; to="$2"
     [ -f "${from}" ] || fail "Missing source file: ${from}"
-    cp "${from}" "${to}"
+    cp -f "${from}" "${to}"
     chmod +x "${to}"
     ok "Installed ${to}"
   }
@@ -128,6 +134,13 @@ install_bins() {
   install_one "${src}/agent-coord-hook"          "${bindir}/${NAME}-hook"
   install_one "${src}/agent-coord-loop"          "${bindir}/${NAME}-loop"
   install_one "${src}/agent-coord-loop-watchdog" "${bindir}/${NAME}-loop-watchdog"
+
+  # Legacy-name aliases so existing scripts, docs, and muscle memory keep
+  # working AND so any stale `agent-coord` binary from a pre-rename install
+  # is overwritten to point at the new canonical DB path.
+  install_one "${src}/agent-coord"               "${bindir}/agent-coord"
+  install_one "${src}/agent-coord-hook"          "${bindir}/agent-coord-hook"
+  install_one "${src}/agent-coord-loop"          "${bindir}/agent-coord-loop"
 }
 
 # ── Step 5: merge hooks into ~/.claude/settings.json ──────────────────────────
@@ -208,7 +221,32 @@ create_state_dirs() {
   chmod 0700 "${CLAUDE_DIR}" 2>/dev/null || :
   mkdir -p "${MEASUREMENT_DIR}"
   chmod 0700 "${MEASUREMENT_DIR}" 2>/dev/null || :
-  ok "State directories ready (${CLAUDE_DIR}, ${MEASUREMENT_DIR})"
+  # Canonical state dir (dir-based so future files live alongside state.db).
+  mkdir -p "${STATE_DIR}"
+  chmod 0700 "${STATE_DIR}" 2>/dev/null || :
+  ok "State directories ready (${CLAUDE_DIR}, ${STATE_DIR}, ${MEASUREMENT_DIR})"
+}
+
+# ── Step 6b: post-install DB path consistency ─────────────────────────────────
+#
+# After binaries are in place, warn loudly if legacy DB files still sit at the
+# old flat paths. The binary auto-migrates on next invocation (migrate-path),
+# but surfacing it here means the user knows to expect a migration line instead
+# of thinking their state got lost.
+
+verify_db_paths() {
+  any_legacy=0
+  for legacy in ${LEGACY_DBS}; do
+    if [ -f "${legacy}" ]; then
+      any_legacy=1
+      warn "Legacy DB present: ${legacy}"
+    fi
+  done
+  if [ "${any_legacy}" = "1" ]; then
+    warn "Canonical target is ${STATE_DB}. Run '${NAME} doctor' after the next tool call — migrate-path will have moved data and backed up originals as *.legacy.bak."
+  else
+    ok "DB path consistency: no legacy DBs found (canonical: ${STATE_DB})"
+  fi
 }
 
 # ── Step 7: done ──────────────────────────────────────────────────────────────
@@ -265,6 +303,7 @@ main() {
   install_bins    "${bindir}"
   merge_settings  "${bindir}"
   create_state_dirs
+  verify_db_paths
   print_success   "${bindir}"
 }
 

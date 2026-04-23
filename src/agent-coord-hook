@@ -20,18 +20,25 @@ import { isAbsolute, resolve, basename } from "node:path";
 import { homedir } from "node:os";
 import { hashFile, extractBashPaths, DESTRUCTIVE, MAX_HASH_BYTES } from "./hook-core";
 import { migrate } from "./migrate";
+import { migratePath, canonicalDbPath, canonicalDbDir } from "./migrate-path";
 
 const MODE = process.argv[2]; // pre | post | bash
 const HOME = homedir();
 const LOG_DIR = `${HOME}/.claude/batonq-measurement`;
 const LOG_PATH = `${LOG_DIR}/events.jsonl`;
-const DB_PATH = `${HOME}/.claude/batonq-state.db`;
+const DB_DIR = canonicalDbDir(HOME);
+const DB_PATH = canonicalDbPath(HOME);
 const SCOPE_PREFIXES = [`${HOME}/DEV/`, `${HOME}/dev/`];
 const TTL_MS = 10 * 60_000; // 10 min heartbeat window
 
-// One-shot rename of legacy `.claude/agent-coord-*` state. No-op on fresh
-// installs and after migration completes. Runs silently here because hook
-// stdout is consumed by Claude Code; the CLI entry prints the success line.
+// Two-stage legacy migration: DB to canonical dir-based path, then
+// fingerprint/measurement rename. Silent in hook context — stdout is
+// reserved for the hookSpecificOutput JSON protocol.
+try {
+  migratePath({ silent: true });
+} catch {
+  // hook discipline: never throw
+}
 try {
   migrate({ silent: true });
 } catch {
@@ -128,6 +135,10 @@ function uuidv7(): string {
 // ── SQLite setup ───────────────────────────────────────────────────────────────
 
 function openDb(): Database {
+  // Dir-based canonical path: ensure parent exists before bun:sqlite creates
+  // the file. Cheaper than a gate on existsSync — mkdirSync with recursive
+  // is a no-op when the dir is already present.
+  mkdirSync(DB_DIR, { recursive: true });
   const db = new Database(DB_PATH, { create: true });
   db.exec(`
     PRAGMA journal_mode=WAL;

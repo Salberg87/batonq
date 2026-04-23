@@ -281,12 +281,18 @@ export function latestTasks(tasks: TaskRow[], n: number = 5): TaskRow[] {
 
 // ── paths ─────────────────────────────────────────────────────────────────────
 
-export const DEFAULT_DB_PATH = `${process.env.HOME ?? ""}/.claude/batonq-state.db`;
+export const DEFAULT_DB_PATH = `${process.env.HOME ?? ""}/.claude/batonq/state.db`;
 export const DEFAULT_EVENTS_PATH = `${process.env.HOME ?? ""}/.claude/batonq-measurement/events.jsonl`;
 
 export function openStateDb(path: string = DEFAULT_DB_PATH): Database {
   if (!existsSync(path)) {
-    // Create with minimal schema so TUI doesn't crash on fresh install.
+    // Create parent dir (canonical path is directory-based) then let
+    // bun:sqlite create the file. Minimal schema so the TUI doesn't crash
+    // on fresh installs.
+    const dir = path.replace(/\/[^/]+$/, "");
+    if (dir && !existsSync(dir)) {
+      require("node:fs").mkdirSync(dir, { recursive: true });
+    }
     const db = new Database(path, { create: true });
     db.exec("PRAGMA busy_timeout=3000;");
     db.exec(`
