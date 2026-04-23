@@ -43,14 +43,15 @@ import {
 import {
   C,
   ClaimsPanel,
-  EventsPanel,
   HelpOverlay,
+  LiveFeedPanel,
   LoopStatusFooter,
   SessionsPanel,
   TasksPanel,
 } from "./tui-panels";
 import { computeAlerts, type Alert } from "./alerts";
 import { AlertLane } from "./alert-lane";
+import { buildDrillDownView, DrillDownOverlay } from "./drill-down";
 import {
   buildCurrentTaskInfo,
   CurrentTaskCard,
@@ -64,11 +65,33 @@ import {
   probeLoopPid,
   type LoopStatus,
 } from "./loop-status";
+import {
+  DEFAULT_LOOP_GLOB,
+  FEED_POLL_MS,
+  feedReducer,
+  INITIAL_FEED_STATE,
+  LIVE_FEED_MAX_LINES,
+  mergeFeed,
+  newestLoopLogPath,
+  readEventsFeed,
+  readGitCommitsFeed,
+  readLoopFeed,
+  type FeedAction,
+  type FeedRecord,
+  type FeedState,
+} from "./live-feed";
 
 type PanelKey = "sessions" | "tasks" | "claims" | "events";
 const PANELS: PanelKey[] = ["sessions", "tasks", "claims", "events"];
 
-type Mode = "normal" | "filter" | "help" | "confirm" | "add-task" | "questions";
+type Mode =
+  | "normal"
+  | "filter"
+  | "help"
+  | "confirm"
+  | "add-task"
+  | "questions"
+  | "drill-down";
 type ConfirmAction =
   | { kind: "abandon"; task: TaskRow }
   | { kind: "release"; claim: ClaimRow }
@@ -93,6 +116,42 @@ function useTick(ms: number): { now: number; bump: () => void } {
     return () => clearInterval(id);
   }, [ms]);
   return { now: t, bump: () => setT(Date.now()) };
+}
+
+// useLiveFeed — polls the three feed sources every FEED_POLL_MS and returns
+// the merged, trimmed buffer. `claimCwds` is the list of holder_cwd values
+// from active claims, used to locate git repos for the [git] source. We
+// pass the array through useMemo so the polling effect only re-subscribes
+// when the set of cwds actually changes.
+function useLiveFeed(claimCwds: string[]): FeedRecord[] {
+  const [records, setRecords] = useState<FeedRecord[]>([]);
+  const cwdKey = claimCwds.join("|");
+  useEffect(() => {
+    let cancelled = false;
+    const poll = () => {
+      if (cancelled) return;
+      try {
+        const loopPath = newestLoopLogPath(DEFAULT_LOOP_GLOB);
+        const loop = readLoopFeed(loopPath, LIVE_FEED_MAX_LINES);
+        const evt = readEventsFeed(DEFAULT_EVENTS_PATH, LIVE_FEED_MAX_LINES);
+        // Bound the git window to the last hour — a TUI feed shouldn't show
+        // ancient commits, and --since keeps `git log` fast on big repos.
+        const sinceMs = Date.now() - 60 * 60 * 1000;
+        const git = readGitCommitsFeed(claimCwds, sinceMs, 5);
+        const merged = mergeFeed([loop, evt, git], LIVE_FEED_MAX_LINES);
+        if (!cancelled) setRecords(merged);
+      } catch {
+        // Keep the previous records on transient errors.
+      }
+    };
+    poll();
+    const id = setInterval(poll, FEED_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [cwdKey]);
+  return records;
 }
 
 function useSnapshot(now: number): Snapshot | null {
@@ -215,6 +274,22 @@ export function App() {
   const [expandedOriginals, setExpandedOriginals] = useState<Set<string>>(
     () => new Set(),
   );
+  const [drillDownTask, setDrillDownTask] = useState<TaskRow | null>(null);
+  const [feedState, setFeedState] = useState<FeedState>(INITIAL_FEED_STATE);
+
+  // Pull the live set of claim-holder cwds off the snapshot so the feed's
+  // git source knows which repos to poll. Memoized so new snapshot objects
+  // with the same cwd set don't thrash the feed polling effect.
+  const claimCwds = useMemo(() => {
+    if (!snap) return [] as string[];
+    const cwds = snap.claims
+      .map((c) => c.holder_cwd ?? null)
+      .filter((c): c is string => !!c);
+    return Array.from(new Set(cwds));
+  }, [snap]);
+  const feedRecords = useLiveFeed(claimCwds);
+  const dispatchFeed = (action: FeedAction) =>
+    setFeedState((s) => feedReducer(s, action, feedRecords.length));
 
   const filtered = useMemo(() => {
     if (!snap) return null;
@@ -232,12 +307,75 @@ export function App() {
     return () => clearTimeout(id);
   }, [flash]);
 
+  // Shared enrich trigger — used by the normal-mode `e` keybind and the
+  // drill-down overlay's `e` callback. Mirrors the original inline logic:
+  // open questions overlay if answers already stored, otherwise spawn
+  // `batonq enrich` and flash progress.
+  function triggerEnrich(t: TaskRow): void {
+    if (t.status !== "draft") {
+      setFlash({ msg: "'e' only works on draft tasks", color: C.warn });
+      return;
+    }
+    if (t.enrich_questions) {
+      const qs = parseQuestions(t.enrich_questions);
+      if (qs.length === 0) {
+        setFlash({
+          msg: "draft has unparseable questions — re-run enrich",
+          color: C.warn,
+        });
+        return;
+      }
+      setQuestionsPending({ eid: t.external_id, questions: qs });
+      setMode("questions");
+      return;
+    }
+    if (enrichingEid) {
+      setFlash({
+        msg: `already enriching ${enrichingEid.slice(0, 8)}`,
+        color: C.warn,
+      });
+      return;
+    }
+    setEnrichingEid(t.external_id);
+    setFlash({
+      msg: `→ enriching ${t.external_id.slice(0, 8)} (claude --model opus)…`,
+      color: C.brand,
+    });
+    runEnrichAsync(t.external_id)
+      .then((res) => {
+        setEnrichingEid(null);
+        forceRefresh();
+        if (res.kind === "error") {
+          setFlash({ msg: `enrich failed: ${res.error}`, color: C.err });
+          return;
+        }
+        if (res.kind === "questions") {
+          setFlash({
+            msg: `↯ questions stored on ${res.newEid.slice(0, 8)} — press e to answer`,
+            color: C.warn,
+          });
+          return;
+        }
+        setFlash({
+          msg: `✓ enriched → ${res.newEid.slice(0, 8)} (p promote, o see original)`,
+          color: C.ok,
+        });
+      })
+      .catch((e: any) => {
+        setEnrichingEid(null);
+        setFlash({
+          msg: `enrich error: ${e?.message ?? String(e)}`,
+          color: C.err,
+        });
+      });
+  }
+
   useInput((input, key) => {
     if (mode === "help") {
       setMode("normal");
       return;
     }
-    if (mode === "add-task" || mode === "questions") {
+    if (mode === "add-task" || mode === "questions" || mode === "drill-down") {
       // Keys in these modes are handled by the embedded form/overlay.
       return;
     }
@@ -293,6 +431,14 @@ export function App() {
       return;
     }
     if (input === "j" || key.downArrow) {
+      // While the Live feed is focused, ↓ scrolls the feed forward (toward
+      // the tail). If we're at the bottom and not paused, this is a no-op —
+      // feedReducer ignores scroll-down unless already paused, matching the
+      // "arrow pauses, End resumes" contract.
+      if (focus === "events") {
+        dispatchFeed({ kind: "scroll-down" });
+        return;
+      }
       setSelected((s) => ({
         ...s,
         [focus]: Math.min(
@@ -303,7 +449,43 @@ export function App() {
       return;
     }
     if (input === "k" || key.upArrow) {
+      // Live-feed focus: ↑ scrolls back and auto-pauses auto-scroll (§4).
+      // The scroll-back puts a ⏸ marker above the feed; 'End' resumes.
+      if (focus === "events") {
+        dispatchFeed({ kind: "scroll-up" });
+        return;
+      }
       setSelected((s) => ({ ...s, [focus]: Math.max(0, s[focus] - 1) }));
+      return;
+    }
+    // 'End' / F work regardless of focus so the operator can resume or pause
+    // the feed without first Tab-cycling to it.
+    if (key.escape && focus === "events" && feedState.paused) {
+      // Bonus: Esc resumes when the feed is paused and focused. Keeps Esc's
+      // "back out" semantic consistent (matches Drill-down's Esc → close).
+      dispatchFeed({ kind: "end" });
+      return;
+    }
+    if (input === "F") {
+      dispatchFeed({ kind: "toggle-pause" });
+      return;
+    }
+    // ink's `useInput` surfaces the End key via the synthetic `key.end` flag
+    // on newer versions; we guard for both name shapes to stay robust.
+    if ((key as any).end || input === "[F" || input === "[4~") {
+      dispatchFeed({ kind: "end" });
+      return;
+    }
+    if (key.return) {
+      // Enter on a Tasks-panel row opens the drill-down overlay (§5 of
+      // docs/tui-ux-v2.md). Other panels ignore Enter for now.
+      if (focus === "tasks") {
+        const t = filtered?.tasks[selected.tasks];
+        if (t) {
+          setDrillDownTask(t);
+          setMode("drill-down");
+        }
+      }
       return;
     }
     if (input === "/") {
@@ -359,65 +541,7 @@ export function App() {
         setFlash({ msg: "no task selected", color: C.warn });
         return;
       }
-      if (t.status !== "draft") {
-        setFlash({ msg: "'e' only works on draft tasks", color: C.warn });
-        return;
-      }
-      if (t.enrich_questions) {
-        // Stored questions from a prior enrich — open overlay without
-        // re-spawning claude. Saves a round-trip AND keeps the test path
-        // deterministic when DB is pre-seeded.
-        const qs = parseQuestions(t.enrich_questions);
-        if (qs.length === 0) {
-          setFlash({
-            msg: "draft has unparseable questions — re-run enrich",
-            color: C.warn,
-          });
-          return;
-        }
-        setQuestionsPending({ eid: t.external_id, questions: qs });
-        setMode("questions");
-        return;
-      }
-      if (enrichingEid) {
-        setFlash({
-          msg: `already enriching ${enrichingEid.slice(0, 8)}`,
-          color: C.warn,
-        });
-        return;
-      }
-      setEnrichingEid(t.external_id);
-      setFlash({
-        msg: `→ enriching ${t.external_id.slice(0, 8)} (claude --model opus)…`,
-        color: C.brand,
-      });
-      runEnrichAsync(t.external_id)
-        .then((res) => {
-          setEnrichingEid(null);
-          forceRefresh();
-          if (res.kind === "error") {
-            setFlash({ msg: `enrich failed: ${res.error}`, color: C.err });
-            return;
-          }
-          if (res.kind === "questions") {
-            setFlash({
-              msg: `↯ questions stored on ${res.newEid.slice(0, 8)} — press e to answer`,
-              color: C.warn,
-            });
-            return;
-          }
-          setFlash({
-            msg: `✓ enriched → ${res.newEid.slice(0, 8)} (p promote, o see original)`,
-            color: C.ok,
-          });
-        })
-        .catch((e: any) => {
-          setEnrichingEid(null);
-          setFlash({
-            msg: `enrich error: ${e?.message ?? String(e)}`,
-            color: C.err,
-          });
-        });
+      triggerEnrich(t);
       return;
     }
     if (input === "p") {
@@ -519,11 +643,13 @@ export function App() {
             done={snap.tasks.done}
             now={now}
           />
-          <EventsPanel
-            rows={filtered.events}
-            selected={selected.events}
+          {/* §4: Live feed replaces the old EventsPanel. The focus key
+              stays "events" to preserve Tab-cycling (sessions→tasks→claims
+              →feed) and the selected/filter records. */}
+          <LiveFeedPanel
+            records={feedRecords}
+            state={feedState}
             focused={focus === "events"}
-            now={now}
           />
         </Box>
       </Box>
@@ -563,8 +689,8 @@ export function App() {
         {mode === "normal" && !flash && !enrichingEid && (
           <Text color={C.dim}>
             q quit · Tab focus · j/k nav · / filter · n new · e enrich · p
-            promote · o original · a abandon · r release · L restart loop · ?
-            help
+            promote · o original · a abandon · r release · L restart loop · F
+            pause feed · End resume · ? help
           </Text>
         )}
       </Box>
@@ -663,8 +789,81 @@ export function App() {
           <HelpOverlay />
         </Box>
       )}
+
+      {/* Drill-down overlay (§5): Escape close · a abandon · r release-claim
+          · e enrich. Opened from Tasks panel via Enter; onClose below flips
+          mode back to "normal" so the main keybinds re-activate. */}
+      {mode === "drill-down" && drillDownTask && (
+        <Box marginTop={1}>
+          <DrillDownOverlay
+            view={buildDrillDownView(
+              drillDownTask,
+              resolveTaskCwd(drillDownTask, snap.claims),
+            )}
+            onClose={() => {
+              setDrillDownTask(null);
+              setMode("normal");
+            }}
+            onAbandon={() => {
+              if (drillDownTask.status === "done") {
+                setFlash({
+                  msg: "task already done — cannot abandon",
+                  color: C.warn,
+                });
+                return;
+              }
+              setConfirm({ kind: "abandon", task: drillDownTask });
+              setDrillDownTask(null);
+              setMode("confirm");
+            }}
+            onRelease={() => {
+              const claim = findClaimForTask(drillDownTask, snap.claims);
+              if (!claim) {
+                setFlash({
+                  msg: "no active claim to release for this task",
+                  color: C.warn,
+                });
+                return;
+              }
+              setConfirm({ kind: "release", claim });
+              setDrillDownTask(null);
+              setMode("confirm");
+            }}
+            onEnrich={() => {
+              setDrillDownTask(null);
+              setMode("normal");
+              triggerEnrich(drillDownTask);
+            }}
+          />
+        </Box>
+      )}
     </Box>
   );
+}
+
+// Find the claim row whose holder_cwd basename matches the task's repo. This
+// mirrors renderCurrentTaskArea's pairing logic — tasks.claimed_by is a PPID
+// while claims.session_id is a Claude UUID, so we can't join on identity and
+// fall back to cwd basename. Returns null when the task has no active claim
+// (e.g. status != "claimed" or the claim row was already released).
+function findClaimForTask(task: TaskRow, claims: ClaimRow[]): ClaimRow | null {
+  if (task.repo.startsWith("any:")) {
+    return claims[0] ?? null;
+  }
+  return (
+    claims.find(
+      (c) => c.holder_cwd && task.repo.endsWith(basename(c.holder_cwd)),
+    ) ?? null
+  );
+}
+
+// Pick the cwd the drill-down should use to resolve "commits since claim".
+// Matches renderCurrentTaskArea: for single-repo tasks use the matching
+// claim's holder_cwd; for multi-repo selectors fall back to the first live
+// claim's cwd (drill-down only renders one commit list).
+function resolveTaskCwd(task: TaskRow, claims: ClaimRow[]): string | null {
+  const claim = findClaimForTask(task, claims);
+  return claim?.holder_cwd ?? null;
 }
 
 // ── current-task area (§2 of docs/tui-ux-v2.md) ──────────────────────────────

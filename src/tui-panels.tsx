@@ -26,6 +26,8 @@ import {
   taskBodyPreview,
   type LoopStatus,
 } from "./loop-status";
+import type { FeedRecord, FeedSource, FeedState } from "./live-feed";
+import { visibleWindow } from "./live-feed";
 
 // Brand colors from /tmp/brand/colors.css
 export const C = {
@@ -357,6 +359,69 @@ export function EventsPanel({
   );
 }
 
+// §4 of docs/tui-ux-v2.md — replaces EventsPanel. Chronologically merged feed
+// of loop-log + events.jsonl + git-commits with coloured prefixes. Pure
+// presentation; caller owns the merged buffer + pause/scroll state so the
+// App can drive polling + keybinds without this file knowing about either.
+//
+// Prefix colours (spec): [loop]=yellow · [evt]=cyan · [git]=green.
+// Cyan isn't in the C palette — we use ink's "cyan" name directly.
+const FEED_SOURCE_COLOR: Record<FeedSource, string> = {
+  loop: C.warn, // amber — close enough to the spec's "yellow"
+  evt: "cyan",
+  git: C.ok,
+};
+
+function feedPrefix(source: FeedSource): string {
+  return `[${source}]`;
+}
+
+export function LiveFeedPanel({
+  records,
+  state,
+  focused,
+  height = 10,
+}: {
+  records: ReadonlyArray<FeedRecord>;
+  state: FeedState;
+  focused: boolean;
+  // Visible rows. Buffer itself is 40 (LIVE_FEED_MAX_LINES) — height is how
+  // many of those we render at once.
+  height?: number;
+}) {
+  const window = visibleWindow(records, state, height);
+  const title =
+    `Live feed (${records.length})` + (state.paused ? " ⏸ paused" : "");
+  return (
+    <Panel title={title} focused={focused}>
+      {window.length === 0 ? (
+        <Text color={C.dim}>
+          no activity yet — waiting for loop/events/git…
+        </Text>
+      ) : (
+        window.map((r, i) => {
+          const color = FEED_SOURCE_COLOR[r.source];
+          return (
+            <Box key={`${r.ts}-${r.source}-${i}`}>
+              <Text color={color}>{feedPrefix(r.source).padEnd(6)}</Text>
+              <Text color={C.paper}>{truncate(r.text, 70).trimEnd()}</Text>
+            </Box>
+          );
+        })
+      )}
+      {state.paused ? (
+        <Text color={C.warn}>
+          ⏸ paused · End resumes · F toggles · ↑/↓ scrolls
+        </Text>
+      ) : focused ? (
+        <Text color={C.dim}>
+          ↑ scrolls back (pauses) · F pause · End resume
+        </Text>
+      ) : null}
+    </Panel>
+  );
+}
+
 // Loop-status footer — one-line summary of the batonq-loop subsystem so you
 // can tell at a glance whether Claude-p is actively chewing on a task or the
 // queue has stalled. Rendered below the four panels, auto-refreshed by the
@@ -458,6 +523,12 @@ export function HelpOverlay() {
       </Text>
       <Text>
         <Text color={C.brand}>L</Text> restart batonq-loop (confirm y/n)
+      </Text>
+      <Text>
+        <Text color={C.brand}>F</Text> toggle live-feed pause
+      </Text>
+      <Text>
+        <Text color={C.brand}>End</Text> resume live-feed auto-scroll
       </Text>
       <Text>
         <Text color={C.brand}>?</Text> toggle this help
