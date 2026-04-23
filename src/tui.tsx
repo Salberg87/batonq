@@ -953,7 +953,12 @@ export function runAbandon(
 export function runRestartLoop(
   setFlash: (f: { msg: string; color: string }) => void,
 ): void {
+  // Kill the loop AND its claude-p child explicitly. Relying on parent-death
+  // to reap the child leaves orphaned `claude -p` processes running
+  // gtimeout/claude trees that would outlive the restart and race the new
+  // loop for events.jsonl writes.
   spawnSync("pkill", ["-f", "agent-coord-loop"], { encoding: "utf8" });
+  spawnSync("pkill", ["-f", "claude -p"], { encoding: "utf8" });
   const bin = resolveLoopBin();
   if (!bin) {
     setFlash({
