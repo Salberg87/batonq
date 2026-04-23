@@ -4,6 +4,10 @@
 
 <h1 align="center">batonq</h1>
 
+<p align="center">
+  <img src="./demo/intro.gif" alt="batonq anti-juks walkthrough — add → try to skip the gate → verify+judge pass → ✓V ✓J" width="820">
+</p>
+
 <p align="center"><strong>Stop AI coding agents from faking test results.</strong></p>
 
 <p align="center">
