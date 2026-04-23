@@ -2119,7 +2119,6 @@ function enrichTask(id?: string): void {
     console.error("usage: batonq enrich <external_id>");
     process.exit(2);
   }
-  syncTasks(false);
   const db = openTaskDb();
   try {
     const row = db

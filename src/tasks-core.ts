@@ -1416,10 +1416,7 @@ export function validatedInsertTask(
 export const TASKS_MD_DEPRECATION_MARKER =
   "DEPRECATED — this file is no longer authoritative";
 
-export const TASKS_MD_DEPRECATION_HEADER = [
-  `> ⚠️ ${TASKS_MD_DEPRECATION_MARKER}. Use 'batonq add' for new`,
-  `> tasks or 'batonq import <file>' for bulk. File may be out-of-sync with DB.`,
-].join("\n");
+export const TASKS_MD_DEPRECATION_HEADER = `> ⚠️ ${TASKS_MD_DEPRECATION_MARKER}. Use 'batonq add' or 'batonq import <file>'. May drift from DB.`;
 
 // Prepend the deprecation notice to TASKS.md once. Idempotent: a second call
 // is a no-op once the marker is present. Does nothing if the file doesn't

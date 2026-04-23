@@ -427,6 +427,37 @@ describe("pick hot path is DB-only", () => {
     expect(pickAfter.status).toBe(0);
     expect(pickAfter.stdout).toContain("TASK_CLAIMED");
   });
+
+  test("pick works on DB-only tasks when TASKS.md is moved away", () => {
+    // Seed a task directly into the DB via `batonq add`, then remove TASKS.md
+    // entirely. pick must still surface the task — proving it reads the DB,
+    // not the file. Regression guard against reintroducing a syncTasks() call
+    // on the pick hot path (pre-arch-2 behaviour).
+    const add = runBatonq(
+      [
+        "add",
+        "--body",
+        "db-only task that must survive TASKS.md being moved away",
+        "--repo",
+        "any:infra",
+      ],
+      { home: fakeHome },
+    );
+    expect(add.status).toBe(0);
+
+    const tasksPath = join(fakeHome, "DEV", "TASKS.md");
+    if (existsSync(tasksPath)) {
+      rmSync(tasksPath);
+    }
+    expect(existsSync(tasksPath)).toBe(false);
+
+    const pick = runBatonq(["pick", "--any"], { home: fakeHome });
+    expect(pick.status).toBe(0);
+    expect(pick.stdout).toContain("TASK_CLAIMED");
+    expect(pick.stdout).toContain(
+      "db-only task that must survive TASKS.md being moved away",
+    );
+  });
 });
 
 // ── tasks-core unit tests (no CLI spawn) ──────────────────────────────────────
