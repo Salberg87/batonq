@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-# agent-coord-loop — Path A: Fresh Claude invocation per task
-# Polls agent-coord pick and spawns a new Claude instance for each task.
+# batonq-loop — Path A: Fresh Claude invocation per task
+# Polls batonq pick and spawns a new Claude instance for each task.
 # Useful for long-running task loops where fresh context per task is preferred.
 
 PICK_NEXT_SYSTEM_PROMPT="$(cat ~/.claude/commands/pick-next.md)"
