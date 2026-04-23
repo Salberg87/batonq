@@ -5,12 +5,15 @@ set -euo pipefail
 # Polls batonq pick and spawns a new Claude instance for each task.
 # Useful for long-running task loops where fresh context per task is preferred.
 #
-# Deps: gtimeout (coreutils). On macOS: `brew install coreutils`.
+# Deps: a `timeout` binary (GNU coreutils). macOS ships without one, so
+#   `brew install coreutils` gives you `gtimeout`. Linux ships `timeout`
+#   natively. batonq_timeout_cmd (from batonq-platform-compat.sh) picks the
+#   right name for the current OS at runtime.
 #
 # Env:
 #   BATONQ_WATCHDOG_STALE_SEC   watchdog mtime-staleness threshold (default 600)
 #   BATONQ_WATCHDOG_WARMUP_SEC  watchdog warm-up before first check (default 120)
-#   BATONQ_LOOP_TIMEOUT         gtimeout duration for claude -p (default 20m)
+#   BATONQ_LOOP_TIMEOUT         timeout duration for claude -p (default 20m)
 #
 # Multi-session caveat: the watchdog watches a *shared* hook log
 # (~/.claude/batonq-measurement/events.jsonl). If two batonq-loop instances run
@@ -19,9 +22,14 @@ set -euo pipefail
 # Acceptable for single-loop-per-host setups; for parallel hosts-on-one-machine
 # use per-loop event logs (e.g. events.$PID.jsonl).
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=./batonq-platform-compat.sh
+. "${SCRIPT_DIR}/batonq-platform-compat.sh"
+
 PICK_NEXT_SYSTEM_PROMPT="$(cat ~/.claude/commands/pick-next.md)"
 
 LOOP_TIMEOUT="${BATONQ_LOOP_TIMEOUT:-20m}"
+TIMEOUT_CMD="$(batonq_timeout_cmd)"
 
 while true; do
   echo "→ batonq pick"
@@ -43,9 +51,9 @@ while true; do
     # Plain claude -p: the previous streaming variant with --verbose piped to a
     # watcher held the process alive after /clear and wedged the loop. Plain
     # mode exits cleanly on stdin EOF.
-    # gtimeout is belt-and-suspenders: any task that takes >LOOP_TIMEOUT is
-    # stuck; kill it so the loop continues. (macOS ships without `timeout` —
-    # gtimeout from coreutils is a hard dep.)
+    # The timeout wrapper is belt-and-suspenders: any task that takes
+    # >LOOP_TIMEOUT is stuck; kill it so the loop continues. On macOS that's
+    # gtimeout (coreutils); on Linux it's the native `timeout`.
     # The watchdog below gives us finer-grain hang detection via events.jsonl mtime.
     # Watch progress with `batonq tail -n 20` in another terminal.
 
@@ -59,10 +67,11 @@ while true; do
     "$WATCHDOG_CMD" $$ "$HOME/.claude/batonq-measurement/events.jsonl" &
     WATCHDOG_PID=$!
 
-    # `|| true` prevents `set -e` from tearing down the loop when gtimeout
-    # (124) or claude returns non-zero — we want the outer loop to keep running.
+    # `|| true` prevents `set -e` from tearing down the loop when the timeout
+    # wrapper (124) or claude returns non-zero — we want the outer loop to
+    # keep running.
     echo "$PICK_OUTPUT" \
-      | gtimeout "$LOOP_TIMEOUT" claude -p \
+      | "$TIMEOUT_CMD" "$LOOP_TIMEOUT" claude -p \
           --dangerously-skip-permissions \
           --append-system-prompt "$PICK_NEXT_SYSTEM_PROMPT" || true
 

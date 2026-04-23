@@ -50,7 +50,7 @@ describe("install.sh (update path)", () => {
         // the test doesn't depend on the host's tool inventory. They're
         // exercised by install.sh itself in regular use.
         .replace(/check_bun\n/, ": # check_bun skipped\n")
-        .replace(/check_gtimeout\n/, ": # check_gtimeout skipped\n")
+        .replace(/check_timeout_cmd\n/, ": # check_timeout_cmd skipped\n")
         .replace(
           /command -v git >\/dev\/null 2>&1 \|\| fail "git is required but not installed\."\n/,
           ": # git check skipped\n",

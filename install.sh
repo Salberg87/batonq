@@ -54,31 +54,61 @@ EOF
   exit 1
 }
 
-# ── Step 1b: gtimeout (required by batonq-loop) ───────────────────────────────
+# ── Step 1b: timeout (required by batonq-loop) ────────────────────────────────
+#
+# batonq-loop wraps each `claude -p` invocation in a `timeout` so a stuck task
+# can't wedge the loop indefinitely. On Linux the GNU `timeout` binary is
+# standard; on macOS there is no native `timeout`, so `gtimeout` from GNU
+# coreutils is required. Accept either so users on Linux hosts don't need to
+# rename binaries, and users on macOS with coreutils installed just work.
 
-check_gtimeout() {
+check_timeout_cmd() {
+  os="$(uname 2>/dev/null || echo unknown)"
+
+  if command -v timeout >/dev/null 2>&1; then
+    ok "timeout found ($(command -v timeout))"
+    return 0
+  fi
   if command -v gtimeout >/dev/null 2>&1; then
     ok "gtimeout found ($(command -v gtimeout))"
     return 0
   fi
-  cat >&2 <<'EOF'
-✖ gtimeout is required by batonq-loop but not installed.
 
-batonq-loop wraps each `claude -p` invocation in `gtimeout` so a stuck task
-can't wedge the loop indefinitely. macOS ships without a `timeout` binary,
-so the loop uses `gtimeout` from GNU coreutils on both macOS and Linux for
-a single code path.
+  case "$os" in
+    Darwin)
+      cat >&2 <<'EOF'
+✖ gtimeout is required by batonq-loop on macOS but is not installed.
 
-On macOS:
+batonq-loop wraps each `claude -p` invocation in a timeout so a stuck task
+can't wedge the loop indefinitely. macOS ships without a native `timeout`,
+so install GNU coreutils (which provides `gtimeout`):
 
   brew install coreutils
 
-On Debian/Ubuntu:
+Then re-run this installer.
+EOF
+      ;;
+    *)
+      cat >&2 <<'EOF'
+✖ Neither `timeout` nor `gtimeout` is on PATH.
+
+batonq-loop wraps each `claude -p` invocation in a timeout so a stuck task
+can't wedge the loop indefinitely. On Debian/Ubuntu:
 
   sudo apt-get install -y coreutils
 
+On Alpine:
+
+  apk add coreutils
+
+On Fedora/RHEL:
+
+  sudo dnf install -y coreutils
+
 Then re-run this installer.
 EOF
+      ;;
+  esac
   exit 1
 }
 
@@ -197,6 +227,11 @@ install_bins() {
   install_one "${src}/agent-coord-loop"          "${bindir}/${NAME}-loop"
   install_one "${src}/agent-coord-loop-watchdog" "${bindir}/${NAME}-loop-watchdog"
   install_one "${src}/agent-coord-loop"          "${bindir}/agent-coord-loop"
+
+  # Platform-compat helper sourced by the loop + watchdog at runtime. Must sit
+  # next to them in bindir so `$(dirname "$0")/batonq-platform-compat.sh`
+  # resolves regardless of which alias the user invoked.
+  install_one "${src}/batonq-platform-compat.sh" "${bindir}/batonq-platform-compat.sh"
 }
 
 # Fallback: copy the entire src/ tree into ~/.local/share/batonq/src/ and
@@ -404,7 +439,7 @@ main() {
   info "Installing ${NAME}"
 
   check_bun
-  check_gtimeout
+  check_timeout_cmd
 
   if ! bindir=$(detect_bindir); then
     fail "Neither ~/.local/bin nor ~/bin is on PATH. Add one to your shell rc and re-run:
