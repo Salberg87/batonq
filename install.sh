@@ -108,7 +108,57 @@ clone_repo() {
   ok "Clone complete"
 }
 
-# ── Step 4: install binaries ──────────────────────────────────────────────────
+# ── Step 4a: compile self-contained binaries with `bun build --compile` ──────
+#
+# Why this exists: agent-coord and agent-coord-hook are bun scripts that
+# `import { ... } from "./logs-core"`, `./loop-status`, `./tasks-core`, etc.
+# The pre-fix installer simply `cp`'d src/agent-coord to bindir/batonq, so the
+# moment the binary tried to resolve a sibling import it crashed with
+# "Cannot find module './loop-status'". `bun build --compile` bundles every
+# transitive import into a single self-contained executable, so the installed
+# binary has zero filesystem deps.
+#
+# Subtlety the bundler doesn't tell you about: files without a .ts/.js/.tsx
+# extension are treated as opaque ASSETS — copied verbatim and represented in
+# the bundle as a 125-byte stub that just exports the asset path. The result
+# is a "compiled" binary that produces zero output. We rename the
+# extensionless entry-point files to .ts in a build dir before invoking the
+# bundler so they are treated as TypeScript modules.
+#
+# Returns 0 on success, 1 if any compile step fails (caller falls back to
+# install_source_fallback).
+
+compile_bins() {
+  build_dir="${TMP_DIR}/build"
+  dist_dir="${TMP_DIR}/dist"
+  rm -rf "${build_dir}" "${dist_dir}"
+  mkdir -p "${build_dir}" "${dist_dir}"
+
+  cp "${TMP_DIR}/src/"*.ts "${build_dir}/" 2>/dev/null || :
+  cp "${TMP_DIR}/src/"*.tsx "${build_dir}/" 2>/dev/null || :
+  cp "${TMP_DIR}/src/agent-coord"      "${build_dir}/agent-coord.ts" \
+    || { warn "src/agent-coord missing"; return 1; }
+  cp "${TMP_DIR}/src/agent-coord-hook" "${build_dir}/agent-coord-hook.ts" \
+    || { warn "src/agent-coord-hook missing"; return 1; }
+
+  info "Installing build deps (bun install)"
+  ( cd "${TMP_DIR}" && bun install --silent ) >/dev/null 2>&1 \
+    || { warn "bun install failed"; return 1; }
+
+  for entry in agent-coord agent-coord-hook; do
+    info "Compiling ${entry} → dist/${entry}"
+    if ! ( cd "${TMP_DIR}" && bun build --compile --target=bun \
+             "build/${entry}.ts" \
+             --outfile "${dist_dir}/${entry}" ) >/dev/null 2>&1; then
+      warn "bun build --compile failed for ${entry}"
+      return 1
+    fi
+  done
+  ok "Compiled self-contained binaries in ${dist_dir}"
+  return 0
+}
+
+# ── Step 4b: install binaries ────────────────────────────────────────────────
 
 install_bins() {
   bindir="$1"
@@ -117,11 +167,6 @@ install_bins() {
   src="${TMP_DIR}/src"
   [ -d "${src}" ] || fail "Expected ${src} after clone, but it does not exist."
 
-  # Map src file → installed name (matches README install instructions).
-  # We install the src/* scripts directly (they are self-contained bun scripts).
-  # ALWAYS overwrite — on upgrades users routinely end up with stale binaries
-  # at the legacy `agent-coord` name pointing at old DB paths. Refusing to
-  # overwrite would re-create the three-DBs-in-one-dir bug the rename fixed.
   install_one() {
     from="$1"; to="$2"
     [ -f "${from}" ] || fail "Missing source file: ${from}"
@@ -130,17 +175,60 @@ install_bins() {
     ok "Installed ${to}"
   }
 
-  install_one "${src}/agent-coord"               "${bindir}/${NAME}"
-  install_one "${src}/agent-coord-hook"          "${bindir}/${NAME}-hook"
+  # Try the compile path first; on any failure, fall back to a source install
+  # with thin wrappers so users still get a working install on hosts where
+  # `bun build --compile` is broken (e.g. ancient bun, exotic arch).
+  # ALWAYS overwrite — on upgrades users routinely end up with stale binaries
+  # at the legacy `agent-coord` name pointing at old DB paths. Refusing to
+  # overwrite would re-create the three-DBs-in-one-dir bug the rename fixed.
+  if compile_bins; then
+    dist="${TMP_DIR}/dist"
+    install_one "${dist}/agent-coord"      "${bindir}/${NAME}"
+    install_one "${dist}/agent-coord-hook" "${bindir}/${NAME}-hook"
+    # Legacy-name aliases (see install_source_fallback for the same set).
+    install_one "${dist}/agent-coord"      "${bindir}/agent-coord"
+    install_one "${dist}/agent-coord-hook" "${bindir}/agent-coord-hook"
+  else
+    install_source_fallback "${bindir}"
+  fi
+
+  # Bash scripts are loaders, not bun scripts — copy as-is regardless of which
+  # path was taken above. They have no JS deps to bundle.
   install_one "${src}/agent-coord-loop"          "${bindir}/${NAME}-loop"
   install_one "${src}/agent-coord-loop-watchdog" "${bindir}/${NAME}-loop-watchdog"
-
-  # Legacy-name aliases so existing scripts, docs, and muscle memory keep
-  # working AND so any stale `agent-coord` binary from a pre-rename install
-  # is overwritten to point at the new canonical DB path.
-  install_one "${src}/agent-coord"               "${bindir}/agent-coord"
-  install_one "${src}/agent-coord-hook"          "${bindir}/agent-coord-hook"
   install_one "${src}/agent-coord-loop"          "${bindir}/agent-coord-loop"
+}
+
+# Fallback: copy the entire src/ tree into ~/.local/share/batonq/src/ and
+# write thin shell wrappers in bindir that exec `bun` against the source file.
+# Slower at startup (bun re-parses on every invocation) but functionally
+# identical — and it dodges every "asset bundling" trap of the compile path.
+install_source_fallback() {
+  bindir="$1"
+  share_dir="${HOME}/.local/share/${NAME}"
+  warn "Using source-fallback install (compile failed). Slower but equivalent."
+  rm -rf "${share_dir}"
+  mkdir -p "${share_dir}"
+  cp -R "${TMP_DIR}/src" "${share_dir}/src"
+  [ -f "${TMP_DIR}/package.json" ] && cp "${TMP_DIR}/package.json" "${share_dir}/"
+  [ -d "${TMP_DIR}/node_modules" ] && cp -R "${TMP_DIR}/node_modules" "${share_dir}/" 2>/dev/null || :
+
+  write_wrapper() {
+    target="$1"; src_name="$2"
+    cat > "${target}" <<EOF
+#!/bin/sh
+# batonq thin wrapper (source-fallback install). The compiled binary path
+# failed during install; this wrapper execs bun against the source file.
+exec bun "${share_dir}/src/${src_name}" "\$@"
+EOF
+    chmod +x "${target}"
+    ok "Wrote wrapper ${target}"
+  }
+
+  write_wrapper "${bindir}/${NAME}"           "agent-coord"
+  write_wrapper "${bindir}/${NAME}-hook"      "agent-coord-hook"
+  write_wrapper "${bindir}/agent-coord"       "agent-coord"
+  write_wrapper "${bindir}/agent-coord-hook"  "agent-coord-hook"
 }
 
 # ── Step 5: merge hooks into ~/.claude/settings.json ──────────────────────────

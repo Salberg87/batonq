@@ -56,10 +56,15 @@ ink-rendered view, refreshed every 2s. The layout is described under
 curl -fsSL https://raw.githubusercontent.com/Salberg87/batonq/main/install.sh | sh
 ```
 
-The installer checks for `bun` and `jq`, clones the repo, drops the three
-binaries into `~/.local/bin/` (or `~/bin/`), merges the Claude Code hooks
-into `~/.claude/settings.json` idempotently, and creates the state dirs.
-Re-running it is safe — existing hook entries are replaced, not duplicated.
+The installer checks for `bun` and `jq`, clones the repo, **runs
+`bun build --compile`** to produce self-contained binaries (each one bundles
+its sibling-module imports — `loop-status`, `logs-core`, etc. — so the
+installed binary has zero filesystem deps), drops them into `~/.local/bin/`
+(or `~/bin/`), merges the Claude Code hooks into `~/.claude/settings.json`
+idempotently, and creates the state dirs. Re-running it is safe — existing
+hook entries are replaced, not duplicated. If `bun build --compile` fails
+(rare; usually a too-old bun), the installer falls back to copying `src/` to
+`~/.local/share/batonq/src/` and writing thin shell wrappers in the bindir.
 
 **Manual (if you want to vendor the checkout):**
 
@@ -70,12 +75,24 @@ bun install
 export PATH="$PWD/bin:$PATH"
 ```
 
-Or install the three binaries directly to a directory on your `PATH`:
+The `bin/` wrappers exec `bun` against `src/` directly, so no compile step is
+needed for a vendored checkout. To produce installable self-contained binaries
+manually (the same artefacts the installer would write):
 
 ```sh
-install -m 0755 src/agent-coord      ~/.local/bin/batonq
-install -m 0755 src/agent-coord-hook ~/.local/bin/batonq-hook
-install -m 0755 src/agent-coord-loop ~/.local/bin/batonq-loop
+mkdir -p build dist
+cp src/*.ts src/*.tsx build/
+cp src/agent-coord      build/agent-coord.ts        # bun bundler treats
+cp src/agent-coord-hook build/agent-coord-hook.ts   # extensionless files
+                                                    # as opaque assets
+bun build --compile --target=bun build/agent-coord.ts \
+  --outfile dist/batonq
+bun build --compile --target=bun build/agent-coord-hook.ts \
+  --outfile dist/batonq-hook
+install -m 0755 dist/batonq      ~/.local/bin/batonq
+install -m 0755 dist/batonq-hook ~/.local/bin/batonq-hook
+install -m 0755 src/agent-coord-loop          ~/.local/bin/batonq-loop
+install -m 0755 src/agent-coord-loop-watchdog ~/.local/bin/batonq-loop-watchdog
 ```
 
 Requires [Bun](https://bun.sh) ≥ 1.0, `jq` (for the hooks merge), and
