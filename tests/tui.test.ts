@@ -552,4 +552,41 @@ describe("AddTaskForm", () => {
     // Lockfile cleaned up after writes.
     expect(existsSync(tasksPath + ".lock")).toBe(false);
   });
+
+  test("appendTaskToPending — N concurrent processes race on the same file; all tasks survive", async () => {
+    // Spawn N subprocesses that each call appendTaskToPending in parallel.
+    // A pure read-modify-write (no flock / no rename) would lose writes here:
+    // whichever process reads last and writes last clobbers earlier writes.
+    // With the advisory lockfile + atomic rename, all N tasks must end up
+    // in the final TASKS.md.
+    const N = 5;
+    const bodies = Array.from({ length: N }, (_, i) => `race-body-${i}`);
+    const corePath = join(import.meta.dir, "..", "src", "tasks-core.ts");
+    const helperPath = join(dir, "race-helper.ts");
+    writeFileSync(
+      helperPath,
+      `import { appendTaskToPending } from ${JSON.stringify(corePath)};
+const [tasksPath, body] = process.argv.slice(2);
+appendTaskToPending(tasksPath, { repo: "any:infra", body });
+`,
+    );
+
+    const procs = bodies.map((body) =>
+      Bun.spawn(["bun", "run", helperPath, tasksPath, body], {
+        stdout: "pipe",
+        stderr: "pipe",
+      }),
+    );
+    const codes = await Promise.all(procs.map((p) => p.exited));
+    for (const code of codes) expect(code).toBe(0);
+
+    const after = readFileSync(tasksPath, "utf8");
+    for (const body of bodies) {
+      expect(after).toContain(`- [ ] **any:infra** — ${body}`);
+    }
+    // Pre-existing seed task is also preserved.
+    expect(after).toContain("- [ ] **repo-a** — existing task");
+    // Lockfile cleaned up after all processes finished.
+    expect(existsSync(tasksPath + ".lock")).toBe(false);
+  });
 });
