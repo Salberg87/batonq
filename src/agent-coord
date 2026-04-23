@@ -1378,14 +1378,14 @@ function getGitDiffSinceClaim(cwd: string, claimedAt: string): string {
 
 function doneTask(id?: string): void {
   const args = process.argv.slice(3);
-  const skipVerify = args.includes("--skip-verify");
-  if (skipVerify && process.env.AGENT_COORD_ALLOW_SKIP !== "1") {
-    console.error(
-      "--skip-verify requires AGENT_COORD_ALLOW_SKIP=1 (prevents autonomous agents from bypassing verify)"
-    );
+  // --skip-verify / --skip-judge removed 2026-04-23. The AGENT_COORD_ALLOW_SKIP env
+  // gate was self-settable by the caller (agents just exported it), so it did not
+  // actually protect the queue. Gates are now mandatory; fix the issue or abandon.
+  if (args.includes("--skip-verify") || args.includes("--skip-judge")) {
+    console.error("--skip-verify / --skip-judge are no longer accepted. Gates are mandatory.");
+    console.error("If verify/judge fails, fix the underlying issue or run: batonq abandon <id>");
     process.exit(2);
   }
-  // strip flag from id lookup
   const positional = args.filter((a) => !a.startsWith("--"));
   const explicitId = positional[0];
   const db = openTaskDb();
@@ -1411,8 +1411,8 @@ function doneTask(id?: string): void {
       }
     }
 
-    // --- Verify gate ---
-    if (target.verify_cmd && !skipVerify) {
+    // --- Verify gate (mandatory since 2026-04-23) ---
+    if (target.verify_cmd) {
       const repoPath = resolveRepoPath(target.repo);
       console.log(`→ verify: ${target.verify_cmd}`);
       console.log(`  (cwd: ${repoPath}, timeout: 300s)`);
@@ -1427,21 +1427,15 @@ function doneTask(id?: string): void {
       );
       if (code !== 0) {
         console.error(`✗ verify FAILED (exit ${code}). Task stays claimed.`);
-        console.error(`  Retry done after fixing, or: AGENT_COORD_ALLOW_SKIP=1 batonq done --skip-verify ${target.external_id} (logged as override)`);
+        console.error(`  Fix the underlying issue and retry: batonq done ${target.external_id}`);
         console.error(`  Or release and re-queue: batonq abandon ${target.external_id}`);
         process.exit(code);
       }
       console.log(`✓ verify passed.`);
-    } else if (target.verify_cmd && skipVerify) {
-      db.run(
-        `UPDATE tasks SET verify_output = ?, verify_ran_at = ? WHERE id = ?`,
-        [`[SKIPPED by --skip-verify]`, new Date().toISOString(), target.id]
-      );
-      console.log(`⚠ verify SKIPPED (--skip-verify). Override logged.`);
     }
 
-    // --- Judge gate ---
-    if (target.judge_cmd && !skipVerify) {
+    // --- Judge gate (mandatory since 2026-04-23) ---
+    if (target.judge_cmd) {
       const repoPath = resolveRepoPath(target.repo);
       console.log(`→ judge: ${target.judge_cmd}`);
       console.log(`  (cwd: ${repoPath})`);

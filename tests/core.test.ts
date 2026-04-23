@@ -456,30 +456,23 @@ describe("batonq --version", () => {
   });
 });
 
-// ── 8. --skip-verify requires AGENT_COORD_ALLOW_SKIP=1 ────────────────────────
+// ── 8. --skip-verify / --skip-judge are rejected unconditionally ──────────────
 
-describe("done --skip-verify gate", () => {
-  test("fails with exit 2 unless AGENT_COORD_ALLOW_SKIP=1 is set", () => {
-    // Isolate in a fresh HOME so we don't touch the real ~/.claude DB.
+describe("done --skip-verify/--skip-judge rejection", () => {
+  test("--skip-verify exits 2 even with AGENT_COORD_ALLOW_SKIP=1 set", () => {
     const fakeHome = mkdtempSync(join(tmpdir(), "batonq-home-"));
     mkdirSync(join(fakeHome, ".claude"), { recursive: true });
     try {
-      const withoutEnv = spawnSync(
-        BATONQ_BIN,
-        ["done", "--skip-verify", "nope123456"],
-        {
+      for (const flag of ["--skip-verify", "--skip-judge"] as const) {
+        const withoutEnv = spawnSync(BATONQ_BIN, ["done", flag, "nope123456"], {
           env: { ...process.env, HOME: fakeHome, PATH: process.env.PATH ?? "" },
           encoding: "utf8",
-        },
-      );
-      expect(withoutEnv.status).toBe(2);
-      const stderr = withoutEnv.stderr ?? "";
-      expect(stderr).toMatch(/AGENT_COORD_ALLOW_SKIP=1/);
+        });
+        expect(withoutEnv.status).toBe(2);
+        expect(withoutEnv.stderr ?? "").toMatch(/no longer accepted/i);
 
-      const withEnv = spawnSync(
-        BATONQ_BIN,
-        ["done", "--skip-verify", "nope123456"],
-        {
+        // Env escape hatch is gone — gate still rejects.
+        const withEnv = spawnSync(BATONQ_BIN, ["done", flag, "nope123456"], {
           env: {
             ...process.env,
             HOME: fakeHome,
@@ -487,13 +480,10 @@ describe("done --skip-verify gate", () => {
             AGENT_COORD_ALLOW_SKIP: "1",
           },
           encoding: "utf8",
-        },
-      );
-      // Gate passed → failure is now "no task with that external_id", not the gate (exit != 2).
-      expect(withEnv.status).not.toBe(2);
-      expect((withEnv.stderr ?? "") + (withEnv.stdout ?? "")).toMatch(
-        /No task with external_id/,
-      );
+        });
+        expect(withEnv.status).toBe(2);
+        expect(withEnv.stderr ?? "").toMatch(/no longer accepted/i);
+      }
     } finally {
       rmSync(fakeHome, { recursive: true, force: true });
     }
