@@ -5,6 +5,23 @@ All notable changes to batonq are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Task priority + scheduling. Optional `priority: high|normal|low` (default
+  `normal`) and `scheduled_for: <ISO-8601 UTC>` directives under a task in
+  `~/DEV/TASKS.md`. `pick` filters out tasks whose `scheduled_for` is in the
+  future and orders the rest by priority, then by `COALESCE(scheduled_for,
+created_at)`, then `created_at` — deterministic and stable. The `tasks`
+  listing mirrors that order and shows a `[H]/[N]/[L]` priority badge plus a
+  `⏰<iso>` / `⏰(ripe)` marker where relevant; `pick` output surfaces the
+  picked task's `priority` and `scheduled_for` fields.
+- `initTaskSchema` adds `priority` and `scheduled_for` columns (with a pick
+  index) and migrates legacy DBs in place. Unknown priority tokens fall back
+  to `normal`; `scheduled_for` requires a full ISO-8601 timestamp with a
+  timezone component and is canonicalised to Z-suffixed UTC on the way in.
+
 ## [0.1.0] — 2026-04-23
 
 Initial public release. Extracted from the internal `agent-coord` tool used

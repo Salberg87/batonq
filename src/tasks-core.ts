@@ -27,6 +27,9 @@ export const DEFAULT_ESCALATION_LOG_PATH = "/tmp/batonq-escalations.log";
 
 export type TaskStatus = "draft" | "pending" | "claimed" | "done" | "lost";
 
+export type TaskPriority = "high" | "normal" | "low";
+export const DEFAULT_PRIORITY: TaskPriority = "normal";
+
 export interface ParsedTask {
   repo: string;
   body: string;
@@ -34,6 +37,46 @@ export interface ParsedTask {
   lineIdx: number;
   verifyCmd?: string;
   judgeCmd?: string;
+  priority?: TaskPriority;
+  // ISO-8601 UTC. A task with scheduled_for > now() is not pickable.
+  scheduledFor?: string;
+}
+
+// Normalise whatever the user typed into one of the three priority tokens.
+// Unknown input (including the empty string, garbage, or wrong case) falls
+// back to "normal" so a typo in TASKS.md never silently promotes work.
+export function normalizePriority(
+  raw: string | null | undefined,
+): TaskPriority {
+  if (!raw) return DEFAULT_PRIORITY;
+  const s = raw.trim().toLowerCase();
+  if (s === "high" || s === "normal" || s === "low") return s;
+  return DEFAULT_PRIORITY;
+}
+
+// Accept only strict ISO-8601 UTC with a Z/±HH:MM offset. We need lexicographic
+// comparison to match chronological order in the SQL pick query, which only
+// holds when every stored timestamp has the same shape. Returns the
+// canonicalised ISO string (ms-precision, Z-suffixed) or null if unparseable.
+export function normalizeScheduledFor(
+  raw: string | null | undefined,
+): string | null {
+  if (!raw) return null;
+  const s = raw.trim();
+  if (!s) return null;
+  // Require a date AND a time component with timezone info. A bare date
+  // ("2026-05-01") parses as midnight-local on some platforms and midnight-UTC
+  // on others — refuse it rather than guess.
+  if (
+    !/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/.test(
+      s,
+    )
+  ) {
+    return null;
+  }
+  const ms = Date.parse(s);
+  if (!Number.isFinite(ms)) return null;
+  return new Date(ms).toISOString();
 }
 
 // `?` marks a draft task — TUI-created tasks land here until enrichment +
@@ -42,6 +85,8 @@ const TASK_RE =
   /^- \[([ x~?])\] (?:\d{4}-\d{2}-\d{2} )?\*\*([^*]+)\*\*\s*[—–-]+\s*(.+?)(?:\s*\([^)]*\))?$/;
 const VERIFY_RE = /^\s+verify:\s*(.+?)\s*$/;
 const JUDGE_RE = /^\s+judge:\s*(.+?)\s*$/;
+const PRIORITY_RE = /^\s+priority:\s*(.+?)\s*$/i;
+const SCHEDULED_RE = /^\s+scheduled_for:\s*(.+?)\s*$/i;
 
 export function parseTasksFile(tasksPath: string): {
   lines: string[];
@@ -114,7 +159,24 @@ export function parseTasksText(text: string): {
     }
     if (current.judgeCmd === undefined) {
       const jm = line.match(JUDGE_RE);
-      if (jm) current.judgeCmd = jm[1];
+      if (jm) {
+        current.judgeCmd = jm[1];
+        continue;
+      }
+    }
+    if (current.priority === undefined) {
+      const pm = line.match(PRIORITY_RE);
+      if (pm) {
+        current.priority = normalizePriority(pm[1]);
+        continue;
+      }
+    }
+    if (current.scheduledFor === undefined) {
+      const sm = line.match(SCHEDULED_RE);
+      if (sm) {
+        const iso = normalizeScheduledFor(sm[1]);
+        if (iso) current.scheduledFor = iso;
+      }
     }
   }
   return { lines, tasks };
@@ -147,11 +209,15 @@ export function initTaskSchema(db: Database): void {
       judge_ran_at TEXT,
       enrich_questions TEXT,
       original_body TEXT,
-      last_progress_at TEXT
+      last_progress_at TEXT,
+      priority TEXT NOT NULL DEFAULT 'normal',
+      scheduled_for TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status);
     CREATE INDEX IF NOT EXISTS idx_task_repo_status ON tasks(repo, status);
   `);
+  // idx_task_pick is created below, AFTER the ALTER TABLEs — on a legacy DB
+  // the priority / scheduled_for columns don't exist yet when this exec runs.
   // Migration for pre-existing DBs that lack verify_*, judge_*, enrich_* columns
   const cols = db
     .query("SELECT name FROM pragma_table_info('tasks')")
@@ -176,6 +242,18 @@ export function initTaskSchema(db: Database): void {
     db.exec("ALTER TABLE tasks ADD COLUMN original_body TEXT");
   if (!has("last_progress_at"))
     db.exec("ALTER TABLE tasks ADD COLUMN last_progress_at TEXT");
+  // SQLite ALTER TABLE cannot add a NOT NULL column without a default on an
+  // existing table, but a DEFAULT clause is fine — existing rows inherit it.
+  if (!has("priority"))
+    db.exec(
+      "ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'",
+    );
+  if (!has("scheduled_for"))
+    db.exec("ALTER TABLE tasks ADD COLUMN scheduled_for TEXT");
+  // The pick index is created after ALTERs so migrating DBs get it too.
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_task_pick ON tasks(status, priority, scheduled_for, created_at)`,
+  );
 }
 
 export function initClaimsSchema(db: Database): void {
@@ -222,14 +300,26 @@ export function syncTasks(
       .get(eid) as any;
     const verify = t.verifyCmd ?? null;
     const judge = t.judgeCmd ?? null;
+    const priority = t.priority ?? DEFAULT_PRIORITY;
+    const scheduledFor = t.scheduledFor ?? null;
     // Map MD status → DB status. `claimed` in MD is treated as pending on
     // insert (DB owns claim state); draft and done pass through verbatim.
     const insertStatus =
       t.status === "done" ? "done" : t.status === "draft" ? "draft" : "pending";
     if (!existing) {
       db.run(
-        `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [eid, t.repo, t.body, insertStatus, nowIso, verify, judge],
+        `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd, priority, scheduled_for) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          eid,
+          t.repo,
+          t.body,
+          insertStatus,
+          nowIso,
+          verify,
+          judge,
+          priority,
+          scheduledFor,
+        ],
       );
       if (t.status !== "done") added++;
     } else {
@@ -259,6 +349,24 @@ export function syncTasks(
           eid,
         ]);
       }
+      // Priority and scheduled_for are editable in-place: flipping `priority: high`
+      // in TASKS.md on an already-synced pending task must actually re-rank it.
+      // Only touches pending and draft rows — claimed/done are frozen so an
+      // active agent's run state can't be disturbed mid-flight.
+      if (existing.status === "pending" || existing.status === "draft") {
+        if (priority !== existing.priority) {
+          db.run(`UPDATE tasks SET priority = ? WHERE external_id = ?`, [
+            priority,
+            eid,
+          ]);
+        }
+        if (scheduledFor !== existing.scheduled_for) {
+          db.run(`UPDATE tasks SET scheduled_for = ? WHERE external_id = ?`, [
+            scheduledFor,
+            eid,
+          ]);
+        }
+      }
     }
   }
   return { added, completed, parsed: parsed.length };
@@ -267,6 +375,10 @@ export function syncTasks(
 export interface PickOptions {
   repo: string | null;
   any?: boolean;
+  // ISO-8601 UTC; defaults to new Date().toISOString() at call time. Passed
+  // in so tests can pin "now" and exercise the scheduled_for gate
+  // deterministically.
+  nowIso?: string;
 }
 
 // Pickable status is `pending` only — drafts (status='draft') are intentionally
@@ -274,25 +386,65 @@ export interface PickOptions {
 // been enriched and human-approved via `batonq promote`. Do NOT broaden this
 // filter to `status != 'done'` or similar — that would silently re-open the
 // queue to drafts. See test "selectCandidate skips drafts" in core.test.ts.
+//
+// Ordering (shared across all scope branches — keep in sync):
+//   1. priority: high (0) < normal (1) < low (2). Explicit CASE so adding a
+//      fourth bucket later doesn't silently fall through to the default.
+//   2. COALESCE(scheduled_for, created_at) ASC — fire scheduled work as soon
+//      as it's ripe; otherwise FIFO by creation.
+//   3. created_at ASC — final tiebreaker so identical-priority / identical-
+//      schedule rows still pick deterministically instead of depending on
+//      SQLite's rowid quirks.
+//
+// Gate: scheduled_for IS NULL OR scheduled_for <= :now — tasks whose
+// scheduled_for is in the future are invisible to pick. String comparison is
+// safe because normalizeScheduledFor canonicalises everything to the same
+// ISO-8601 Z-suffixed shape on the way in.
+const PICK_ORDER_BY = `
+  CASE priority
+    WHEN 'high' THEN 0
+    WHEN 'normal' THEN 1
+    ELSE 2
+  END ASC,
+  COALESCE(scheduled_for, created_at) ASC,
+  created_at ASC
+`;
+
 export function selectCandidate(db: Database, opts: PickOptions): any {
   const { repo, any } = opts;
+  const nowIso = opts.nowIso ?? new Date().toISOString();
+  const scheduleGate = `(scheduled_for IS NULL OR scheduled_for <= ?)`;
+
   if (any) {
     return db
-      .query(`SELECT * FROM tasks WHERE status = 'pending' ORDER BY id LIMIT 1`)
-      .get();
+      .query(
+        `SELECT * FROM tasks
+         WHERE status = 'pending' AND ${scheduleGate}
+         ORDER BY ${PICK_ORDER_BY}
+         LIMIT 1`,
+      )
+      .get(nowIso);
   }
   if (repo) {
     return db
       .query(
-        `SELECT * FROM tasks WHERE status = 'pending' AND (repo = ? OR repo LIKE 'any:%') ORDER BY id LIMIT 1`,
+        `SELECT * FROM tasks
+         WHERE status = 'pending' AND ${scheduleGate}
+           AND (repo = ? OR repo LIKE 'any:%')
+         ORDER BY ${PICK_ORDER_BY}
+         LIMIT 1`,
       )
-      .get(repo);
+      .get(nowIso, repo);
   }
   return db
     .query(
-      `SELECT * FROM tasks WHERE status = 'pending' AND repo LIKE 'any:%' ORDER BY id LIMIT 1`,
+      `SELECT * FROM tasks
+       WHERE status = 'pending' AND ${scheduleGate}
+         AND repo LIKE 'any:%'
+       ORDER BY ${PICK_ORDER_BY}
+       LIMIT 1`,
     )
-    .get();
+    .get(nowIso);
 }
 
 export function claimCandidate(
@@ -672,6 +824,9 @@ export interface NewTask {
   body: string;
   verify?: string;
   judge?: string;
+  priority?: TaskPriority;
+  // ISO-8601 UTC. Must be a canonicalised string (see normalizeScheduledFor).
+  scheduledFor?: string;
 }
 
 export function buildTaskLines(
@@ -685,6 +840,13 @@ export function buildTaskLines(
   const judge = t.judge?.trim();
   if (verify) out.push(`  verify: ${verify}`);
   if (judge) out.push(`  judge: ${judge}`);
+  // Only emit priority when it's a meaningful deviation from the default, so
+  // routine tasks stay one-liners. `scheduled_for` is emitted verbatim if
+  // provided — it's a caller promise that the value is already normalised.
+  if (t.priority && t.priority !== DEFAULT_PRIORITY) {
+    out.push(`  priority: ${t.priority}`);
+  }
+  if (t.scheduledFor) out.push(`  scheduled_for: ${t.scheduledFor}`);
   return out;
 }
 

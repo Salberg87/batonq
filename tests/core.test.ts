@@ -18,12 +18,16 @@ import {
   appendClarifyingAnswers,
   appendTaskToPending,
   applyEnrichment,
+  buildTaskLines,
   claimCandidate,
+  DEFAULT_PRIORITY,
   enrichTaskBody,
   externalId,
   getGitDiffSinceClaim,
   initClaimsSchema,
   initTaskSchema,
+  normalizePriority,
+  normalizeScheduledFor,
   parseEnrichResponse,
   parseTasksFile,
   parseTasksText,
@@ -2159,5 +2163,313 @@ describe("uninstall.sh", () => {
     } finally {
       rmSync(fakeHome, { recursive: true, force: true });
     }
+  });
+});
+
+// ── priority + scheduled_for feature ──────────────────────────────────────────
+
+describe("priority + scheduled_for", () => {
+  test("normalizePriority maps known, defaults unknown to 'normal'", () => {
+    expect(normalizePriority("high")).toBe("high");
+    expect(normalizePriority(" HIGH ")).toBe("high");
+    expect(normalizePriority("Normal")).toBe("normal");
+    expect(normalizePriority("low")).toBe("low");
+    expect(normalizePriority("urgent")).toBe("normal");
+    expect(normalizePriority("")).toBe("normal");
+    expect(normalizePriority(null)).toBe("normal");
+    expect(normalizePriority(undefined)).toBe("normal");
+    expect(DEFAULT_PRIORITY).toBe("normal");
+  });
+
+  test("normalizeScheduledFor requires full ISO-8601 with time+tz", () => {
+    expect(normalizeScheduledFor("2026-05-01T09:00:00Z")).toBe(
+      "2026-05-01T09:00:00.000Z",
+    );
+    // Offset timezone is canonicalised to UTC Z
+    expect(normalizeScheduledFor("2026-05-01T11:00:00+02:00")).toBe(
+      "2026-05-01T09:00:00.000Z",
+    );
+    // Rejected: bare date, missing tz, garbage
+    expect(normalizeScheduledFor("2026-05-01")).toBeNull();
+    expect(normalizeScheduledFor("2026-05-01T09:00:00")).toBeNull();
+    expect(normalizeScheduledFor("tomorrow")).toBeNull();
+    expect(normalizeScheduledFor("")).toBeNull();
+    expect(normalizeScheduledFor(null)).toBeNull();
+  });
+
+  test("parser extracts priority: and scheduled_for: directives", () => {
+    const { tasks } = parseTasksText(
+      [
+        "## Pending",
+        "- [ ] **any:infra** — urgent hotfix",
+        "  priority: high",
+        "  scheduled_for: 2026-05-01T09:00:00Z",
+        "  verify: exit 0",
+        "",
+        "- [ ] **any:infra** — plain task with no metadata",
+        "",
+        "- [ ] **any:infra** — unknown priority falls back",
+        "  priority: URGENT",
+      ].join("\n"),
+    );
+    expect(tasks).toHaveLength(3);
+    expect(tasks[0]!.priority).toBe("high");
+    expect(tasks[0]!.scheduledFor).toBe("2026-05-01T09:00:00.000Z");
+    expect(tasks[0]!.verifyCmd).toBe("exit 0");
+    expect(tasks[1]!.priority).toBeUndefined();
+    expect(tasks[1]!.scheduledFor).toBeUndefined();
+    // normalizePriority lower-cases and rejects unknowns → "normal"
+    expect(tasks[2]!.priority).toBe("normal");
+  });
+
+  test("parser ignores priority: / scheduled_for: inside code fences", () => {
+    const { tasks } = parseTasksText(
+      [
+        "- [ ] **any:infra** — fenced example",
+        "  Example markdown:",
+        "  ```",
+        "  priority: high",
+        "  scheduled_for: 2026-05-01T09:00:00Z",
+        "  ```",
+      ].join("\n"),
+    );
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]!.priority).toBeUndefined();
+    expect(tasks[0]!.scheduledFor).toBeUndefined();
+  });
+
+  test("syncTasks persists priority + scheduled_for and updates on edit", () => {
+    const db = memDb();
+    const t: ParsedTask = {
+      repo: "any:infra",
+      body: "scheduled hotfix",
+      status: "pending",
+      lineIdx: 0,
+      priority: "high",
+      scheduledFor: "2026-05-01T09:00:00.000Z",
+    };
+    syncTasks(db, [t], "2026-04-23T10:00:00.000Z");
+    let row = db
+      .query("SELECT * FROM tasks WHERE repo = ?")
+      .get("any:infra") as any;
+    expect(row.priority).toBe("high");
+    expect(row.scheduled_for).toBe("2026-05-01T09:00:00.000Z");
+
+    // Editing the MD (priority flipped, schedule cleared) must re-rank the row.
+    syncTasks(
+      db,
+      [{ ...t, priority: "low", scheduledFor: undefined }],
+      "2026-04-23T10:05:00.000Z",
+    );
+    row = db
+      .query("SELECT * FROM tasks WHERE repo = ?")
+      .get("any:infra") as any;
+    expect(row.priority).toBe("low");
+    expect(row.scheduled_for).toBeNull();
+    db.close();
+  });
+
+  test("default priority is 'normal' when the directive is absent", () => {
+    const db = memDb();
+    syncTasks(
+      db,
+      [{ repo: "any:infra", body: "plain", status: "pending", lineIdx: 0 }],
+      "2026-04-23T10:00:00.000Z",
+    );
+    const row = db
+      .query("SELECT priority, scheduled_for FROM tasks WHERE body = ?")
+      .get("plain") as any;
+    expect(row.priority).toBe("normal");
+    expect(row.scheduled_for).toBeNull();
+  });
+
+  test("selectCandidate orders high → normal → low, FIFO within a priority", () => {
+    const db = memDb();
+    const mk = (body: string, priority: string, createdAt: string) =>
+      db.run(
+        `INSERT INTO tasks (external_id, repo, body, status, created_at, priority) VALUES (?, ?, ?, 'pending', ?, ?)`,
+        [externalId("any:infra", body), "any:infra", body, createdAt, priority],
+      );
+    // Deliberately out-of-order insertion so the test would fail if the
+    // query silently fell back to id/rowid ordering.
+    mk("low-1", "low", "2026-04-23T10:00:00.000Z");
+    mk("normal-2", "normal", "2026-04-23T10:00:02.000Z");
+    mk("high-1", "high", "2026-04-23T10:00:03.000Z");
+    mk("normal-1", "normal", "2026-04-23T10:00:01.000Z");
+    mk("high-2", "high", "2026-04-23T10:00:04.000Z");
+
+    // Drain the queue and record the order. Use a large "now" so scheduling
+    // is a no-op; we only exercise priority + FIFO tiebreakers here.
+    const seen: string[] = [];
+    for (;;) {
+      const c = selectCandidate(db, {
+        repo: "any:infra",
+        nowIso: "2099-01-01T00:00:00.000Z",
+      });
+      if (!c) break;
+      seen.push(c.body);
+      db.run(`UPDATE tasks SET status = 'done' WHERE id = ?`, [c.id]);
+    }
+    expect(seen).toEqual(["high-1", "high-2", "normal-1", "normal-2", "low-1"]);
+    db.close();
+  });
+
+  test("selectCandidate hides tasks whose scheduled_for is in the future", () => {
+    const db = memDb();
+    const mk = (body: string, sched: string | null, priority = "normal") =>
+      db.run(
+        `INSERT INTO tasks (external_id, repo, body, status, created_at, priority, scheduled_for) VALUES (?, ?, ?, 'pending', ?, ?, ?)`,
+        [
+          externalId("any:infra", body),
+          "any:infra",
+          body,
+          "2026-04-23T10:00:00.000Z",
+          priority,
+          sched,
+        ],
+      );
+    mk("future-high", "2099-01-01T00:00:00.000Z", "high");
+    mk("ripe-low", "2026-04-23T09:00:00.000Z", "low");
+    mk("unscheduled-normal", null, "normal");
+
+    const now = "2026-04-23T10:00:00.000Z";
+    // At `now`, the high-priority task is still in the future — it MUST NOT
+    // win, even though high outranks normal and low. The ripe low-priority
+    // task is visible but loses to the unscheduled normal on priority.
+    const c1 = selectCandidate(db, { repo: "any:infra", nowIso: now });
+    expect(c1.body).toBe("unscheduled-normal");
+
+    // After draining the normal task, pick falls through to the ripe low one
+    // — but still skips the future high because its gate is closed.
+    db.run(
+      `UPDATE tasks SET status = 'done' WHERE body = 'unscheduled-normal'`,
+    );
+    const c2 = selectCandidate(db, { repo: "any:infra", nowIso: now });
+    expect(c2.body).toBe("ripe-low");
+
+    // Advance past the future task's scheduled_for — it now dominates.
+    db.run(`UPDATE tasks SET status = 'done' WHERE body = 'ripe-low'`);
+    const c3 = selectCandidate(db, {
+      repo: "any:infra",
+      nowIso: "2099-01-02T00:00:00.000Z",
+    });
+    expect(c3.body).toBe("future-high");
+    db.close();
+  });
+
+  test("when two tasks share priority, earlier scheduled_for wins over later", () => {
+    const db = memDb();
+    const mk = (body: string, sched: string) =>
+      db.run(
+        `INSERT INTO tasks (external_id, repo, body, status, created_at, priority, scheduled_for) VALUES (?, ?, ?, 'pending', ?, 'normal', ?)`,
+        [
+          externalId("any:infra", body),
+          "any:infra",
+          body,
+          // created_at deliberately reversed so FIFO alone would pick "later"
+          body === "later"
+            ? "2026-04-23T10:00:00.000Z"
+            : "2026-04-23T10:00:05.000Z",
+          sched,
+        ],
+      );
+    mk("later", "2026-04-23T10:00:00.000Z"); // inserted first but later schedule
+    mk("earlier", "2026-04-23T09:00:00.000Z"); // earlier schedule should win
+
+    const c = selectCandidate(db, {
+      repo: "any:infra",
+      nowIso: "2099-01-01T00:00:00.000Z",
+    });
+    expect(c.body).toBe("earlier");
+    db.close();
+  });
+
+  test("scope filters still apply on top of priority + schedule", () => {
+    const db = memDb();
+    const mk = (repo: string, body: string, priority = "normal") =>
+      db.run(
+        `INSERT INTO tasks (external_id, repo, body, status, created_at, priority) VALUES (?, ?, ?, 'pending', ?, ?)`,
+        [
+          externalId(repo, body),
+          repo,
+          body,
+          "2026-04-23T10:00:00.000Z",
+          priority,
+        ],
+      );
+    mk("repo-a", "repo-a high", "high");
+    mk("repo-b", "repo-b high", "high"); // must not leak into repo-a picks
+    mk("any:infra", "any low", "low");
+
+    const inA = selectCandidate(db, { repo: "repo-a" });
+    expect(inA.body).toBe("repo-a high");
+    const outOfRepo = selectCandidate(db, { repo: null });
+    expect(outOfRepo.body).toBe("any low");
+    const anyScope = selectCandidate(db, { repo: null, any: true });
+    // With --any, repo-b's high-priority task becomes reachable.
+    expect(["repo-a high", "repo-b high"]).toContain(anyScope.body);
+    db.close();
+  });
+
+  test("buildTaskLines emits priority/scheduled_for only when non-default / set", () => {
+    const basic = buildTaskLines({ repo: "any:infra", body: "x" });
+    expect(basic).toEqual(["- [ ] **any:infra** — x"]);
+
+    const withHigh = buildTaskLines({
+      repo: "any:infra",
+      body: "x",
+      priority: "high",
+      scheduledFor: "2026-05-01T09:00:00.000Z",
+    });
+    expect(withHigh).toEqual([
+      "- [ ] **any:infra** — x",
+      "  priority: high",
+      "  scheduled_for: 2026-05-01T09:00:00.000Z",
+    ]);
+
+    // 'normal' is the default → don't serialise it (keep tasks terse)
+    const withNormal = buildTaskLines({
+      repo: "any:infra",
+      body: "x",
+      priority: "normal",
+    });
+    expect(withNormal).toEqual(["- [ ] **any:infra** — x"]);
+  });
+
+  test("initTaskSchema migration adds priority + scheduled_for to pre-existing DB", () => {
+    // Simulate a legacy DB that has the "tasks" table WITHOUT the new columns.
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        external_id TEXT UNIQUE NOT NULL,
+        repo TEXT NOT NULL,
+        body TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL
+      );
+    `);
+    db.run(
+      `INSERT INTO tasks (external_id, repo, body, status, created_at) VALUES (?, 'any:infra', 'legacy', 'pending', ?)`,
+      [externalId("any:infra", "legacy"), "2026-04-23T10:00:00.000Z"],
+    );
+
+    // Run migration.
+    initTaskSchema(db);
+
+    // New columns exist and default correctly for existing rows.
+    const row = db
+      .query("SELECT priority, scheduled_for FROM tasks WHERE body = 'legacy'")
+      .get() as any;
+    expect(row.priority).toBe("normal");
+    expect(row.scheduled_for).toBeNull();
+
+    // And pick now works against the migrated DB.
+    const c = selectCandidate(db, {
+      repo: "any:infra",
+      nowIso: "2026-04-23T11:00:00.000Z",
+    });
+    expect(c.body).toBe("legacy");
+    db.close();
   });
 });

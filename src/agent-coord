@@ -1172,6 +1172,10 @@ function pickTask(): void {
     console.log(`TASK_CLAIMED`);
     console.log(`external_id: ${candidate.external_id}`);
     console.log(`repo:        ${candidate.repo}`);
+    console.log(`priority:    ${candidate.priority ?? "normal"}`);
+    if (candidate.scheduled_for) {
+      console.log(`scheduled:   ${candidate.scheduled_for}`);
+    }
     console.log(`session:     ${session}`);
     console.log(``);
     console.log(`TASK:`);
@@ -1193,17 +1197,23 @@ function mineTask(): void {
   const others = db
     .query(`SELECT * FROM tasks WHERE status = 'claimed' AND claimed_by != ? ORDER BY claimed_at`)
     .all(session) as any[];
+  const prioBadge = (p: string | null | undefined) =>
+    p === "high" ? "[H]" : p === "low" ? "[L]" : "[N]";
   console.log(`My claims (${mine.length}) — session ${session}:`);
   for (const r of mine) {
     const ageS = Math.round((Date.now() - Date.parse(r.claimed_at)) / 1000);
-    console.log(`  ${r.external_id}  [${r.repo}] ${r.body}  (${ageS}s ago)`);
+    console.log(
+      `  ${r.external_id}  ${prioBadge(r.priority)} [${r.repo}] ${r.body}  (${ageS}s ago)`,
+    );
   }
   if (others.length) {
     console.log();
     console.log(`Other sessions' claims (${others.length}):`);
     for (const r of others) {
       const ageS = Math.round((Date.now() - Date.parse(r.claimed_at)) / 1000);
-      console.log(`  ${r.external_id}  [${r.repo}] ${r.body}  — ${r.claimed_by}  (${ageS}s ago)`);
+      console.log(
+        `  ${r.external_id}  ${prioBadge(r.priority)} [${r.repo}] ${r.body}  — ${r.claimed_by}  (${ageS}s ago)`,
+      );
     }
   }
   db.close();
@@ -1394,24 +1404,45 @@ function abandonTask(id?: string): void {
 function listTasks(): void {
   syncTasks(false);
   const db = openTaskDb();
+  const now = new Date().toISOString();
   const groups: Array<["pending" | "claimed" | "done", string]> = [
     ["pending", "Pending"],
     ["claimed", "Claimed"],
     ["done", "Done (recent)"],
   ];
   for (const [status, label] of groups) {
-    const rows = db
-      .query(
-        status === "done"
-          ? `SELECT * FROM tasks WHERE status = ? ORDER BY completed_at DESC LIMIT 10`
-          : `SELECT * FROM tasks WHERE status = ? ORDER BY id`
-      )
-      .all(status) as any[];
+    // Pending rows are listed in the same order pick() consumes them (priority,
+    // ripe scheduled_for, then created_at) so this view is a faithful preview
+    // of the next claims. Claimed + done keep their existing order.
+    const query =
+      status === "done"
+        ? `SELECT * FROM tasks WHERE status = ? ORDER BY completed_at DESC LIMIT 10`
+        : status === "pending"
+          ? `SELECT * FROM tasks WHERE status = ?
+             ORDER BY
+               CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END ASC,
+               COALESCE(scheduled_for, created_at) ASC,
+               created_at ASC`
+          : `SELECT * FROM tasks WHERE status = ? ORDER BY id`;
+    const rows = db.query(query).all(status) as any[];
     if (rows.length === 0) continue;
     console.log(`${label} (${rows.length}):`);
     for (const r of rows) {
-      const badge = status === "claimed" ? `[claimed by ${r.claimed_by.slice(0, 12)}]` : "";
-      console.log(`  ${r.external_id}  [${r.repo}] ${r.body}  ${badge}`);
+      const prio = r.priority ?? "normal";
+      const prioBadge =
+        prio === "high" ? "[H]" : prio === "low" ? "[L]" : "[N]";
+      const schedBadge = r.scheduled_for
+        ? r.scheduled_for > now
+          ? ` ⏰${r.scheduled_for}`
+          : ` ⏰(ripe)`
+        : "";
+      const claimBadge =
+        status === "claimed" && r.claimed_by
+          ? `  [claimed by ${r.claimed_by.slice(0, 12)}]`
+          : "";
+      console.log(
+        `  ${r.external_id}  ${prioBadge} [${r.repo}] ${r.body}${schedBadge}${claimBadge}`,
+      );
     }
     console.log();
   }

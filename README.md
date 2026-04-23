@@ -152,6 +152,13 @@ already claimed.
 - **Judge agent** — an optional second-layer LLM review (`judge:` line).
   Only a `PASS` verdict lets the task close; `FAIL` leaves it claimed with
   the reasoning in the event log.
+- **Priority + scheduling** — add optional `priority: high|normal|low`
+  (default `normal`) and/or `scheduled_for: <ISO-8601 UTC>` directives
+  under a task. `pick` drains `high` before `normal` before `low`; within a
+  priority, tasks whose `scheduled_for` is in the future are invisible, and
+  ripe tasks fire earliest-first. Stable ordering: `high → normal → low`,
+  then `COALESCE(scheduled_for, created_at)` ascending, then `created_at` as
+  the final tiebreaker.
 - **Hooks** — `batonq-hook` plugs into Claude Code's PreToolUse and
   PostToolUse hooks. Layer 1 appends JSONL measurement events; layer 2
   enforces file locks, so two parallel agents can't write to the same path.
