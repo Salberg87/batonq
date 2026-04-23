@@ -78,6 +78,10 @@ part you'd reach for when you want coordination as a _primitive_, not a
 platform. Pass the baton, finish the leg, prove the work. Small surface,
 big leverage, boring on purpose.
 
+For an honest side-by-side vs claude-squad, crystal, conductor, manual
+`/loop` scripts, and ccswarm — including where those tools beat batonq —
+see [docs/comparison.md](./docs/comparison.md).
+
 ## Demo
 
 Run `batonq tui` (or `bun src/tui.tsx` from a checkout) to see the live
