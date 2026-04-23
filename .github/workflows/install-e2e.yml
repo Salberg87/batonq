@@ -1,0 +1,91 @@
+name: Install E2E
+
+# Why this workflow exists: install.sh has historically shipped broken — the
+# earliest version `cp`'d src/agent-coord verbatim to bindir/batonq, and the
+# first sibling `import` crashed with "Cannot find module './loop-status'".
+# This job runs install.sh against the *current* commit (not main) on both
+# Linux and macOS, then invokes `batonq status` and fails the build if
+# module-resolution errors leak through.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  install-e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+
+      # install.sh hard-requires jq (settings merge). On macOS it also needs
+      # gtimeout from coreutils (batonq-loop timeout wrapper).
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install jq coreutils
+
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      # install.sh clones ${BATONQ_REPO_URL} at branch ${BATONQ_BRANCH}. The
+      # checkout action leaves us on a detached HEAD, so name it explicitly
+      # and let file:// serve the clone back to the installer. This is what
+      # makes the test cover the PR's install.sh (not main's).
+      - name: Create named branch for file:// clone
+        shell: bash
+        run: git checkout -B ci-install-test
+
+      - name: Run install.sh with isolated HOME
+        shell: bash
+        env:
+          BATONQ_REPO_URL: file://${{ github.workspace }}
+          BATONQ_BRANCH: ci-install-test
+        run: |
+          set -euo pipefail
+          export HOME=/tmp/fake-home
+          mkdir -p "$HOME/.local/bin"
+          export PATH="$HOME/.local/bin:$PATH"
+          sh install.sh
+
+      - name: Verify batonq status (no "Cannot find module")
+        shell: bash
+        run: |
+          set -uo pipefail
+          export HOME=/tmp/fake-home
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # Capture both the exit code and output — `status` should exit 0
+          # on a fresh install with an empty DB, but the primary failure we
+          # guard against is module-resolution crashes from a broken bundle.
+          set +e
+          output=$(batonq status 2>&1)
+          rc=$?
+          set -e
+
+          echo "---- batonq status (rc=$rc) ----"
+          printf '%s\n' "$output"
+          echo "--------------------------------"
+
+          if printf '%s' "$output" | grep -q "Cannot find module"; then
+            echo "FAIL: batonq status emitted 'Cannot find module' — installer bundled without sibling imports."
+            exit 1
+          fi
+
+          if [ "$rc" -ne 0 ]; then
+            echo "FAIL: batonq status exited $rc."
+            exit "$rc"
+          fi
+
+          echo "PASS: batonq status ran cleanly with no module-resolution errors."

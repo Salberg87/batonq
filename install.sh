@@ -17,8 +17,12 @@
 set -euo pipefail
 
 NAME="batonq"
-REPO_URL="https://github.com/Salberg87/${NAME}.git"
-BRANCH="main"
+# REPO_URL / BRANCH are overridable so CI (and anyone debugging a broken
+# install) can point the installer at a file:// clone of the current checkout
+# instead of fetching main from GitHub. Production curl|sh users never set
+# these — the defaults match the public repo.
+REPO_URL="${BATONQ_REPO_URL:-https://github.com/Salberg87/${NAME}.git}"
+BRANCH="${BATONQ_BRANCH:-main}"
 TMP_DIR="/tmp/${NAME}-install"
 CLAUDE_DIR="${HOME}/.claude"
 SETTINGS="${CLAUDE_DIR}/settings.json"
