@@ -260,6 +260,7 @@ export function App() {
       return;
     }
     if (input === "e") {
+      // 'e'/_enrich keybind: enrich selected draft via `batonq enrich <id>`.
       if (focus !== "tasks") {
         setFlash({ msg: "'e' only works on Tasks panel", color: C.warn });
         return;
@@ -331,6 +332,7 @@ export function App() {
       return;
     }
     if (input === "p") {
+      // 'p'/_promote keybind: flip selected draft → pending (pick will see it).
       if (focus !== "tasks") {
         setFlash({ msg: "'p' only works on Tasks panel", color: C.warn });
         return;
