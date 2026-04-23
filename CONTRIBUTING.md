@@ -6,7 +6,7 @@ purpose — keep that in mind when proposing changes.
 ## Development setup
 
 ```sh
-git clone https://github.com/fsalb/batonq.git
+git clone https://github.com/Salberg87/batonq.git
 cd batonq
 bun install
 ```
