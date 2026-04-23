@@ -418,6 +418,8 @@ function resolveRepoPath(repoName: string): string {
 }
 
 function runJudge(judgePrompt: string, gitDiff: string, cwd: string): { passed: boolean; output: string } {
+  // Invariant: PASS requires result.status === 0 && !result.error FIRST — never
+  // trust stdout alone (a non-zero exit whose stdout contains "PASS" must NOT gate through).
   const MAX_OUTPUT = 1024 * 1024 * 4; // 4 MB
   const prompt = `${judgePrompt}\n\n---\nGit diff:\n\`\`\`\n${gitDiff}\n\`\`\`\n\nRespond with PASS or FAIL on the first line, followed by a brief explanation.`;
 
