@@ -1,4 +1,5 @@
 [test]
+preload = ["./tests/_coverage-preload.ts"]
 coverageThreshold = { line = 0.70, function = 0.60 }
 coverageReporter = ["text", "lcov"]
 coverageDir = "coverage"
