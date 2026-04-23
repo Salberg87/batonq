@@ -1517,3 +1517,225 @@ describe("TUI L-keybind opens restart confirm overlay", () => {
     unmount();
   });
 });
+
+// ── §5: Drill-down overlay ───────────────────────────────────────────────────
+//
+// Spec: docs/tui-ux-v2.md §5. Enter on a task row opens a full-screen modal
+// with the full body, verify_cmd + tailed output, judge_cmd + headed verdict,
+// and commits since claim. Esc closes; `a`/`r`/`e` mirror the main-panel
+// keybinds so the operator can act on what they see without backing out.
+
+import {
+  buildDrillDownView,
+  DrillDownOverlay,
+  type DrillDownView,
+} from "../src/drill-down";
+
+describe("DrillDownOverlay (§5)", () => {
+  const baseView: DrillDownView = {
+    externalId: "63da83f9ef7c",
+    status: "done",
+    badge: "✓V ✓J",
+    body: "Implement TUI §5 (Drill-down overlay) — Enter opens full-screen modal with verify+judge+commits",
+    verifyCmd: "bun test tests/tui.test.ts",
+    verifyTail: [
+      "PASS tests/tui.test.ts",
+      "  ✓ renders drill-down overlay",
+      "  ✓ Esc closes overlay",
+      "",
+      "3 pass, 0 fail",
+    ],
+    judgeCmd: "did the overlay render correctly?",
+    judgeHead: [
+      "PASS",
+      "overlay shows body, verify, judge, commits",
+      "all keybinds wired",
+    ],
+    commits: [
+      { sha: "a1b2c3d", subject: "feat(tui): drill-down overlay §5" },
+      { sha: "d4e5f6a", subject: "test(tui): drill-down overlay tests" },
+    ],
+  };
+
+  test("renders full body, verify cmd + tail, judge cmd + head, commits, and footer keybinds", () => {
+    const { lastFrame, unmount } = render(
+      React.createElement(DrillDownOverlay, {
+        view: baseView,
+        onClose: () => {},
+        onAbandon: () => {},
+        onRelease: () => {},
+        onEnrich: () => {},
+      }),
+    );
+    const out = lastFrame() ?? "";
+    // Header: full external id, status, badge.
+    expect(out).toContain("Task 63da83f9ef7c");
+    expect(out).toContain("[done]");
+    expect(out).toContain("✓V ✓J");
+    // Full body — not truncated to 60/80 chars like the Tasks panel.
+    expect(out).toContain("Implement TUI §5");
+    expect(out).toContain("verify+judge+commits");
+    // Verify cmd + a few tail lines (the helper clips to 30 lines; here we
+    // asserted presence of the assertion + summary).
+    expect(out).toContain("Verify cmd:");
+    expect(out).toContain("bun test tests/tui.test.ts");
+    expect(out).toContain("Verify output (last 30 lines):");
+    expect(out).toContain("PASS tests/tui.test.ts");
+    expect(out).toContain("3 pass, 0 fail");
+    // Judge cmd + head.
+    expect(out).toContain("Judge cmd:");
+    expect(out).toContain("did the overlay render correctly?");
+    expect(out).toContain("Judge verdict:");
+    expect(out).toContain("PASS");
+    expect(out).toContain("all keybinds wired");
+    // Commits — count in header, rows show sha + subject.
+    expect(out).toContain("Commits since claim (2):");
+    expect(out).toContain("a1b2c3d");
+    expect(out).toContain("drill-down overlay §5");
+    expect(out).toContain("d4e5f6a");
+    // Footer keybinds.
+    expect(out).toContain("Esc");
+    expect(out).toContain("close");
+    expect(out).toContain("abandon");
+    expect(out).toContain("release-claim");
+    expect(out).toContain("enrich");
+    unmount();
+  });
+
+  test("Esc triggers onClose without firing any action callback", async () => {
+    let closed = false;
+    let abandoned = false;
+    let released = false;
+    let enriched = false;
+    const { stdin, unmount } = render(
+      React.createElement(DrillDownOverlay, {
+        view: baseView,
+        onClose: () => {
+          closed = true;
+        },
+        onAbandon: () => {
+          abandoned = true;
+        },
+        onRelease: () => {
+          released = true;
+        },
+        onEnrich: () => {
+          enriched = true;
+        },
+      }),
+    );
+    stdin.write("\x1B"); // ESC
+    await new Promise((r) => setTimeout(r, 20));
+    unmount();
+
+    expect(closed).toBe(true);
+    expect(abandoned).toBe(false);
+    expect(released).toBe(false);
+    expect(enriched).toBe(false);
+  });
+
+  test("a/r/e keybinds route to their respective callbacks inside the overlay", async () => {
+    const fired: string[] = [];
+    const make = (label: string) => () => {
+      fired.push(label);
+    };
+    const { stdin, unmount } = render(
+      React.createElement(DrillDownOverlay, {
+        view: baseView,
+        onClose: make("close"),
+        onAbandon: make("abandon"),
+        onRelease: make("release"),
+        onEnrich: make("enrich"),
+      }),
+    );
+    stdin.write("a");
+    await new Promise((r) => setTimeout(r, 10));
+    stdin.write("r");
+    await new Promise((r) => setTimeout(r, 10));
+    stdin.write("e");
+    await new Promise((r) => setTimeout(r, 10));
+    unmount();
+
+    expect(fired).toEqual(["abandon", "release", "enrich"]);
+  });
+
+  test("empty outputs show '(none)' placeholders instead of blank gaps", () => {
+    const { lastFrame, unmount } = render(
+      React.createElement(DrillDownOverlay, {
+        view: {
+          ...baseView,
+          verifyCmd: null,
+          verifyTail: [],
+          judgeCmd: null,
+          judgeHead: [],
+          commits: [],
+        },
+        onClose: () => {},
+        onAbandon: () => {},
+        onRelease: () => {},
+        onEnrich: () => {},
+      }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("— none —"); // verify + judge cmd placeholder
+    // Three sections with (none): verify output, judge verdict, commits.
+    const noneCount = (out.match(/\(none\)/g) ?? []).length;
+    expect(noneCount).toBeGreaterThanOrEqual(3);
+    expect(out).toContain("Commits since claim (0):");
+    unmount();
+  });
+});
+
+describe("buildDrillDownView (pure)", () => {
+  const task: TaskRow = {
+    id: 42,
+    external_id: "abcdef0123",
+    repo: "any:infra",
+    body: "body text",
+    status: "done",
+    claimed_by: null,
+    claimed_at: null,
+    completed_at: null,
+    created_at: "2026-04-23T10:00:00.000Z",
+    verify_cmd: "bun test",
+    // 35 lines — tailLines must clip to 30.
+    verify_output: Array.from({ length: 35 }, (_, i) => `v-line-${i}`).join(
+      "\n",
+    ),
+    verify_ran_at: "2026-04-23T10:30:00.000Z",
+    judge_cmd: "ok?",
+    // 20 lines — headLines must clip to 15.
+    judge_output: Array.from({ length: 20 }, (_, i) => `j-line-${i}`).join(
+      "\n",
+    ),
+    judge_ran_at: "2026-04-23T10:31:00.000Z",
+  };
+
+  test("tail clips verify to 30 lines (keeps the end) and head clips judge to 15 (keeps the start)", () => {
+    const view = buildDrillDownView(task, null);
+    expect(view.verifyTail.length).toBe(30);
+    // First surviving verify line is v-line-5 (35 − 30 = 5).
+    expect(view.verifyTail[0]).toBe("v-line-5");
+    expect(view.verifyTail[view.verifyTail.length - 1]).toBe("v-line-34");
+
+    expect(view.judgeHead.length).toBe(15);
+    expect(view.judgeHead[0]).toBe("j-line-0");
+    expect(view.judgeHead[view.judgeHead.length - 1]).toBe("j-line-14");
+  });
+
+  test("done status surfaces the doneBadge in the view header", () => {
+    const view = buildDrillDownView(task, null);
+    // Task has verify_ran_at + judge_ran_at → ✓V ✓J badge.
+    expect(view.badge).toBe("✓V ✓J");
+  });
+
+  test("non-done status has no badge (badge is null)", () => {
+    const view = buildDrillDownView({ ...task, status: "claimed" }, null);
+    expect(view.badge).toBeNull();
+  });
+
+  test("null repoCwd yields empty commit list (no git spawn)", () => {
+    const view = buildDrillDownView(task, null);
+    expect(view.commits).toEqual([]);
+  });
+});
