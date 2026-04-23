@@ -4,6 +4,7 @@
 
 import { Database } from "bun:sqlite";
 import {
+  appendFileSync,
   closeSync,
   existsSync,
   openSync,
@@ -15,7 +16,16 @@ import {
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 
-export type TaskStatus = "draft" | "pending" | "claimed" | "done";
+// OpenClaw-inspired claim TTL: claimed tasks must show progress (PostToolUse
+// touches `last_progress_at`) within this window or they're candidates for
+// recovery. A separate heartbeat gate protects sessions that are alive but
+// between tool calls; only sessions that also miss their heartbeat transition
+// to `lost` and land in the escalation log.
+export const TASK_CLAIM_TTL_MS = 30 * 60 * 1000;
+export const TASK_RECOVERY_HEARTBEAT_MS = 5 * 60 * 1000;
+export const DEFAULT_ESCALATION_LOG_PATH = "/tmp/batonq-escalations.log";
+
+export type TaskStatus = "draft" | "pending" | "claimed" | "done" | "lost";
 
 export interface ParsedTask {
   repo: string;
@@ -136,7 +146,8 @@ export function initTaskSchema(db: Database): void {
       judge_output TEXT,
       judge_ran_at TEXT,
       enrich_questions TEXT,
-      original_body TEXT
+      original_body TEXT,
+      last_progress_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status);
     CREATE INDEX IF NOT EXISTS idx_task_repo_status ON tasks(repo, status);
@@ -163,6 +174,8 @@ export function initTaskSchema(db: Database): void {
     db.exec("ALTER TABLE tasks ADD COLUMN enrich_questions TEXT");
   if (!has("original_body"))
     db.exec("ALTER TABLE tasks ADD COLUMN original_body TEXT");
+  if (!has("last_progress_at"))
+    db.exec("ALTER TABLE tasks ADD COLUMN last_progress_at TEXT");
 }
 
 export function initClaimsSchema(db: Database): void {
@@ -305,6 +318,151 @@ export function sweepClaims(
     [nowIso, nowIso],
   );
   return { expired: r.changes };
+}
+
+// ── task-claim TTL + lost-state + escalation (OpenClaw-inspired) ──────────────
+//
+// touchTaskProgress refreshes `last_progress_at` on every claimed task owned by
+// a session. Called by the PostToolUse hook so that an agent actively doing
+// work (tool calls) resets the TTL clock. Returns the number of rows touched
+// (0 if the session holds no claims — the common case).
+export function touchTaskProgress(
+  db: Database,
+  sessionId: string,
+  nowIso: string = new Date().toISOString(),
+): { touched: number } {
+  const r = db.run(
+    `UPDATE tasks SET last_progress_at = ?
+     WHERE status = 'claimed' AND claimed_by = ?`,
+    [nowIso, sessionId],
+  );
+  return { touched: r.changes };
+}
+
+export interface TaskRecoveryContext {
+  task: any;
+  session: any | null;
+  nowMs: number;
+}
+
+export type TaskRecoveryDecision =
+  | { kind: "defer"; untilIso: string }
+  | { kind: "mark_lost" };
+
+export type TaskRecoveryHook = (
+  ctx: TaskRecoveryContext,
+) => TaskRecoveryDecision;
+
+// Default recovery gate: if the claiming session shows a heartbeat within
+// TASK_RECOVERY_HEARTBEAT_MS (5 min) we defer another 5 min — the agent is
+// alive but between tool calls. Otherwise mark_lost so sweepTasks can flip
+// status and log an escalation.
+export function defaultTryRecoverTaskBeforeMarkLost(
+  ctx: TaskRecoveryContext,
+): TaskRecoveryDecision {
+  const { session, nowMs } = ctx;
+  const lastSeen = session?.last_seen;
+  if (typeof lastSeen === "string" && lastSeen) {
+    const lastSeenMs = Date.parse(lastSeen);
+    if (
+      Number.isFinite(lastSeenMs) &&
+      nowMs - lastSeenMs < TASK_RECOVERY_HEARTBEAT_MS
+    ) {
+      return {
+        kind: "defer",
+        untilIso: new Date(nowMs + TASK_RECOVERY_HEARTBEAT_MS).toISOString(),
+      };
+    }
+  }
+  return { kind: "mark_lost" };
+}
+
+export interface SweepTasksOptions {
+  nowIso?: string;
+  ttlMs?: number;
+  recover?: TaskRecoveryHook;
+  escalationLogPath?: string;
+  writeEscalation?: (line: string) => void;
+}
+
+export interface SweepTasksResult {
+  scanned: number;
+  lost: number;
+  deferred: number;
+}
+
+// sweepTasks scans claimed tasks whose last progress (or claim time when the
+// task has never been touched) predates now-TTL, runs the recovery hook on
+// each, and either defers (bumps last_progress_at into the future) or marks
+// the task `lost` and appends a line to the escalation log.
+//
+// The escalation log is JSONL with one record per lost task so downstream
+// watchers (humans, Slack bots, …) can tail it without parsing prose.
+export function sweepTasks(
+  db: Database,
+  opts: SweepTasksOptions = {},
+): SweepTasksResult {
+  const nowIso = opts.nowIso ?? new Date().toISOString();
+  const nowMs = Date.parse(nowIso);
+  const ttlMs = opts.ttlMs ?? TASK_CLAIM_TTL_MS;
+  const recover = opts.recover ?? defaultTryRecoverTaskBeforeMarkLost;
+  const cutoffIso = new Date(nowMs - ttlMs).toISOString();
+
+  const stale = db
+    .query(
+      `SELECT * FROM tasks
+       WHERE status = 'claimed'
+         AND COALESCE(last_progress_at, claimed_at) < ?`,
+    )
+    .all(cutoffIso) as any[];
+
+  let lost = 0;
+  let deferred = 0;
+
+  for (const task of stale) {
+    const session = task.claimed_by
+      ? ((db
+          .query(`SELECT * FROM sessions WHERE session_id = ?`)
+          .get(task.claimed_by) as any) ?? null)
+      : null;
+    const decision = recover({ task, session, nowMs });
+    if (decision.kind === "defer") {
+      db.run(`UPDATE tasks SET last_progress_at = ? WHERE id = ?`, [
+        decision.untilIso,
+        task.id,
+      ]);
+      deferred++;
+      continue;
+    }
+    db.run(`UPDATE tasks SET status = 'lost' WHERE id = ?`, [task.id]);
+    lost++;
+    const bodySnippet = (task.body ?? "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 120);
+    const line =
+      JSON.stringify({
+        ts: nowIso,
+        external_id: task.external_id,
+        repo: task.repo,
+        claimed_by: task.claimed_by,
+        claimed_at: task.claimed_at,
+        last_progress_at: task.last_progress_at,
+        body_snippet: bodySnippet,
+      }) + "\n";
+    if (opts.writeEscalation) {
+      opts.writeEscalation(line);
+    } else {
+      const path = opts.escalationLogPath ?? DEFAULT_ESCALATION_LOG_PATH;
+      try {
+        appendFileSync(path, line, { mode: 0o600 });
+      } catch {
+        // non-fatal — sweep is best-effort; next run re-scans anyway
+      }
+    }
+  }
+
+  return { scanned: stale.length, lost, deferred };
 }
 
 export interface VerifyResult {

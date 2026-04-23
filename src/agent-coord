@@ -10,6 +10,7 @@ import { homedir } from "node:os";
 import {
   parseTasksFile as parseTasksFileCore,
   externalId,
+  initClaimsSchema,
   initTaskSchema,
   syncTasks as syncTasksCore,
   selectCandidate,
@@ -21,6 +22,7 @@ import {
   enrichTaskBody,
   applyEnrichment,
   promoteDraftToPending,
+  sweepTasks as sweepTasksCore,
   type ParsedTask,
 } from "./tasks-core";
 
@@ -53,6 +55,9 @@ switch (cmd) {
   case "sweep":
     sweepCmd();
     break;
+  case "sweep-tasks":
+    sweepTasksCmd();
+    break;
   case "sync-tasks":
     syncTasks(true);
     break;
@@ -83,7 +88,7 @@ switch (cmd) {
   default:
     console.error(
       "usage: batonq\n" +
-        "  Coordination:  check | status | release <path> | sweep\n" +
+        "  Coordination:  check | status | release <path> | sweep | sweep-tasks\n" +
         "  Measurement:   tail [-n N] | report [--since ISO] [--until ISO] [--json]\n" +
         "  Tasks:         sync-tasks | pick | mine | done [<id>] | abandon [<id>] | tasks\n" +
         "  Drafts:        enrich <id> | promote <id>\n" +
@@ -283,6 +288,26 @@ function sweepCmd() {
   db.close();
 }
 
+// sweep-tasks: distinct from `sweep` (which releases file-claims and expires
+// sessions). Walks claimed tasks whose last progress predates the TTL, runs
+// the recovery hook on each, and either defers live-but-quiet holders or
+// flips dead holders to status=lost and appends an escalation log line.
+function sweepTasksCmd() {
+  if (!existsSync(DB_PATH)) {
+    console.log("(no state.db — nothing to sweep)");
+    return;
+  }
+  const db = openTaskDb();
+  try {
+    const res = sweepTasksCore(db);
+    console.log(
+      `Swept tasks: ${res.lost} lost, ${res.deferred} deferred (scanned ${res.scanned}).`
+    );
+  } finally {
+    db.close();
+  }
+}
+
 // ── tasks ─────────────────────────────────────────────────────────────────────
 
 function parseTasksFile(): { lines: string[]; tasks: ParsedTask[] } {
@@ -293,6 +318,11 @@ function openTaskDb(): Database {
   const db = new Database(DB_PATH, { create: true });
   db.exec("PRAGMA busy_timeout=3000;");
   initTaskSchema(db);
+  // sweepTasks (and anything else that joins against sessions for liveness)
+  // needs the sessions/claims tables even if the hook has never run in this
+  // $HOME yet. Keeping the schema init colocated with openTaskDb makes the
+  // CLI self-sufficient on a fresh install.
+  initClaimsSchema(db);
   return db;
 }
 
@@ -344,6 +374,11 @@ function pickTask(): void {
   syncTasks(false);
   const db = openTaskDb();
   try {
+    // Auto-sweep task-TTLs before picking so stale claims don't block the
+    // queue. Keeps the sweep hot path inline with pick instead of relying
+    // on a cron — the most reliable trigger is "another agent wants work".
+    sweepTasksCore(db);
+
     const repo = getRepoForCwd();
     const session = currentSession();
     const args = process.argv.slice(3);

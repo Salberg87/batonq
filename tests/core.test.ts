@@ -32,10 +32,14 @@ import {
   runVerify,
   selectCandidate,
   sweepClaims,
+  sweepTasks,
   syncTasks,
+  TASK_CLAIM_TTL_MS,
+  TASK_RECOVERY_HEARTBEAT_MS,
   type ParsedTask,
   type SpawnFn,
   type SpawnResult,
+  type TaskRecoveryContext,
 } from "../src/tasks-core";
 import {
   DESTRUCTIVE,
@@ -1347,5 +1351,231 @@ rewriteMdTaskStatus(tasksPath, "any:infra", body, "pending");
     // NOT the Q&A-augmented intermediate.
     expect(final.original_body).toBe("add a helper");
     db.close();
+  });
+});
+
+// ── task-claim TTL: lost-state + recovery hook + escalation notify ────────────
+
+describe("sweepTasks (task-claim TTL)", () => {
+  // Seed a claimed task whose progress clock predates the TTL. The helper
+  // reaches past claimCandidate() so we can pin the timestamps deterministically
+  // (real claimCandidate uses Date.now()).
+  const seedStaleClaim = (
+    db: Database,
+    opts: {
+      externalIdValue?: string;
+      body?: string;
+      claimedBy?: string;
+      claimedAt: string;
+      lastProgressAt?: string | null;
+      repo?: string;
+    },
+  ): number => {
+    const eid =
+      opts.externalIdValue ??
+      externalId("any:infra", opts.body ?? "stale task");
+    db.run(
+      `INSERT INTO tasks (external_id, repo, body, status, claimed_by, claimed_at, last_progress_at, created_at)
+       VALUES (?, ?, ?, 'claimed', ?, ?, ?, ?)`,
+      [
+        eid,
+        opts.repo ?? "any:infra",
+        opts.body ?? "stale task",
+        opts.claimedBy ?? "sess-A",
+        opts.claimedAt,
+        opts.lastProgressAt ?? null,
+        opts.claimedAt,
+      ],
+    );
+    return (
+      db.query("SELECT id FROM tasks WHERE external_id = ?").get(eid) as any
+    ).id;
+  };
+
+  test("TTL-expiry with no live session flips claimed → lost", () => {
+    const db = memDb();
+    const now = "2026-04-23T13:00:00.000Z";
+    // Claimed 45 min ago, no heartbeat refresh; no session row either.
+    const claimedAt = new Date(Date.parse(now) - 45 * 60_000).toISOString();
+    seedStaleClaim(db, {
+      body: "dead-session task",
+      claimedBy: "sess-dead",
+      claimedAt,
+    });
+
+    const captured: string[] = [];
+    const res = sweepTasks(db, {
+      nowIso: now,
+      writeEscalation: (line) => captured.push(line),
+    });
+
+    expect(res).toEqual({ scanned: 1, lost: 1, deferred: 0 });
+    const row = db
+      .query(`SELECT status FROM tasks WHERE body = ?`)
+      .get("dead-session task") as any;
+    expect(row.status).toBe("lost");
+    expect(captured.length).toBe(1);
+    db.close();
+  });
+
+  test("recovery hook defers when claiming session has fresh heartbeat", () => {
+    const db = memDb();
+    const now = "2026-04-23T13:00:00.000Z";
+    const claimedAt = new Date(Date.parse(now) - 45 * 60_000).toISOString();
+    const lastSeen = new Date(Date.parse(now) - 60_000).toISOString(); // 1 min ago — alive
+    seedStaleClaim(db, {
+      body: "live-session task",
+      claimedBy: "sess-alive",
+      claimedAt,
+    });
+    db.run(
+      `INSERT INTO sessions (session_id, cwd, started_at, last_seen) VALUES (?, ?, ?, ?)`,
+      ["sess-alive", "/tmp/fake", claimedAt, lastSeen],
+    );
+
+    // Sanity: default recovery hook must actually see the session (not null).
+    let seenSession: any = "sentinel";
+    const spy = (ctx: TaskRecoveryContext) => {
+      seenSession = ctx.session;
+      // Delegate: defer if within 5 min, else mark_lost.
+      if (
+        ctx.session &&
+        typeof ctx.session.last_seen === "string" &&
+        ctx.nowMs - Date.parse(ctx.session.last_seen) <
+          TASK_RECOVERY_HEARTBEAT_MS
+      ) {
+        return {
+          kind: "defer" as const,
+          untilIso: new Date(
+            ctx.nowMs + TASK_RECOVERY_HEARTBEAT_MS,
+          ).toISOString(),
+        };
+      }
+      return { kind: "mark_lost" as const };
+    };
+
+    const captured: string[] = [];
+    const res = sweepTasks(db, {
+      nowIso: now,
+      recover: spy,
+      writeEscalation: (line) => captured.push(line),
+    });
+
+    expect(seenSession).not.toBeNull();
+    expect(seenSession.session_id).toBe("sess-alive");
+    expect(res).toEqual({ scanned: 1, lost: 0, deferred: 1 });
+    const row = db
+      .query(`SELECT status, last_progress_at FROM tasks WHERE body = ?`)
+      .get("live-session task") as any;
+    // Status must NOT flip to lost — claim is protected.
+    expect(row.status).toBe("claimed");
+    // last_progress_at got bumped forward, so a second sweep at same `now`
+    // would no longer see this task as stale.
+    expect(Date.parse(row.last_progress_at)).toBeGreaterThan(Date.parse(now));
+    // No escalation log line for the deferred task.
+    expect(captured.length).toBe(0);
+    db.close();
+  });
+
+  test("escalation notification carries timestamp, external_id and body snippet", () => {
+    const db = memDb();
+    const now = "2026-04-23T14:00:00.000Z";
+    const claimedAt = new Date(
+      Date.parse(now) - (TASK_CLAIM_TTL_MS + 60_000),
+    ).toISOString();
+    const longBody =
+      "escalate me because I am a very long body that should get truncated to at most 120 characters of useful context in the log";
+    const eid = externalId("any:infra", longBody);
+    seedStaleClaim(db, {
+      externalIdValue: eid,
+      body: longBody,
+      claimedBy: "sess-gone",
+      claimedAt,
+    });
+
+    // Use the real file path too, just a tmp copy, to exercise the write path.
+    const logPath = join(workdir, "escalations.log");
+    const res = sweepTasks(db, {
+      nowIso: now,
+      escalationLogPath: logPath,
+    });
+    expect(res.lost).toBe(1);
+
+    const contents = readFileSync(logPath, "utf8");
+    const lines = contents.trim().split("\n");
+    expect(lines.length).toBe(1);
+    const rec = JSON.parse(lines[0]!);
+    expect(rec.ts).toBe(now);
+    expect(rec.external_id).toBe(eid);
+    expect(typeof rec.body_snippet).toBe("string");
+    expect(rec.body_snippet.length).toBeLessThanOrEqual(120);
+    expect(rec.body_snippet).toContain("escalate me");
+    // The claiming session's id should be preserved so escalation readers can
+    // cross-reference it against sessions/logs.
+    expect(rec.claimed_by).toBe("sess-gone");
+    db.close();
+  });
+
+  test("`batonq pick` auto-invokes sweep-tasks on entry", () => {
+    // Drive the real CLI against a temp HOME so the pick command's inline
+    // sweepTasksCore() call runs and flips a stale claim to lost.
+    const fakeHome = mkdtempSync(join(tmpdir(), "batonq-home-"));
+    mkdirSync(join(fakeHome, ".claude"), { recursive: true });
+    const tasksPath = join(fakeHome, "DEV", "TASKS.md");
+    mkdirSync(join(fakeHome, "DEV"), { recursive: true });
+    // Keep TASKS.md minimal so sync-tasks doesn't reshape the claimed row.
+    writeFileSync(
+      tasksPath,
+      [
+        "# Tasks",
+        "",
+        "## Pending",
+        "",
+        "- [ ] **any:infra** — stale claim placeholder",
+        "",
+      ].join("\n"),
+    );
+
+    const dbPath = join(fakeHome, ".claude", "agent-coord-state.db");
+    try {
+      // First: sync populates the DB with the pending task, then we mutate
+      // it to a stale claimed state and watch `pick` sweep it.
+      const seed = spawnSync(BATONQ_BIN, ["sync-tasks"], {
+        env: { ...process.env, HOME: fakeHome, PATH: process.env.PATH ?? "" },
+        encoding: "utf8",
+      });
+      expect(seed.status).toBe(0);
+
+      const db = new Database(dbPath);
+      const claimedAt = new Date(
+        Date.now() - (TASK_CLAIM_TTL_MS + 5 * 60_000),
+      ).toISOString();
+      db.run(
+        `UPDATE tasks SET status = 'claimed', claimed_by = ?, claimed_at = ?, last_progress_at = NULL
+         WHERE body = ?`,
+        ["sess-ghost", claimedAt, "stale claim placeholder"],
+      );
+      db.close();
+
+      // Run pick. It should sweep (flipping the stale row to lost) BEFORE
+      // selecting a candidate. The row then transitions to lost, and since
+      // there are no other pending tasks, pick outputs NO_TASK.
+      const pick = spawnSync(BATONQ_BIN, ["pick", "--any"], {
+        env: { ...process.env, HOME: fakeHome, PATH: process.env.PATH ?? "" },
+        encoding: "utf8",
+      });
+      expect(pick.status).toBe(0);
+      expect(pick.stdout).toContain("NO_TASK");
+
+      // Verify the sweep fired: stale claim → lost.
+      const after = new Database(dbPath, { readonly: true });
+      const row = after
+        .query(`SELECT status FROM tasks WHERE body = ?`)
+        .get("stale claim placeholder") as any;
+      expect(row.status).toBe("lost");
+      after.close();
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
   });
 });

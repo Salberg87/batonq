@@ -131,25 +131,26 @@ already claimed.
 
 ## Commands
 
-| Command                 | Description                                                                                                  | Example                            |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------- |
-| `batonq pick`           | Claim the next task matching the current cwd's repo (or an `any:*` task).                                    | `batonq pick`                      |
-| `batonq mine`           | Show tasks claimed by the current session (pid).                                                             | `batonq mine`                      |
-| `batonq done <id>`      | Mark a claimed task done. Runs the `verify:` gate if the task has one.                                       | `batonq done 51592069b22d`         |
-| `batonq abandon <id>`   | Release a claim so another agent can pick the task.                                                          | `batonq abandon 51592069b22d`      |
-| `batonq tasks`          | List every task in `~/DEV/TASKS.md` with status.                                                             | `batonq tasks`                     |
-| `batonq sync-tasks`     | Re-parse `TASKS.md` into the SQLite state immediately (usually automatic).                                   | `batonq sync-tasks`                |
-| `batonq release <path>` | Release a file lock held by the current session.                                                             | `batonq release src/app.ts`        |
-| `batonq sweep`          | Purge expired claims and file locks whose owning session is gone.                                            | `batonq sweep`                     |
-| `batonq status`         | Print overall queue + lock state as a compact summary.                                                       | `batonq status`                    |
-| `batonq check`          | Health check: schema version, state-db permissions, hook wiring.                                             | `batonq check`                     |
-| `batonq tail [-n N]`    | Tail the event log (JSONL).                                                                                  | `batonq tail -n 50`                |
-| `batonq report`         | Aggregate measurement events over a time range (`--since`, `--until`, `--json`).                             | `batonq report --since 2026-04-01` |
-| `batonq enrich <id>`    | Elaborate a draft via `claude --model opus`. Returns clarifying questions OR a spec with `verify:`+`judge:`. | `batonq enrich 51592069b22d`       |
-| `batonq promote <id>`   | Flip a draft to pending so `pick` will see it. Use after `enrich` once you're happy with the spec.           | `batonq promote 51592069b22d`      |
-| `batonq tui`            | Live ink-based TUI dashboard with sessions, tasks, claims, locks, events. Press `n` to add a task inline.    | `batonq tui`                       |
-| `batonq-hook`           | Claude Code PreToolUse / PostToolUse hook. Not invoked manually.                                             | (wired by `install.sh`)            |
-| `batonq-loop`           | Fresh-Claude-per-task runner. `cd` into a repo, run, and the loop does the rest.                             | `cd ~/DEV/MyRepo && batonq-loop`   |
+| Command                 | Description                                                                                                                                                                              | Example                            |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
+| `batonq pick`           | Claim the next task matching the current cwd's repo (or an `any:*` task).                                                                                                                | `batonq pick`                      |
+| `batonq mine`           | Show tasks claimed by the current session (pid).                                                                                                                                         | `batonq mine`                      |
+| `batonq done <id>`      | Mark a claimed task done. Runs the `verify:` gate if the task has one.                                                                                                                   | `batonq done 51592069b22d`         |
+| `batonq abandon <id>`   | Release a claim so another agent can pick the task.                                                                                                                                      | `batonq abandon 51592069b22d`      |
+| `batonq tasks`          | List every task in `~/DEV/TASKS.md` with status.                                                                                                                                         | `batonq tasks`                     |
+| `batonq sync-tasks`     | Re-parse `TASKS.md` into the SQLite state immediately (usually automatic).                                                                                                               | `batonq sync-tasks`                |
+| `batonq release <path>` | Release a file lock held by the current session.                                                                                                                                         | `batonq release src/app.ts`        |
+| `batonq sweep`          | Purge expired claims and file locks whose owning session is gone.                                                                                                                        | `batonq sweep`                     |
+| `batonq sweep-tasks`    | Mark claimed tasks with no progress in 30 min as `lost`; live sessions get a 5-min grace via recovery hook. Logs lost tasks to `/tmp/batonq-escalations.log`. Auto-runs on every `pick`. | `batonq sweep-tasks`               |
+| `batonq status`         | Print overall queue + lock state as a compact summary.                                                                                                                                   | `batonq status`                    |
+| `batonq check`          | Health check: schema version, state-db permissions, hook wiring.                                                                                                                         | `batonq check`                     |
+| `batonq tail [-n N]`    | Tail the event log (JSONL).                                                                                                                                                              | `batonq tail -n 50`                |
+| `batonq report`         | Aggregate measurement events over a time range (`--since`, `--until`, `--json`).                                                                                                         | `batonq report --since 2026-04-01` |
+| `batonq enrich <id>`    | Elaborate a draft via `claude --model opus`. Returns clarifying questions OR a spec with `verify:`+`judge:`.                                                                             | `batonq enrich 51592069b22d`       |
+| `batonq promote <id>`   | Flip a draft to pending so `pick` will see it. Use after `enrich` once you're happy with the spec.                                                                                       | `batonq promote 51592069b22d`      |
+| `batonq tui`            | Live ink-based TUI dashboard with sessions, tasks, claims, locks, events. Press `n` to add a task inline.                                                                                | `batonq tui`                       |
+| `batonq-hook`           | Claude Code PreToolUse / PostToolUse hook. Not invoked manually.                                                                                                                         | (wired by `install.sh`)            |
+| `batonq-loop`           | Fresh-Claude-per-task runner. `cd` into a repo, run, and the loop does the rest.                                                                                                         | `cd ~/DEV/MyRepo && batonq-loop`   |
 
 ## TUI
 
@@ -209,6 +210,21 @@ a terse idea into a concrete spec:
 A draft never leaks into `pick` on its own — `selectCandidate` filters on
 `status = 'pending'` exactly. Enrichment is the human-in-the-loop step that
 keeps opus' default-bias from producing wrong work downstream.
+
+**Task-claim TTL & the `lost` status:**
+
+Claimed tasks carry a 30-minute progress TTL (`TASK_CLAIM_TTL_MS`). Every
+PostToolUse hook refreshes `last_progress_at` on the session's claimed tasks,
+so an agent actively doing work keeps its claim warm. When `batonq sweep-tasks`
+runs — automatically on every `pick`, or on demand — it scans claimed tasks
+whose last progress predates the TTL and runs `tryRecoverTaskBeforeMarkLost`
+on each. If the claiming session still has a heartbeat within 5 minutes the
+task gets a 5-minute grace extension; if the session looks dead, the task
+flips to **`lost`** and a JSONL line (timestamp, `external_id`, repo, body
+snippet) is appended to `/tmp/batonq-escalations.log` so a human — or another
+agent tailing the file — can pick up the pieces. `lost` tasks are out of the
+`pick` rotation; abandon + re-promote (or manually flip the DB row back to
+`pending`) to re-queue them.
 
 > **TODO:** add `docs/tui.png` once v0.2 ships.
 

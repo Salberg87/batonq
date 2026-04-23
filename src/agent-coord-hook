@@ -355,6 +355,18 @@ async function main() {
           [nowIso(), hashes[p], fingerprint, p, session]
         );
       }
+      // Task-claim TTL: refresh last_progress_at on any claimed tasks owned
+      // by this session. Guarded because the tasks table may not exist yet
+      // on a fresh install where no CLI command has run — fail open.
+      try {
+        db.run(
+          `UPDATE tasks SET last_progress_at = ?
+           WHERE status = 'claimed' AND claimed_by = ?`,
+          [nowIso(), session]
+        );
+      } catch {
+        // tasks table absent or locked — sweep will catch up on next pick
+      }
     } else if (MODE === "bash") {
       if (!bashPattern) return;
       const denies: string[] = [];
