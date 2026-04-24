@@ -14,7 +14,10 @@
 #   5. Creates ~/.claude/ (for state.db) and ~/.claude/batonq-measurement/.
 #   6. Prints next steps.
 
-set -euo pipefail
+# POSIX-only: no `-o pipefail` (dash on Debian/Ubuntu rejects it). The one
+# pipeline whose failure mattered (`import | sed`) is rewritten to capture
+# its exit code explicitly below, so we don't lose failure detection.
+set -eu
 
 NAME="batonq"
 # REPO_URL / BRANCH are overridable so CI (and anyone debugging a broken
@@ -396,7 +399,12 @@ migrate_legacy_tasks_md() {
     return 0
   fi
   info "Migrating pending entries from ${tasks_md} into the DB (idempotent)…"
-  if "${bindir}/${NAME}" import "${tasks_md}" 2>&1 | sed 's/^/    /'; then
+  # Can't rely on `-o pipefail` (POSIX sh), so capture output and exit code
+  # separately before indenting — otherwise the trailing `sed` would mask a
+  # failed import and the warn branch would never fire.
+  import_out=$("${bindir}/${NAME}" import "${tasks_md}" 2>&1) && rc=0 || rc=$?
+  printf '%s\n' "${import_out}" | sed 's/^/    /'
+  if [ "${rc}" -eq 0 ]; then
     ok "Legacy TASKS.md migrated. The file is now deprecated — use 'batonq add' / 'batonq import' going forward."
   else
     warn "Migration of ${tasks_md} failed. Run it manually: ${NAME} import ${tasks_md}"
