@@ -87,9 +87,18 @@ function spawnVictim(): {
   // The harness runs `<timeout> 600 sleep 600` as a child of a bash parent so
   // the watchdog's `pkill -P <parent> -f "<timeout>"` has something to match.
   // The echoed PID is the bash parent — that's what we pass to the watchdog.
+  //
+  // Trailing `exit $?` serves two purposes:
+  //  1. Keeps bash from tail-call-exec'ing the timeout command — without it,
+  //     bash 5 (Linux CI) replaces itself with `timeout`, so there's no
+  //     bash→timeout parent-child link for pkill -P to walk. bash 3.2 (macOS
+  //     local) doesn't optimize this way, which is why the breakage was
+  //     CI-only.
+  //  2. Propagates the timeout's exit code (143 when SIGTERM'd, or signal)
+  //     so the kills-stale test can observe a non-zero exit.
   const proc = spawn(
     "bash",
-    ["-c", `echo "$$"; ${TIMEOUT_CMD} 600 sleep 600`],
+    ["-c", `echo "$$"; ${TIMEOUT_CMD} 600 sleep 600; exit $?`],
     {
       stdio: ["ignore", "pipe", "pipe"],
     },

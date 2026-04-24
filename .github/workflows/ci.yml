@@ -20,6 +20,10 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v1
 
+      - name: Install coreutils (gtimeout) on macOS
+        if: runner.os == 'macOS'
+        run: brew install coreutils
+
       - name: Install dependencies
         run: bun install
 
