@@ -29,6 +29,7 @@ import {
   sessionStatus,
   shortId,
   shortPath,
+  type Snapshot,
   type TaskRow,
 } from "../src/tui-data";
 import {

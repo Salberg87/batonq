@@ -199,7 +199,11 @@ export function commitsSince(
       const m = line.match(/^(\S+)\s+(.*)$/);
       return m ? { sha: m[1]!, subject: m[2]! } : null;
     })
-    .filter((x): x is { sha: string; subject: string } => x !== null);
+    .filter(
+      (
+        x: { sha: string; subject: string } | null,
+      ): x is { sha: string; subject: string } => x !== null,
+    );
 }
 
 // ── drill-down helpers ────────────────────────────────────────────────────────
