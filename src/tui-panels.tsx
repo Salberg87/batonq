@@ -31,7 +31,7 @@ import { visibleWindow } from "./live-feed";
 
 // Brand colors from /tmp/brand/colors.css
 export const C = {
-  brand: "#E8A43A", // baton amber
+  brand: "#10B981", // baton green
   ink: "#1F2937", // ink slate
   ok: "#4ADE80", // handoff green
   paper: "#FAFAF9", // paper
