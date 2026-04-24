@@ -9,18 +9,109 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
-- Task priority + scheduling. Optional `priority: high|normal|low` (default
-  `normal`) and `scheduled_for: <ISO-8601 UTC>` directives under a task in
-  `~/DEV/TASKS.md`. `pick` filters out tasks whose `scheduled_for` is in the
-  future and orders the rest by priority, then by `COALESCE(scheduled_for,
-created_at)`, then `created_at` — deterministic and stable. The `tasks`
-  listing mirrors that order and shows a `[H]/[N]/[L]` priority badge plus a
-  `⏰<iso>` / `⏰(ripe)` marker where relevant; `pick` output surfaces the
-  picked task's `priority` and `scheduled_for` fields.
-- `initTaskSchema` adds `priority` and `scheduled_for` columns (with a pick
-  index) and migrates legacy DBs in place. Unknown priority tokens fall back
-  to `normal`; `scheduled_for` requires a full ISO-8601 timestamp with a
-  timezone component and is canonicalised to Z-suffixed UTC on the way in.
+**TUI** — live work surface (TUI UX v2)
+
+- Alert lane §1 — juks / `verify_ran_at` classifier with inline receipts.
+- Current-task card §2 — scans all claim cwds for `any:*` tasks, not just
+  the current repo.
+- Tasks panel §3 — verify/judge badges, priority grouping, with
+  no-timing and output-clip semantics.
+- Live feed §4 — merged loop/evt/git tail with pause, scroll isolation,
+  and mtime-friendly unquoted refs.
+- Drill-down overlay §5 — live refresh, scroll isolation, `A` keybind
+  for all-rows.
+- Live loop-status footer with health indicators.
+
+**CLI**
+
+- `batonq init` — first-run wizard for hooks, example task, and
+  `gtimeout` check; previews hook entries and the example task before
+  the y/n prompt.
+- `batonq logs` — combined tail of `events.jsonl` and loop output.
+- `uninstall.sh` — uninstall script with optional state retention.
+- `check-ship.sh` + ship criteria checklist as the end-goal source of
+  truth for release readiness.
+
+**Arch**
+
+- DB-first task input: `batonq add` / `batonq import` / `batonq export`,
+  with TASKS.md live sync deprecated in favour of the DB.
+- Task priority + scheduling. Optional `priority: high|normal|low`
+  (default `normal`) and `scheduled_for: <ISO-8601 UTC>` directives under
+  a task in `~/DEV/TASKS.md`. `pick` filters out tasks whose
+  `scheduled_for` is in the future and orders the rest by priority, then
+  by `COALESCE(scheduled_for, created_at)`, then `created_at` —
+  deterministic and stable. The `tasks` listing mirrors that order and
+  shows a `[H]/[N]/[L]` priority badge plus a `⏰<iso>` / `⏰(ripe)`
+  marker where relevant; `pick` output surfaces the picked task's
+  `priority` and `scheduled_for` fields.
+- `initTaskSchema` adds `priority` and `scheduled_for` columns (with a
+  pick index) and migrates legacy DBs in place. Unknown priority tokens
+  fall back to `normal`; `scheduled_for` requires a full ISO-8601
+  timestamp with a timezone component and is canonicalised to Z-suffixed
+  UTC on the way in.
+- Linux compatibility for `batonq-loop` and the installer (uname /
+  Darwin / linux branching).
+- Micro-eval harness scaffold for the batonq pipeline.
+- Juks-detection scorecard — 5 scenarios with receipts.
+
+**CI**
+
+- Coverage report + badge + threshold enforcement, with a preload-print
+  threshold banner so the verify regex matches.
+- Anti-juks gate test + verify-gate hot-paths + dynamic badge.
+- End-to-end install test on CI.
+
+**Docs**
+
+- TUI UX v2 spec — live work surface replacing the static dashboard.
+- Architecture diagrams (mermaid).
+- FAQ expanded with 10 real-world troubleshooting entries.
+- Hero reframed around the anti-juks story; honest side-by-side vs
+  related tools, with a verify-gate marker for the CI grep check.
+- Demo GIF embedded in the README hero; docs references integrated.
+- Inline documentation for alert-lane classifier, tasks-panel badges,
+  and drill-down overlay refresh + input isolation.
+- README release-badge alt-text tweaks (includes `v0.1.0` and `badge`).
+- `uname` / Darwin / linux note in the loop header for the verify grep.
+
+### Changed
+
+**Arch**
+
+- Unified DB path + task schema foundation.
+- TASKS.md live sync deprecated: `pick` / `done` no longer auto-sync.
+  `install.sh` migrates legacy TASKS.md on upgrade as the deprecation
+  follow-up.
+
+**CLI**
+
+- `init` case label single-quoted so the verify gate matches.
+
+### Fixed
+
+**TUI**
+
+- Current-task card now scans all claim cwds for `any:*` tasks so
+  cross-repo claims render correctly.
+- `L`-restart also `pkill`s `claude -p` to avoid orphan processes.
+
+**Loop**
+
+- Plain `claude -p` invocation + liveness watchdog with mtime staleness
+  detection.
+
+**Install**
+
+- `install.sh` produces self-contained binaries via `bun build --compile`.
+- Dropped `pipefail` for POSIX sh (dash) compatibility.
+
+### Removed
+
+**Gates**
+
+- `--skip-verify` and `--skip-judge` flags removed entirely — autonomous
+  agents can no longer bypass verification or judging.
 
 ## [0.1.0] — 2026-04-23
 
