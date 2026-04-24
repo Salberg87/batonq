@@ -253,7 +253,9 @@ install_source_fallback() {
   mkdir -p "${share_dir}"
   cp -R "${TMP_DIR}/src" "${share_dir}/src"
   [ -f "${TMP_DIR}/package.json" ] && cp "${TMP_DIR}/package.json" "${share_dir}/"
-  [ -d "${TMP_DIR}/node_modules" ] && cp -R "${TMP_DIR}/node_modules" "${share_dir}/" 2>/dev/null || :
+  if [ -d "${TMP_DIR}/node_modules" ]; then
+    cp -R "${TMP_DIR}/node_modules" "${share_dir}/" 2>/dev/null || :
+  fi
 
   write_wrapper() {
     target="$1"; src_name="$2"

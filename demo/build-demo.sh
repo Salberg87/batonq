@@ -76,7 +76,9 @@ shopt -u nullglob
 
 restore_logs() {
   for name in "${stashed[@]:-}"; do
-    [[ -n "$name" && -e "$STASH/$name" ]] && mv "$STASH/$name" /tmp/ || true
+    if [[ -n "$name" && -e "$STASH/$name" ]]; then
+      mv "$STASH/$name" /tmp/ || true
+    fi
   done
 }
 trap restore_logs EXIT
