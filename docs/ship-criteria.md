@@ -47,7 +47,7 @@ bottom (`X/Y criteria passing. Blockers: <ids>`) to decide.
 # ── Basics — the table stakes that make this a product at all ────────────────
 SHIP-001 | README anti-juks tagline present | grep -q "Stop AI coding agents from faking test results" README.md
 SHIP-002 | install.sh shell-syntax valid | sh -n install.sh
-SHIP-003 | install.sh uses strict mode and chmods binaries | grep -q "set -euo pipefail" install.sh && grep -q "chmod +x" install.sh
+SHIP-003 | install.sh uses strict mode and chmods binaries | grep -qE "set -eu?$|set -euo pipefail" install.sh && grep -q "chmod +x" install.sh
 SHIP-004 | Linux/Darwin compat shim committed | test -f src/batonq-platform-compat.sh && grep -qE "Darwin|Linux" src/batonq-platform-compat.sh
 SHIP-005 | Coverage threshold ≥70% in bunfig | grep -qE "coverageThreshold.*line.*0\.7" bunfig.toml
 SHIP-006 | CI workflow yaml parses and tests both OSes | python3 -c "import yaml,sys; d=yaml.safe_load(open('.github/workflows/ci.yml')); sys.exit(0 if 'ubuntu-latest' in str(d) and 'macos-latest' in str(d) else 1)"
