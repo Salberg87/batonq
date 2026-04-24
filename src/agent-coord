@@ -16,6 +16,7 @@ import {
   syncTasks as syncTasksCore,
   selectCandidate,
   claimCandidate,
+  detectFragileGitLog,
   runVerify,
   runJudge as runJudgeCore,
   getGitDiffSinceClaim as getGitDiffSinceClaimCore,
@@ -1586,6 +1587,24 @@ function pickTask(): void {
     // queue. Keeps the sweep hot path inline with pick instead of relying
     // on a cron — the most reliable trigger is "another agent wants work".
     sweepTasksCore(db);
+
+    // Audit queue for deadlock-prone verify_cmds (`git log -1 | grep ...`) so
+    // operators can rewrite them before the race bites. Runs once per pick;
+    // cheap and silent when the queue is clean.
+    const fragile = db
+      .query(
+        `SELECT external_id, verify_cmd FROM tasks
+           WHERE status IN ('pending','claimed','draft') AND verify_cmd IS NOT NULL`
+      )
+      .all() as Array<{ external_id: string; verify_cmd: string }>;
+    const flagged = fragile.filter((t) => detectFragileGitLog(t.verify_cmd));
+    if (flagged.length > 0) {
+      console.error(
+        `⚠ ${flagged.length} queued task(s) use fragile \`git log -1 | grep\` in verify — ` +
+          `switch to \`git_commits_since_claim\` (see docs/faq.md). Affected: ` +
+          flagged.map((t) => t.external_id).join(", ")
+      );
+    }
 
     const repo = getRepoForCwd();
     const session = currentSession();
