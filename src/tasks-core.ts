@@ -622,19 +622,37 @@ export interface VerifyResult {
   output: string;
 }
 
+// Shell preamble prepended to every verify command. Exposes
+// `git_commits_since_claim` so verify scripts can assert against commits made
+// after the task was claimed, rather than `git log -1` (which breaks in
+// multi-agent setups when a peer commits between claim and done).
+const VERIFY_PREAMBLE = [
+  "git_commits_since_claim() {",
+  '  if [ -z "${BATONQ_CLAIM_TS:-}" ]; then',
+  '    echo "git_commits_since_claim: BATONQ_CLAIM_TS not set" >&2',
+  "    return 2",
+  "  fi",
+  '  git log --since="$BATONQ_CLAIM_TS" --pretty=%s "$@"',
+  "}",
+].join("\n");
+
 export function runVerify(
   cmd: string,
   cwd: string,
   taskId: string,
+  claimedAt?: string | null,
 ): VerifyResult {
   const MAX_OUTPUT = 1024 * 1024 * 4;
-  const result = spawnSync("/bin/sh", ["-c", cmd], {
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    AGENT_COORD_REPO_ROOT: cwd,
+    AGENT_COORD_TASK_ID: taskId,
+  };
+  if (claimedAt) env.BATONQ_CLAIM_TS = claimedAt;
+  const wrapped = `${VERIFY_PREAMBLE}\n${cmd}`;
+  const result = spawnSync("/bin/sh", ["-c", wrapped], {
     cwd,
-    env: {
-      ...process.env,
-      AGENT_COORD_REPO_ROOT: cwd,
-      AGENT_COORD_TASK_ID: taskId,
-    },
+    env,
     timeout: 300_000,
     encoding: "utf8",
     maxBuffer: MAX_OUTPUT,

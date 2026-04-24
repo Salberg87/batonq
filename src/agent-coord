@@ -1739,7 +1739,7 @@ function doneTask(id?: string): void {
       console.log(`→ verify: ${target.verify_cmd}`);
       console.log(`  (cwd: ${repoPath}, timeout: 300s)`);
       console.log();
-      const { code, output } = runVerify(target.verify_cmd, repoPath, target.external_id);
+      const { code, output } = runVerify(target.verify_cmd, repoPath, target.external_id, target.claimed_at);
       const truncated = output.length > 80_000 ? output.slice(0, 80_000) + "\n[truncated]" : output;
       process.stdout.write(truncated);
       console.log();

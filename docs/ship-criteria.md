@@ -40,6 +40,12 @@ bottom (`X/Y criteria passing. Blockers: <ids>`) to decide.
    running the whole test-suite.
 4. If a check cannot be written without side effects, write it anyway —
    but keep its runtime under 60s.
+5. If the check asserts on a commit subject (`git log ... | grep ...`),
+   use `git_commits_since_claim` or `git log --since="$BATONQ_CLAIM_TS"`
+   instead of `git log -1`. `HEAD` may not belong to your task in
+   multi-agent setups — a peer loop can land a commit between your
+   `done` call and the gate running, which makes `git log -1` flake.
+   See `docs/faq.md` for the full rationale.
 
 ## Criteria
 

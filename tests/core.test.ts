@@ -426,6 +426,99 @@ describe("runVerify", () => {
     expect(withEnv.code).toBe(0);
     expect(withEnv.output).toContain("tid-xyz:" + workdir);
   });
+
+  // Multi-agent deadlock guard: verify scripts that assert on commit subjects
+  // must tolerate peer commits landing between claim and done. `git log -1`
+  // breaks here; `git_commits_since_claim` (backed by BATONQ_CLAIM_TS) survives.
+  describe("BATONQ_CLAIM_TS / git_commits_since_claim", () => {
+    // Build a throwaway git repo; return the path and a helper that commits
+    // with a given subject and optional author date (so we can place a commit
+    // before or after the claim timestamp without sleeping).
+    function makeRepo(): {
+      repo: string;
+      commit: (subject: string, whenISO?: string) => void;
+    } {
+      const repo = mkdtempSync(join(tmpdir(), "batonq-verify-repo-"));
+      const gitEnv = {
+        GIT_AUTHOR_NAME: "t",
+        GIT_AUTHOR_EMAIL: "t@t",
+        GIT_COMMITTER_NAME: "t",
+        GIT_COMMITTER_EMAIL: "t@t",
+      };
+      const init = spawnSync("git", ["init", "-q", "-b", "main", repo], {
+        encoding: "utf8",
+      });
+      expect(init.status).toBe(0);
+      return {
+        repo,
+        commit(subject, whenISO) {
+          const env: Record<string, string> = {
+            ...process.env,
+            ...gitEnv,
+          } as Record<string, string>;
+          if (whenISO) {
+            env.GIT_AUTHOR_DATE = whenISO;
+            env.GIT_COMMITTER_DATE = whenISO;
+          }
+          const r = spawnSync(
+            "git",
+            [
+              "-C",
+              repo,
+              "commit",
+              "--allow-empty",
+              "-m",
+              subject,
+              "--no-gpg-sign",
+            ],
+            { encoding: "utf8", env },
+          );
+          expect(r.status).toBe(0);
+        },
+      };
+    }
+
+    test("passes when the claimed task's commit exists — even with a peer commit after claim", () => {
+      const { repo, commit } = makeRepo();
+
+      // Pre-claim history: an unrelated old commit. Claim happens at CLAIM_TS.
+      commit("chore: seed", "2026-04-24T00:00:00Z");
+      const claimTs = "2026-04-24T01:00:00Z";
+
+      // The agent commits its task delivery, then a peer lands an unrelated
+      // commit on top. `git log -1 --pretty=%s` would see the peer commit and
+      // (wrongly) FAIL. The helper must still find the task's commit subject.
+      commit("fix(verify): deliver SHIP-017", "2026-04-24T01:05:00Z");
+      commit("docs: unrelated peer edit", "2026-04-24T01:06:00Z");
+
+      const cmd = `git_commits_since_claim | grep -F "fix(verify): deliver SHIP-017" >/dev/null`;
+      const res = runVerify(cmd, repo, "tid-multi", claimTs);
+      expect(res.code).toBe(0);
+    });
+
+    test("still fails when the task was never delivered (only peer commits since claim)", () => {
+      const { repo, commit } = makeRepo();
+
+      commit("chore: seed", "2026-04-24T00:00:00Z");
+      const claimTs = "2026-04-24T01:00:00Z";
+      // Only a peer commit lands; the claimed task was never delivered.
+      commit("docs: unrelated peer edit", "2026-04-24T01:06:00Z");
+
+      const cmd = `git_commits_since_claim | grep -F "fix(verify): deliver SHIP-017" >/dev/null`;
+      const res = runVerify(cmd, repo, "tid-missing", claimTs);
+      expect(res.code).not.toBe(0);
+    });
+
+    test("git_commits_since_claim errors cleanly if BATONQ_CLAIM_TS is unset", () => {
+      // Defensive: if runVerify is called without a claim timestamp (e.g., a
+      // task claimed before this change shipped), the helper should fail fast
+      // rather than silently widening the window to "all history".
+      const { repo } = makeRepo();
+      const res = runVerify("git_commits_since_claim", repo, "tid-nots");
+      expect(res.code).not.toBe(0);
+      expect(res.output).toContain("BATONQ_CLAIM_TS not set");
+    });
+  });
 });
 
 // ── 7a. touchTaskProgress refreshes last_progress_at on claimed rows ─────────

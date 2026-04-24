@@ -68,6 +68,23 @@ the loop's `PATH` (e.g. `gtimeout`, `bun` not linked), the gate is flaky
 is wrong, `batonq abandon <id>` and rewrite the `verify:` line; if it's a real
 failure, fix the code and re-run `batonq done <id>`.
 
+**Writing a verify that asserts on commit messages — why does it flake under parallel loops?**
+A verify like `git log -1 --pretty=%s | grep -q "fix(X):"` is fragile in multi-agent
+setups. If agent A claims task X and commits the fix, but agent B lands an unrelated
+commit between A's `done` call and the gate running, `HEAD` now points at B's commit
+and A's verify FAILs. A re-claims, re-runs, hits the same race — deadlock. Use the
+injected `BATONQ_CLAIM_TS` env var (set to the task's `claimed_at` ISO timestamp)
+with `git log --since="$BATONQ_CLAIM_TS"`, or call the pre-injected helper
+`git_commits_since_claim` which does exactly that:
+
+```sh
+# Task verify: pass if the delivery commit landed since this task was claimed.
+git_commits_since_claim | grep -qF "fix(verify): ..."
+```
+
+The helper errors out (exit 2) if `BATONQ_CLAIM_TS` is unset, so stale tasks
+claimed before this change fail loudly rather than silently matching all history.
+
 **The loop seems to sleep too long.**
 `batonq-loop` sleeps 60s between `claude -p` invocations when `pick` returns
 `NO_TASK`. That's expected — there's nothing to do, so the loop stays quiet.
