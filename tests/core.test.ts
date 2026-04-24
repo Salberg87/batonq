@@ -21,6 +21,7 @@ import {
   buildTaskLines,
   claimCandidate,
   DEFAULT_PRIORITY,
+  detectFragileGitLog,
   enrichTaskBody,
   externalId,
   getGitDiffSinceClaim,
@@ -507,6 +508,34 @@ describe("runVerify", () => {
       const cmd = `git_commits_since_claim | grep -F "fix(verify): deliver SHIP-017" >/dev/null`;
       const res = runVerify(cmd, repo, "tid-missing", claimTs);
       expect(res.code).not.toBe(0);
+    });
+
+    test("emits a migration warning when verify uses `git log -1 | grep`", () => {
+      // Passive docs alone don't prevent new tasks from using the fragile
+      // pattern. runVerify flags it at gate-time so operators see it in the
+      // captured verify_output and migrate to git_commits_since_claim.
+      expect(
+        detectFragileGitLog('git log -1 --pretty=%s | grep "fix(X):"'),
+      ).toBe(true);
+      expect(
+        detectFragileGitLog("git log --since=X --pretty=%s | grep foo"),
+      ).toBe(false);
+      expect(detectFragileGitLog("git_commits_since_claim | grep foo")).toBe(
+        false,
+      );
+
+      const { repo, commit } = makeRepo();
+      commit("fix(X): delivered", "2026-04-24T01:05:00Z");
+      const res = runVerify(
+        'git log -1 --pretty=%s | grep -q "fix(X): delivered"',
+        repo,
+        "tid-warn",
+        "2026-04-24T01:00:00Z",
+      );
+      // Gate still passes — the warning is advisory, not a hard fail.
+      expect(res.code).toBe(0);
+      expect(res.output).toContain("warning: verify uses `git log -1`");
+      expect(res.output).toContain("git_commits_since_claim");
     });
 
     test("git_commits_since_claim errors cleanly if BATONQ_CLAIM_TS is unset", () => {

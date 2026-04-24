@@ -636,6 +636,13 @@ const VERIFY_PREAMBLE = [
   "}",
 ].join("\n");
 
+// Detect the fragile commit-subject pattern that BATONQ_CLAIM_TS replaces:
+// `git log -1 --pretty=%s | grep ...` breaks when a peer loop commits between
+// the task's done and the gate running. Exported for tests.
+export function detectFragileGitLog(cmd: string): boolean {
+  return /git\s+log\s+-1\b/.test(cmd) && /\|\s*grep\b/.test(cmd);
+}
+
 export function runVerify(
   cmd: string,
   cwd: string,
@@ -650,6 +657,11 @@ export function runVerify(
   };
   if (claimedAt) env.BATONQ_CLAIM_TS = claimedAt;
   const wrapped = `${VERIFY_PREAMBLE}\n${cmd}`;
+  const warning = detectFragileGitLog(cmd)
+    ? "[batonq] warning: verify uses `git log -1` — fragile under parallel loops. " +
+      "Switch to `git_commits_since_claim` (BATONQ_CLAIM_TS) to avoid deadlocks. " +
+      "See docs/faq.md.\n"
+    : "";
   const result = spawnSync("/bin/sh", ["-c", wrapped], {
     cwd,
     env,
@@ -659,7 +671,7 @@ export function runVerify(
   });
   const stdout = result.stdout ?? "";
   const stderr = result.stderr ?? "";
-  const output = stdout + (stderr ? `\n[stderr]\n${stderr}` : "");
+  const output = warning + stdout + (stderr ? `\n[stderr]\n${stderr}` : "");
   let code: number;
   if (result.error && (result.error as any).code === "ETIMEDOUT") code = 124;
   else if (result.signal)
