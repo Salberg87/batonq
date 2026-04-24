@@ -64,6 +64,18 @@ describe("agent-coord-loop: shellcheck", () => {
   );
 });
 
+// Resolve the timeout-binary name the same way the watchdog does, so the
+// harness spawns a process that `pkill -f "$TIMEOUT_NAME"` will actually
+// match (gtimeout on macOS, timeout on Linux CI).
+const TIMEOUT_CMD = (() => {
+  const r = spawnSync(
+    "bash",
+    ["-c", `. "${COMPAT_SCRIPT}"; batonq_timeout_cmd`],
+    { encoding: "utf8" },
+  );
+  return (r.stdout ?? "").trim() || "timeout";
+})();
+
 // Spawn a long-running victim process under a harness shell so the watchdog's
 // `pkill -P <parent>` has a real child tree to reap. The harness waits for the
 // victim, then exits — which is how we observe the kill: the harness's exit
@@ -72,12 +84,16 @@ function spawnVictim(): {
   parentPid: number;
   wait: () => Promise<{ code: number | null; signal: string | null }>;
 } {
-  // The harness runs `gtimeout 600 sleep 600` as a child of a bash parent so
-  // the watchdog's `pkill -P <parent> -f "gtimeout"` has something to match.
+  // The harness runs `<timeout> 600 sleep 600` as a child of a bash parent so
+  // the watchdog's `pkill -P <parent> -f "<timeout>"` has something to match.
   // The echoed PID is the bash parent — that's what we pass to the watchdog.
-  const proc = spawn("bash", ["-c", 'echo "$$"; gtimeout 600 sleep 600'], {
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  const proc = spawn(
+    "bash",
+    ["-c", `echo "$$"; ${TIMEOUT_CMD} 600 sleep 600`],
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
 
   const parentPidPromise = new Promise<number>((resolveFn) => {
     let buf = "";
