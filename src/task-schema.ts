@@ -25,6 +25,12 @@ export const STATUSES = [
   "lost",
 ] as const;
 
+// Multi-CLI dispatch target. `any` (the default) means the loop is free to
+// route to whichever runner has capacity / is installed; explicit values pin
+// the task to a specific CLI. Keep in sync with `AgentTool` in agent-runners.
+export const AGENTS = ["claude", "codex", "gemini", "opencode", "any"] as const;
+export const DEFAULT_AGENT = "any";
+
 export const TaskSchema = z.object({
   external_id: z.string().min(1, "external_id must be non-empty"),
   repo: z.string().min(1, "repo must be non-empty"),
@@ -40,6 +46,7 @@ export const TaskSchema = z.object({
     .min(10, "judge command must be at least 10 characters")
     .optional(),
   status: z.enum(STATUSES),
+  agent: z.enum(AGENTS).optional().default(DEFAULT_AGENT),
 });
 
 export type Task = z.infer<typeof TaskSchema>;

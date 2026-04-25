@@ -189,7 +189,7 @@ switch (cmd) {
         "  Setup:         init [--yes]\n" +
         "  Coordination:  check | doctor | status | release <path> | sweep | sweep-tasks\n" +
         "  Measurement:   tail [-n N] | logs [-f] [-n N] [--source events|loop|both] | report [--since ISO] [--until ISO] [--json]\n" +
-        "  Tasks:         add --body <text> [--repo <name>] [--verify <sh>] [--judge <prompt>] [--priority high|normal|low] [--at <ISO>] [--status draft|pending] [--json]\n" +
+        "  Tasks:         add --body <text> [--repo <name>] [--verify <sh>] [--judge <prompt>] [--priority high|normal|low] [--at <ISO>] [--status draft|pending] [--agent claude|codex|gemini|opencode|any] [--json]\n" +
         "                 import <file.yaml|file.md> | export --md [--file PATH]\n" +
         "                 sync-tasks | pick | mine | done [<id>] | abandon [<id>] | tasks\n" +
         "  Drafts:        enrich <id> | promote <id>\n" +
@@ -2193,6 +2193,7 @@ interface AddFlags {
   priority: string;
   at?: string;
   status?: string;
+  agent?: string;
   json: boolean;
 }
 
@@ -2230,13 +2231,16 @@ function parseAddFlags(args: string[]): AddFlags {
       case "--status":
         flags.status = takeNext("--status");
         break;
+      case "--agent":
+        flags.agent = takeNext("--agent");
+        break;
       case "--json":
         flags.json = true;
         break;
       default:
         console.error(`add: unknown flag: ${a}`);
         console.error(
-          "usage: batonq add --body <text> [--repo <name>] [--verify <sh>] [--judge <prompt>] [--priority high|normal|low] [--at <ISO>] [--status draft|pending] [--json]",
+          "usage: batonq add --body <text> [--repo <name>] [--verify <sh>] [--judge <prompt>] [--priority high|normal|low] [--at <ISO>] [--status draft|pending] [--agent claude|codex|gemini|opencode|any] [--json]",
         );
         process.exit(2);
     }
@@ -2286,6 +2290,7 @@ function addCmd(): void {
   if (args.includes("--priority")) input.priority = flags.priority;
   if (flags.at !== undefined) input.scheduled_for = flags.at;
   if (flags.status !== undefined) input.status = flags.status;
+  if (flags.agent !== undefined) input.agent = flags.agent;
 
   // Derive repo from the cwd git-root when neither flags nor JSON supplied one.
   if (!("repo" in input) || !input.repo) {

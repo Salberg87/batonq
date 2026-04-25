@@ -20,6 +20,7 @@ import {
   applyEnrichment,
   buildTaskLines,
   claimCandidate,
+  DEFAULT_AGENT,
   DEFAULT_PRIORITY,
   detectFragileGitLog,
   enrichTaskBody,
@@ -27,6 +28,7 @@ import {
   getGitDiffSinceClaim,
   initClaimsSchema,
   initTaskSchema,
+  insertTask,
   normalizePriority,
   normalizeScheduledFor,
   parseEnrichResponse,
@@ -43,11 +45,13 @@ import {
   TASK_CLAIM_TTL_MS,
   TASK_RECOVERY_HEARTBEAT_MS,
   touchTaskProgress,
+  validatedInsertTask,
   type ParsedTask,
   type SpawnFn,
   type SpawnResult,
   type TaskRecoveryContext,
 } from "../src/tasks-core";
+import { AGENTS, parseTaskInput, TaskSchema } from "../src/task-schema";
 import {
   DESTRUCTIVE,
   MAX_HASH_BYTES,
@@ -2738,6 +2742,169 @@ describe("priority + scheduled_for", () => {
       nowIso: "2026-04-23T11:00:00.000Z",
     });
     expect(c.body).toBe("legacy");
+    db.close();
+  });
+});
+
+// ── agent field (multi-CLI dispatch) ──────────────────────────────────────────
+
+describe("agent field", () => {
+  const MIN_VALID = {
+    external_id: "abc123",
+    repo: "any:infra",
+    body: "a minimally valid task body that clears the 20-char floor",
+    priority: "normal",
+    status: "pending",
+  } as const;
+
+  test("schema accepts each enum value (claude/codex/gemini/opencode/any)", () => {
+    for (const agent of AGENTS) {
+      const parsed = parseTaskInput({ ...MIN_VALID, agent });
+      expect(parsed.agent).toBe(agent);
+    }
+    // Default fills in 'any' when the field is omitted entirely.
+    const defaulted = parseTaskInput({ ...MIN_VALID });
+    expect(defaulted.agent).toBe(DEFAULT_AGENT);
+    expect(defaulted.agent).toBe("any");
+  });
+
+  test("schema rejects an unknown agent value with ZodError", () => {
+    const res = TaskSchema.safeParse({ ...MIN_VALID, agent: "cursor" });
+    expect(res.success).toBe(false);
+    if (!res.success) {
+      const paths = res.error.issues.map((i) => i.path.join("."));
+      expect(paths).toContain("agent");
+    }
+  });
+
+  test("CLI --agent persists into the DB row", () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "batonq-agent-"));
+    mkdirSync(join(fakeHome, ".claude"), { recursive: true });
+    mkdirSync(join(fakeHome, "DEV"), { recursive: true });
+    try {
+      const r = spawnSync(
+        BATONQ_BIN,
+        [
+          "add",
+          "--body",
+          "agent flag round-trip body that clears the 20-char floor",
+          "--repo",
+          "any:infra",
+          "--agent",
+          "codex",
+        ],
+        {
+          env: {
+            ...process.env,
+            HOME: fakeHome,
+            PATH: process.env.PATH ?? "",
+          },
+          encoding: "utf8",
+        },
+      );
+      expect(r.status).toBe(0);
+      const eid = (r.stdout ?? "").trim().replace(/^task added:\s+/, "");
+
+      const db = new Database(join(fakeHome, ".claude", "batonq", "state.db"), {
+        readonly: true,
+      });
+      const row = db
+        .query("SELECT agent FROM tasks WHERE external_id = ?")
+        .get(eid) as { agent: string };
+      db.close();
+      expect(row.agent).toBe("codex");
+
+      // Default path: omit --agent, expect 'any' in the row.
+      const r2 = spawnSync(
+        BATONQ_BIN,
+        [
+          "add",
+          "--body",
+          "default agent body that clears the 20-char floor easily",
+          "--repo",
+          "any:infra",
+        ],
+        {
+          env: {
+            ...process.env,
+            HOME: fakeHome,
+            PATH: process.env.PATH ?? "",
+          },
+          encoding: "utf8",
+        },
+      );
+      expect(r2.status).toBe(0);
+      const eid2 = (r2.stdout ?? "").trim().replace(/^task added:\s+/, "");
+      const db2 = new Database(
+        join(fakeHome, ".claude", "batonq", "state.db"),
+        { readonly: true },
+      );
+      const row2 = db2
+        .query("SELECT agent FROM tasks WHERE external_id = ?")
+        .get(eid2) as { agent: string };
+      db2.close();
+      expect(row2.agent).toBe("any");
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  test("initTaskSchema agent migration is idempotent (multiple runs, no agent loss)", () => {
+    // Legacy DB without the `agent` column.
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        external_id TEXT UNIQUE NOT NULL,
+        repo TEXT NOT NULL,
+        body TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL
+      );
+    `);
+    db.run(
+      `INSERT INTO tasks (external_id, repo, body, status, created_at) VALUES (?, 'any:infra', 'legacy-row', 'pending', ?)`,
+      [externalId("any:infra", "legacy-row"), "2026-04-23T10:00:00.000Z"],
+    );
+
+    // First run: adds the agent column (NULL on existing rows).
+    initTaskSchema(db);
+    const cols1 = db
+      .query("SELECT name FROM pragma_table_info('tasks')")
+      .all() as { name: string }[];
+    expect(cols1.some((c) => c.name === "agent")).toBe(true);
+    const legacyRow1 = db
+      .query("SELECT agent FROM tasks WHERE body = 'legacy-row'")
+      .get() as { agent: string | null };
+    expect(legacyRow1.agent).toBeNull();
+
+    // Insert a fresh task — it should be tagged with the default agent.
+    insertTask(db, {
+      repo: "any:infra",
+      body: "fresh row inserted between the two migration runs to detect data loss",
+      agent: "gemini",
+    });
+
+    // Second run: no schema change, no data loss.
+    expect(() => initTaskSchema(db)).not.toThrow();
+    expect(() => initTaskSchema(db)).not.toThrow();
+
+    const cols2 = db
+      .query("SELECT name FROM pragma_table_info('tasks')")
+      .all() as { name: string }[];
+    const agentCount = cols2.filter((c) => c.name === "agent").length;
+    expect(agentCount).toBe(1); // not duplicated
+
+    const fresh = db
+      .query("SELECT agent FROM tasks WHERE body LIKE 'fresh row inserted%'")
+      .get() as { agent: string };
+    expect(fresh.agent).toBe("gemini");
+
+    const legacyRow2 = db
+      .query("SELECT agent FROM tasks WHERE body = 'legacy-row'")
+      .get() as { agent: string | null };
+    expect(legacyRow2.agent).toBeNull();
+
     db.close();
   });
 });

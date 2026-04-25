@@ -211,7 +211,8 @@ export function initTaskSchema(db: Database): void {
       original_body TEXT,
       last_progress_at TEXT,
       priority TEXT NOT NULL DEFAULT 'normal',
-      scheduled_for TEXT
+      scheduled_for TEXT,
+      agent TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status);
     CREATE INDEX IF NOT EXISTS idx_task_repo_status ON tasks(repo, status);
@@ -250,6 +251,10 @@ export function initTaskSchema(db: Database): void {
     );
   if (!has("scheduled_for"))
     db.exec("ALTER TABLE tasks ADD COLUMN scheduled_for TEXT");
+  // Multi-CLI dispatch target. Nullable at the DB layer; the schema layer
+  // (task-schema.ts) defaults missing values to 'any'. NULL on legacy rows
+  // is interpreted the same as 'any' by the dispatcher.
+  if (!has("agent")) db.exec("ALTER TABLE tasks ADD COLUMN agent TEXT");
   // The pick index is created after ALTERs so migrating DBs get it too.
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_task_pick ON tasks(status, priority, scheduled_for, created_at)`,
@@ -1325,6 +1330,9 @@ export function promoteDraftToPending(
 // `batonq export --md`). These helpers power `batonq add`, `batonq import`,
 // and `batonq export`.
 
+export type TaskAgent = "claude" | "codex" | "gemini" | "opencode" | "any";
+export const DEFAULT_AGENT: TaskAgent = "any";
+
 export interface TaskInput {
   repo: string;
   body: string;
@@ -1333,6 +1341,7 @@ export interface TaskInput {
   verify?: string;
   judge?: string;
   status?: TaskStatus;
+  agent?: TaskAgent;
 }
 
 // Raised from insertTask when the computed external_id already exists. Carries
@@ -1362,9 +1371,10 @@ export function insertTask(
   const status = t.status ?? "pending";
   const priority = t.priority ?? DEFAULT_PRIORITY;
   const scheduledFor = t.scheduledFor ?? null;
+  const agent = t.agent ?? DEFAULT_AGENT;
   db.run(
-    `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd, priority, scheduled_for)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd, priority, scheduled_for, agent)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       eid,
       repo,
@@ -1375,6 +1385,7 @@ export function insertTask(
       t.judge ?? null,
       priority,
       scheduledFor,
+      agent,
     ],
   );
   return eid;
@@ -1410,6 +1421,7 @@ export function validatedInsertTask(
   if (!input.external_id) input.external_id = externalId(repo, body);
   if (!input.status) input.status = "pending";
   if (!input.priority) input.priority = DEFAULT_PRIORITY;
+  if (!input.agent) input.agent = DEFAULT_AGENT;
 
   // Canonicalise scheduled_for so lexicographic comparison in pick works.
   // If normaliser returns null we leave the raw value alone — Zod will
@@ -1436,6 +1448,7 @@ export function validatedInsertTask(
       judge:
         typeof input.judge === "string" ? (input.judge as string) : undefined,
       status: input.status as TaskStatus,
+      agent: input.agent as TaskAgent,
     },
     nowIso,
   );
