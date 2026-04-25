@@ -1,6 +1,6 @@
 {
   "name": "batonq",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A baton queue for parallel agents. Coordination as a primitive, not a platform.",
   "license": "MIT",
   "type": "module",

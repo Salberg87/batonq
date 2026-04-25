@@ -7,6 +7,83 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-25
+
+### Added
+
+**Multi-CLI fan-out** — batonq is no longer Claude-only.
+
+- New `src/agent-runners/` abstraction with implementations for
+  **claude**, **codex**, **gemini**, and **opencode**. Each adapter
+  hides per-tool flag idiosyncrasies (Codex needs `--full-auto` for
+  workspace-write; Gemini wants `--approval-mode=auto_edit` to bypass
+  admin-blocked `--yolo`; opencode just takes `run <prompt>`).
+- Model nicknames per runner (`opus`/`sonnet`/`haiku`,
+  `pro`/`flash`) translated to current versioned ids by a
+  `MODELS` map. Unknown nicknames pass through verbatim so callers
+  can specify full ids.
+- `ExecutionMode` type (`analyze`/`execute`) — read-only probes vs
+  full autonomous tool use.
+- Subscription-auth env trick on Claude (`CLAUDECODE=""` +
+  `ANTHROPIC_API_KEY=""`) so overnight loops bill against the
+  Pro/Max plan instead of pay-as-you-go. Opt out via
+  `BATONQ_USE_API_KEY=1`.
+- Loop dispatch (`src/agent-coord-loop`) now routes to the picked
+  agent via `batonq agent-run` instead of hard-coding `claude -p`.
+  `BATONQ_FORCE_AGENT` env var pins all dispatches at the host
+  level for ops-time overrides.
+- `agent` field on tasks (Zod-validated:
+  `claude|codex|gemini|opencode|any`). Default `any` resolves via
+  routing.
+- `@agent:` / `@model:` annotations on TASKS.md task lines —
+  inline overrides parsed and stripped during sync.
+- Routing in `src/agent-runners/routing.ts` — task-type detector
+  (bilingual NO/EN keyword regex) plus the oxo-inspired
+  task-type-to-agent table (exploration → gemini-flash,
+  implementation → claude-sonnet, code_generation → codex, etc.).
+- Context-gathering strategies (`none`/`simple`/`auto`,
+  `rlm` stubbed) ported from oxo.
+- Claude session continuity (`--continue <id>`) — opt-in
+  `reuse_session` flag for retry chains that benefit from carrying
+  context.
+
+**Operator surface**
+
+- `batonq agent-list` — shows which runners are wired and which
+  are on PATH.
+- `batonq agent-run --tool=<x> --prompt=<text>` — head-to-head
+  invocation, used both by humans and by the loop dispatcher.
+- `batonq snapshot` (and `--md`) — paste-ready status block for an
+  external "overseer chat": ship status, queue counts, active
+  claims, running loops, last 10 commits, last 3 CI runs, 24h
+  cheat-detection, 5 latest hook events.
+
+### Changed
+
+- The repo's previous `juks` vocabulary (Norwegian for "cheat")
+  was renamed globally to `cheat` for English consistency with
+  the public positioning. 142 occurrences across src/, tests/,
+  docs/, evals/, demo/. No DB schema impact.
+
+### Fixed
+
+- SHIP-017: TypeScript typecheck regression in
+  `tests/core.test.ts` after introducing `AGENTS as const`.
+  Wrapped `AGENTS.length` in `Number()` to widen the literal type
+  for `expect(...).toBe(...)`. Diagnosed and patched by **codex**
+  via `batonq agent-run`, the first verifiable end-to-end commit
+  through the multi-CLI dispatch path.
+- Codex runner defaulted to read-only sandbox; now passes
+  `--full-auto` in execute mode so the agent can edit files and
+  run git.
+
+### Notes
+
+- Live-verified all four runners with `say hi in 3 words`:
+  claude (8.7s), codex (8.8s), gemini (12.7s), opencode (5.4s).
+- Ship-criteria still passes 22/22 after every change in this
+  release.
+
 ## [0.2.0] - 2026-04-24
 
 ### Added
