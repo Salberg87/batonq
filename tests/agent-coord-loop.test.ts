@@ -359,3 +359,193 @@ describe("agent-coord-loop-watchdog", () => {
     { timeout: 15_000 },
   );
 });
+
+// Dispatch tests: drive the loop with a mock `batonq` on PATH so we can
+// inspect the argv it builds for `agent-run`. The mock writes its argv to a
+// known file on the first `batonq agent-run` call and emits NO_TASK on the
+// second `batonq pick` so the loop drops into its 60s sleep — at that point
+// we tear it down. Nothing here exercises the real Claude/codex/gemini
+// CLIs; we're verifying the routing/fallback logic in the bash loop.
+describe("agent-coord-loop: dispatch via batonq agent-run", () => {
+  let tmp: string;
+  let mockBin: string;
+  let argsLog: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "batonq-dispatch-"));
+    mockBin = join(tmp, "bin");
+    mkdirSync(mockBin, { recursive: true });
+    argsLog = join(tmp, "agent-run-args.log");
+    // The loop reads ~/.claude/commands/pick-next.md at startup; HOME=tmp
+    // redirects that read into our scratch dir.
+    mkdirSync(join(tmp, ".claude", "commands"), { recursive: true });
+    writeFileSync(join(tmp, ".claude", "commands", "pick-next.md"), "stub");
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  function writeMockBatonq(opts: {
+    pickAgent: string;
+    pickModel: string;
+  }): void {
+    // The mock acts as `batonq pick` (returns one TASK_CLAIMED then NO_TASK
+    // on subsequent calls), `batonq agent-run` (records argv), and
+    // `batonq done`/`abandon` (no-ops). The pick-once-then-empty pattern
+    // keeps the loop from looping forever and racing the test cleanup.
+    const script = `#!/bin/sh
+case "$1" in
+  pick)
+    if [ -f "${tmp}/pick_done" ]; then
+      echo "NO_TASK"
+      echo "queue empty"
+      exit 0
+    fi
+    touch "${tmp}/pick_done"
+    cat <<'PICK_EOF'
+TASK_CLAIMED
+external_id: deadbeef0001
+repo:        batonq
+priority:    normal
+agent:       ${opts.pickAgent}
+model:       ${opts.pickModel}
+session:     pid_99
+
+TASK:
+do nothing meaningful
+
+When complete:   batonq done deadbeef0001
+If abandoning:   batonq abandon deadbeef0001
+PICK_EOF
+    ;;
+  agent-run)
+    shift
+    # Record each argv element on its own line so the test can grep without
+    # caring about quoting (multi-line --prompt values would otherwise muddle
+    # a single-line dump).
+    : > "${argsLog}"
+    for a in "$@"; do
+      printf '%s\\n' "$a" >> "${argsLog}"
+    done
+    exit 0
+    ;;
+  done|abandon)
+    exit 0
+    ;;
+  *)
+    echo "mock batonq: unhandled subcommand $1" >&2
+    exit 2
+    ;;
+esac
+`;
+    const path = join(mockBin, "batonq");
+    writeFileSync(path, script);
+    chmodSync(path, 0o755);
+  }
+
+  function writeAvailableTool(name: string): void {
+    // No-op stub so `command -v <name>` succeeds during the loop's
+    // availability gate. We don't actually invoke the tool.
+    const path = join(mockBin, name);
+    writeFileSync(path, "#!/bin/sh\nexit 0\n");
+    chmodSync(path, 0o755);
+  }
+
+  // Spawn the loop with a controlled PATH and HOME, wait until the mock
+  // batonq writes its argv log, then SIGKILL the whole process group so the
+  // watchdog (a backgrounded child of the loop) is reaped along with bash.
+  async function runLoopUntilDispatched(
+    env: NodeJS.ProcessEnv,
+  ): Promise<string> {
+    const proc = spawn("bash", [LOOP_SCRIPT], {
+      env,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    try {
+      const start = Date.now();
+      while (!existsSync(argsLog) && Date.now() - start < 8_000) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    } finally {
+      try {
+        process.kill(-proc.pid!, "SIGKILL");
+      } catch {
+        // already dead
+      }
+      await new Promise((r) => proc.on("exit", () => r(undefined)));
+    }
+    if (!existsSync(argsLog)) {
+      throw new Error(
+        "loop never invoked agent-run within 8s — mock batonq or watchdog wiring is wrong",
+      );
+    }
+    return require("node:fs").readFileSync(argsLog, "utf8") as string;
+  }
+
+  test(
+    "dispatches with the agent and model emitted by `batonq pick`",
+    async () => {
+      writeMockBatonq({ pickAgent: "gemini", pickModel: "flash" });
+      writeAvailableTool("gemini");
+
+      const recorded = await runLoopUntilDispatched({
+        ...process.env,
+        PATH: `${mockBin}:${process.env.PATH ?? ""}`,
+        HOME: tmp,
+      });
+
+      // argv should include --tool=gemini and --model=flash. We don't pin
+      // ordering — the loop is free to reshape argv layout in the future.
+      expect(recorded).toContain("--tool=gemini");
+      expect(recorded).toContain("--model=flash");
+    },
+    { timeout: 15_000 },
+  );
+
+  test(
+    "BATONQ_FORCE_AGENT overrides the picked agent",
+    async () => {
+      // Pick says gemini, but operator pinned codex via env.
+      writeMockBatonq({ pickAgent: "gemini", pickModel: "flash" });
+      writeAvailableTool("gemini");
+      writeAvailableTool("codex");
+
+      const recorded = await runLoopUntilDispatched({
+        ...process.env,
+        PATH: `${mockBin}:${process.env.PATH ?? ""}`,
+        HOME: tmp,
+        BATONQ_FORCE_AGENT: "codex",
+      });
+
+      expect(recorded).toContain("--tool=codex");
+      expect(recorded).not.toContain("--tool=gemini");
+    },
+    { timeout: 15_000 },
+  );
+
+  test(
+    "falls back to claude when the picked agent is not on PATH",
+    async () => {
+      // Use a deliberately bogus tool name so we don't have to filter the
+      // real PATH. Picking "gemini" here would make the test flaky on dev
+      // boxes that have gemini-cli installed (command -v would succeed and
+      // the fallback wouldn't fire). A random-suffix name is guaranteed
+      // missing on every host.
+      const missing = "batonq-fake-tool-zzz9999";
+      writeMockBatonq({ pickAgent: missing, pickModel: "flash" });
+      writeAvailableTool("claude");
+
+      const recorded = await runLoopUntilDispatched({
+        ...process.env,
+        PATH: `${mockBin}:${process.env.PATH ?? ""}`,
+        HOME: tmp,
+      });
+
+      expect(recorded).toContain("--tool=claude");
+      expect(recorded).not.toContain(`--tool=${missing}`);
+    },
+    { timeout: 15_000 },
+  );
+});

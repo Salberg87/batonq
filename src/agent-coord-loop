@@ -1,9 +1,24 @@
 #!/bin/bash
 set -euo pipefail
 
-# batonq-loop — Path A: Fresh Claude invocation per task
-# Polls batonq pick and spawns a new Claude instance for each task.
-# Useful for long-running task loops where fresh context per task is preferred.
+# batonq-loop — Path A: Fresh agent invocation per task via batonq agent-run.
+#
+# Polls `batonq pick` and dispatches each claimed task through the agent-runner
+# abstraction (src/agent-runners/*) instead of hard-coding `claude -p`. The
+# picked agent + model come from the routing layer (src/agent-runners/
+# routing.ts) and are emitted on `agent:` / `model:` lines in pick output.
+#
+# Two operator-side escape hatches sit on top of routing:
+#
+#   BATONQ_FORCE_AGENT=<tool>   pin every dispatch to <tool> regardless of
+#                               what routing decided. Useful when one CLI is
+#                               broken/rate-limited and you want every task
+#                               pushed through one runner without re-routing
+#                               rows in the DB.
+#   <tool> not on PATH          silently fall back to claude. claude is the
+#                               historical default; we treat it as the
+#                               last-resort runner expected to be present
+#                               on every host.
 #
 # Deps: a `timeout` binary (GNU coreutils). macOS ships without one, so
 #   `brew install coreutils` gives you `gtimeout`. Linux ships `timeout`
@@ -13,14 +28,13 @@ set -euo pipefail
 # Env:
 #   BATONQ_WATCHDOG_STALE_SEC   watchdog mtime-staleness threshold (default 600)
 #   BATONQ_WATCHDOG_WARMUP_SEC  watchdog warm-up before first check (default 120)
-#   BATONQ_LOOP_TIMEOUT         timeout duration for claude -p (default 20m)
+#   BATONQ_LOOP_TIMEOUT         timeout duration for dispatch (default 20m)
+#   BATONQ_FORCE_AGENT          ops-time agent pin (overrides routing)
 #
 # Multi-session caveat: the watchdog watches a *shared* hook log
-# (~/.claude/batonq-measurement/events.jsonl). If two batonq-loop instances run
-# concurrently on the same machine and only one is making progress, the other's
-# watchdog will see fresh mtimes from its peer and NOT fire on its own wedge.
-# Acceptable for single-loop-per-host setups; for parallel hosts-on-one-machine
-# use per-loop event logs (e.g. events.$PID.jsonl).
+# (~/.claude/batonq-measurement/events.jsonl). The events log is written by
+# the hook regardless of which agent ran, so the watchdog stays agnostic to
+# which CLI was dispatched.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./batonq-platform-compat.sh
@@ -30,6 +44,17 @@ PICK_NEXT_SYSTEM_PROMPT="$(cat ~/.claude/commands/pick-next.md)"
 
 LOOP_TIMEOUT="${BATONQ_LOOP_TIMEOUT:-20m}"
 TIMEOUT_CMD="$(batonq_timeout_cmd)"
+
+# extract_pick_field <key> — pull the right-hand value of `<key>: <value>`
+# lines from $PICK_OUTPUT. Returns empty string if the key is absent so the
+# caller can ${var:-default} their own fallback. awk is used over sed to
+# avoid escaping headaches in the BRE regex.
+extract_pick_field() {
+  local key="$1" value
+  value=$(printf '%s\n' "$PICK_OUTPUT" \
+            | awk -F: -v k="$key" '$1 == k { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }')
+  printf '%s' "$value"
+}
 
 while true; do
   echo "→ batonq pick"
@@ -45,22 +70,38 @@ while true; do
   if [[ "$PICK_OUTPUT" =~ ^TASK_CLAIMED ]]; then
     echo "$PICK_OUTPUT"
     echo
-    echo "→ spawning claude -p for this task"
+
+    # Routing decision propagated by `batonq pick` (resolved via src/agent-
+    # runners/routing.ts). Empty for legacy DB rows that pre-date routing —
+    # default to claude/sonnet to preserve the old hard-coded behaviour.
+    AGENT="$(extract_pick_field agent)"
+    MODEL="$(extract_pick_field model)"
+    AGENT="${AGENT:-claude}"
+    MODEL="${MODEL:-sonnet}"
+
+    if [ -n "${BATONQ_FORCE_AGENT:-}" ]; then
+      echo "→ BATONQ_FORCE_AGENT=${BATONQ_FORCE_AGENT} (overrides picked: ${AGENT})"
+      AGENT="${BATONQ_FORCE_AGENT}"
+    fi
+
+    # Availability gate: if the chosen runner isn't on PATH, fall back to
+    # claude. The fallback applies equally to a routing pick and to a
+    # BATONQ_FORCE_AGENT pin — surprising the operator with a hung dispatch
+    # is worse than a logged fallback they can spot in the loop output.
+    if ! command -v "$AGENT" >/dev/null 2>&1; then
+      echo "→ ${AGENT} not on PATH; falling back to claude"
+      AGENT="claude"
+    fi
+
+    echo "→ dispatching: batonq agent-run --tool=${AGENT} --model=${MODEL}"
     echo
 
-    # Plain claude -p: the previous streaming variant with --verbose piped to a
-    # watcher held the process alive after /clear and wedged the loop. Plain
-    # mode exits cleanly on stdin EOF.
-    # The timeout wrapper is belt-and-suspenders: any task that takes
-    # >LOOP_TIMEOUT is stuck; kill it so the loop continues. On macOS that's
-    # gtimeout (coreutils); on Linux it's the native `timeout`.
-    # The watchdog below gives us finer-grain hang detection via events.jsonl mtime.
-    # Watch progress with `batonq tail -n 20` in another terminal.
-
     # Liveness watchdog: if the shared hook event log goes mtime-stale for
-    # BATONQ_WATCHDOG_STALE_SEC, kill the gtimeout/claude tree so the loop
-    # rolls forward. Default 600s (10 min), overridable via env. Extracted
-    # to its own script so it's independently testable.
+    # BATONQ_WATCHDOG_STALE_SEC, kill the gtimeout/agent tree so the loop
+    # rolls forward. Default 600s (10 min), overridable via env. The
+    # watchdog kills the gtimeout process by name; agent-run runs as a
+    # grandchild via gtimeout so the kill propagates regardless of which
+    # CLI we dispatched to.
     WATCHDOG_CMD="$(command -v batonq-loop-watchdog \
                 || command -v agent-coord-loop-watchdog \
                 || echo "$(dirname "$0")/agent-coord-loop-watchdog")"
@@ -68,12 +109,15 @@ while true; do
     WATCHDOG_PID=$!
 
     # `|| true` prevents `set -e` from tearing down the loop when the timeout
-    # wrapper (124) or claude returns non-zero — we want the outer loop to
-    # keep running.
-    echo "$PICK_OUTPUT" \
-      | "$TIMEOUT_CMD" "$LOOP_TIMEOUT" claude -p \
-          --dangerously-skip-permissions \
-          --append-system-prompt "$PICK_NEXT_SYSTEM_PROMPT" || true
+    # wrapper (124) or agent-run returns non-zero — we want the outer loop to
+    # keep running. The full pick output is passed as --prompt so the picked
+    # agent has the same context (external_id, body, "When complete: batonq
+    # done <id>") that claude got under the previous hard-coded path.
+    "$TIMEOUT_CMD" "$LOOP_TIMEOUT" batonq agent-run \
+        --tool="$AGENT" \
+        --model="$MODEL" \
+        --prompt="$PICK_OUTPUT" \
+        --system-prompt="$PICK_NEXT_SYSTEM_PROMPT" || true
 
     # Clean up watchdog (task done or killed)
     kill "$WATCHDOG_PID" 2>/dev/null || true
