@@ -94,6 +94,38 @@ describe("detectTaskType — regex classification per task type", () => {
     ).toBe("refactor");
   });
 
+  test("Norwegian bodies hit the same buckets as the English equivalents", () => {
+    // TASKS.md mixes Norwegian and English freely — the regex must classify
+    // both languages or it silently underroutes Norwegian-language tasks.
+    expect(detectTaskType("Implementer ny feature for bulk task import")).toBe(
+      "implementation",
+    );
+    expect(detectTaskType("Legg til en ny funksjon for eksport")).toBe(
+      "implementation",
+    );
+    expect(
+      detectTaskType("Refaktorer selectCandidate til mindre helpers"),
+    ).toBe("refactor");
+    expect(
+      detectTaskType("Utforsk auth-modulen og kartlegg session-flow"),
+    ).toBe("exploration");
+    expect(detectTaskType("Undersøk hvorfor bygget er tregt på CI")).toBe(
+      "exploration",
+    );
+    expect(detectTaskType("Gjennomgå PR-en før merge")).toBe("review");
+    expect(detectTaskType("Kodegjennomgang av migrate-path")).toBe("review");
+    expect(detectTaskType("Fiks skrivefeil i README.md")).toBe("quick_fix");
+    expect(detectTaskType("Redesign arkitekturen for køen")).toBe(
+      "architecture",
+    );
+    expect(detectTaskType("Generer boilerplate for ny MCP-server")).toBe(
+      "code_generation",
+    );
+    expect(detectTaskType("Analyser TODO-kommentarer i hele kodebasen")).toBe(
+      "bulk_analysis",
+    );
+  });
+
   test("ROUTING_TABLE covers every TaskType", () => {
     for (const t of TASK_TYPES) {
       expect(ROUTING_TABLE[t as TaskType]).toBeTruthy();
