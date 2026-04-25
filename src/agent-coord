@@ -180,6 +180,9 @@ switch (cmd) {
   case "agent-list":
     runAgentList();
     break;
+  case "snapshot":
+    runSnapshot(process.argv.slice(3));
+    break;
   default:
     console.error(
       "usage: batonq\n" +
@@ -193,6 +196,7 @@ switch (cmd) {
         "  Dashboard:     tui | loop-status [--json]\n" +
         "  Ship:          ship-status\n" +
         "  Agents:        agent-list | agent-run --tool=<claude|codex> --prompt=<text> [--cwd=<dir>] [--timeout-sec=N]\n" +
+        "  Snapshot:      snapshot [--md] (paste-ready status block for overseer chat)\n" +
         "  Exit:          uninstall [--remove-state|--keep-state]"
     );
     process.exit(2);
@@ -214,6 +218,178 @@ function runShipStatus(): void {
     cwd: resolve(__dirname, ".."),
   });
   process.exit(res.status ?? 0);
+}
+
+// snapshot: dump a paste-ready status block summarising EVERYTHING that
+// matters about the running batonq system in one go. Designed to be fed
+// into another LLM session ("overseer chat") as context — the user
+// shouldn't have to chain `tasks`, `loop-status`, `tail`, `git log`,
+// `gh run list` and `check-ship` to assemble it themselves.
+//
+// Output is markdown-flavoured plain text; --md adds fenced sections so
+// the whole blob can be dropped straight into a chat composer without
+// breaking the surrounding markdown.
+function runSnapshot(args: string[]): void {
+  const asMd = args.includes("--md");
+  const fence = (lang: string) => (asMd ? "```" + lang : "");
+  const efence = () => (asMd ? "```" : "");
+
+  const out: string[] = [];
+  const push = (line = "") => out.push(line);
+
+  const now = new Date();
+  push(`# batonq snapshot — ${now.toISOString()}`);
+  push();
+
+  // ── Ship status ─────────────────────────────────────────────────────
+  push("## Ship");
+  const shipScript = resolve(__dirname, "..", "scripts", "check-ship.sh");
+  if (existsSync(shipScript)) {
+    const r = spawnSync("sh", [shipScript], { encoding: "utf8" });
+    const summary =
+      (r.stdout ?? "").split("\n").reverse().find((l) => /criteria passing/.test(l)) ?? "(no summary)";
+    push(summary);
+  } else {
+    push("(check-ship.sh not present)");
+  }
+  push();
+
+  // ── Queue ───────────────────────────────────────────────────────────
+  push("## Queue");
+  if (existsSync(DB_PATH)) {
+    try {
+      const db = new Database(DB_PATH, { readonly: true });
+      try {
+        const counts = db
+          .query<{ status: string; n: number }, []>(
+            `SELECT status, count(*) AS n FROM tasks GROUP BY status ORDER BY status`,
+          )
+          .all();
+        for (const c of counts) push(`- ${c.status}: ${c.n}`);
+        const claimed = db
+          .query<
+            { external_id: string; body: string; claimed_at: string; claimed_by: string | null },
+            []
+          >(
+            `SELECT external_id, body, claimed_at, claimed_by FROM tasks WHERE status='claimed' ORDER BY claimed_at ASC LIMIT 5`,
+          )
+          .all();
+        if (claimed.length) {
+          push();
+          push("### Active claims");
+          for (const c of claimed) {
+            const mins = Math.round(
+              (now.getTime() - new Date(c.claimed_at).getTime()) / 60000,
+            );
+            push(
+              `- \`${c.external_id.slice(0, 12)}\` (${mins}m old, by ${c.claimed_by ?? "—"}): ${c.body.slice(0, 80)}`,
+            );
+          }
+        }
+      } finally {
+        db.close();
+      }
+    } catch (e) {
+      push(`(queue read failed: ${(e as Error).message})`);
+    }
+  } else {
+    push(`(state DB not at ${DB_PATH})`);
+  }
+  push();
+
+  // ── Loops ───────────────────────────────────────────────────────────
+  push("## Loops");
+  const loops = spawnSync(
+    "sh",
+    ["-c", "ps -ax -o pid=,etime=,command= | grep -E 'batonq-loop|agent-coord-loop' | grep -v grep || true"],
+    { encoding: "utf8" },
+  );
+  const loopLines = (loops.stdout ?? "").trim().split("\n").filter(Boolean);
+  if (loopLines.length === 0) push("- none running");
+  else for (const l of loopLines) push(`- ${l.trim()}`);
+  push();
+
+  // ── Recent commits ─────────────────────────────────────────────────
+  push("## Recent commits (last 10)");
+  const log = spawnSync(
+    "git",
+    ["-C", resolve(__dirname, ".."), "log", "--oneline", "-n", "10"],
+    { encoding: "utf8" },
+  );
+  if (asMd) push(fence(""));
+  push((log.stdout ?? "").trim() || "(no git log)");
+  if (asMd) push(efence());
+  push();
+
+  // ── CI ──────────────────────────────────────────────────────────────
+  push("## CI (last 3 runs)");
+  const gh = spawnSync(
+    "gh",
+    [
+      "run",
+      "list",
+      "-R",
+      "Salberg87/batonq",
+      "-L",
+      "3",
+      "--json",
+      "conclusion,status,name,createdAt",
+      "--jq",
+      `.[] | "- \\(.createdAt|sub("T";" ")|sub(":[0-9]+Z$";"")) \\(.name) \\(.status) \\(.conclusion//"-")"`,
+    ],
+    { encoding: "utf8" },
+  );
+  push((gh.stdout ?? "").trim() || "(gh not available)");
+  push();
+
+  // ── Cheat / juks classifier hits in last 24h ───────────────────────
+  push("## Cheat-detection (last 24h)");
+  if (existsSync(DB_PATH)) {
+    try {
+      const db = new Database(DB_PATH, { readonly: true });
+      try {
+        const cheats = db
+          .query<{ external_id: string; completed_at: string }, []>(
+            `SELECT external_id, completed_at FROM tasks
+              WHERE status='done'
+                AND verify_cmd IS NOT NULL
+                AND verify_ran_at IS NULL
+                AND completed_at > datetime('now','-24 hours')
+              ORDER BY completed_at DESC LIMIT 10`,
+          )
+          .all();
+        if (cheats.length === 0) push("- none (gates held)");
+        else for (const c of cheats) push(`- ⚠ \`${c.external_id.slice(0, 12)}\` at ${c.completed_at}`);
+      } finally {
+        db.close();
+      }
+    } catch (e) {
+      push(`(cheat query failed: ${(e as Error).message})`);
+    }
+  }
+  push();
+
+  // ── Last events tail ───────────────────────────────────────────────
+  push("## Last events (5 most recent)");
+  if (existsSync(LOG_PATH)) {
+    const tail = spawnSync("tail", ["-n", "5", LOG_PATH], { encoding: "utf8" });
+    if (asMd) push(fence("jsonl"));
+    for (const line of (tail.stdout ?? "").trim().split("\n").filter(Boolean)) {
+      try {
+        const e = JSON.parse(line);
+        push(
+          `- ${e.ts?.slice?.(0, 19) ?? "?"}  ${(e.session ?? "").slice(0, 8)}  ${e.tool}  ${(e.paths?.[0] ?? "").slice(-50)}`,
+        );
+      } catch {
+        push(`- ${line.slice(0, 120)}`);
+      }
+    }
+    if (asMd) push(efence());
+  } else {
+    push("(no events.jsonl)");
+  }
+
+  process.stdout.write(out.join("\n") + "\n");
 }
 
 // agent-list: print which AgentRunners are implemented and which are

@@ -3,29 +3,32 @@
 import type { AgentRunner, AgentTool } from "./types";
 import { claudeRunner } from "./claude";
 import { codexRunner } from "./codex";
+import { geminiRunner } from "./gemini";
+import { opencodeRunner } from "./opencode";
 
 const REGISTRY: Record<AgentTool, AgentRunner> = {
   claude: claudeRunner,
   codex: codexRunner,
-  // gemini and opencode wired in in follow-up tasks.
-  gemini: claudeRunner, // placeholder so the type stays exhaustive
-  opencode: claudeRunner, // placeholder
+  gemini: geminiRunner,
+  opencode: opencodeRunner,
 };
 
-/**
- * Look up a runner by name. Throws if the name is not yet implemented
- * (caller should validate against `availableTools()` before calling).
- */
+/** Look up a runner by name. Throws if the name is not registered. */
 export function getRunner(name: AgentTool): AgentRunner {
   const r = REGISTRY[name];
   if (!r) throw new Error(`unknown agent tool: ${name}`);
   return r;
 }
 
-/** List runners that have first-class implementations (not placeholders). */
-export const IMPLEMENTED_TOOLS: readonly AgentTool[] = ["claude", "codex"];
+/** Tools that have first-class implementations. */
+export const IMPLEMENTED_TOOLS: readonly AgentTool[] = [
+  "claude",
+  "codex",
+  "gemini",
+  "opencode",
+];
 
-/** List runners whose binary is on PATH (best-effort). */
+/** Tools whose binary is on PATH (best-effort). */
 export function availableTools(): AgentTool[] {
   return IMPLEMENTED_TOOLS.filter((t) => REGISTRY[t].available());
 }
@@ -35,4 +38,6 @@ export type {
   AgentRunOptions,
   AgentRunResult,
   AgentTool,
+  ExecutionMode,
+  ModelNickname,
 } from "./types";

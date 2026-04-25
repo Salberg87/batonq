@@ -11,17 +11,28 @@ import {
   availableTools,
   getRunner,
 } from "../src/agent-runners";
-import { capOutput, STDOUT_CAP_BYTES } from "../src/agent-runners/types";
+import {
+  capOutput,
+  resolveModel,
+  STDOUT_CAP_BYTES,
+} from "../src/agent-runners/types";
+import { CLAUDE_MODELS } from "../src/agent-runners/claude";
+import { CODEX_MODELS } from "../src/agent-runners/codex";
+import { GEMINI_MODELS } from "../src/agent-runners/gemini";
 
 describe("agent-runners registry", () => {
-  test("exposes claude and codex as implemented tools", () => {
+  test("exposes claude, codex, gemini, opencode as implemented tools", () => {
     expect(IMPLEMENTED_TOOLS).toContain("claude");
     expect(IMPLEMENTED_TOOLS).toContain("codex");
+    expect(IMPLEMENTED_TOOLS).toContain("gemini");
+    expect(IMPLEMENTED_TOOLS).toContain("opencode");
   });
 
   test("getRunner returns a runner with the requested name", () => {
     expect(getRunner("claude").name).toBe("claude");
     expect(getRunner("codex").name).toBe("codex");
+    expect(getRunner("gemini").name).toBe("gemini");
+    expect(getRunner("opencode").name).toBe("opencode");
   });
 
   test("each implemented runner exposes available() and run()", () => {
@@ -57,5 +68,47 @@ describe("capOutput", () => {
     const exact = "y".repeat(STDOUT_CAP_BYTES);
     expect(capOutput(exact)).toBe(exact);
     expect(capOutput(exact + "z").endsWith("[truncated]")).toBe(true);
+  });
+});
+
+describe("resolveModel — nickname → real id translation", () => {
+  test("returns undefined when nickname is undefined", () => {
+    expect(resolveModel(undefined, CLAUDE_MODELS)).toBeUndefined();
+  });
+
+  test("translates known Claude nicknames", () => {
+    expect(resolveModel("opus", CLAUDE_MODELS)).toBe(CLAUDE_MODELS.opus);
+    expect(resolveModel("sonnet", CLAUDE_MODELS)).toBe(CLAUDE_MODELS.sonnet);
+    expect(resolveModel("haiku", CLAUDE_MODELS)).toBe(CLAUDE_MODELS.haiku);
+  });
+
+  test("translates known Gemini nicknames", () => {
+    expect(resolveModel("pro", GEMINI_MODELS)).toBe(GEMINI_MODELS.pro);
+    expect(resolveModel("flash", GEMINI_MODELS)).toBe(GEMINI_MODELS.flash);
+  });
+
+  test("passes unknown nicknames through verbatim (caller can supply full id)", () => {
+    const fullId = "claude-opus-4-99-20300101";
+    expect(resolveModel(fullId, CLAUDE_MODELS)).toBe(fullId);
+    expect(resolveModel("gemini-99-ultra", GEMINI_MODELS)).toBe(
+      "gemini-99-ultra",
+    );
+  });
+});
+
+describe("MODELS maps cover the documented nicknames", () => {
+  test("Claude has opus/sonnet/haiku", () => {
+    for (const k of ["opus", "sonnet", "haiku"]) {
+      expect(CLAUDE_MODELS[k]).toBeTruthy();
+    }
+  });
+
+  test("Codex has at least 'default'", () => {
+    expect(CODEX_MODELS["default"]).toBeTruthy();
+  });
+
+  test("Gemini has pro/flash", () => {
+    expect(GEMINI_MODELS["pro"]).toBeTruthy();
+    expect(GEMINI_MODELS["flash"]).toBeTruthy();
   });
 });

@@ -1,18 +1,28 @@
 // agent-runners/codex.ts — OpenAI Codex CLI runner.
 //
-// Headless invocation: `codex exec [--skip-git-repo-check] "<prompt>"`.
-// The `exec` subcommand is the non-interactive entry point. We always pass
+// Headless invocation: `codex exec [--skip-git-repo-check] [--model <id>] "<prompt>"`.
+// `exec` is the non-interactive subcommand. We always pass
 // `--skip-git-repo-check` because batonq tasks frequently target dirs that
-// are not git roots themselves (e.g. `~/DEV` umbrella runs, scratch dirs).
-// Auth is via `codex login` (ChatGPT or API key); the runner does not
-// re-check auth on every call — failures surface as non-zero exit.
+// are not git roots themselves (`~/DEV` umbrella, scratch dirs).
 //
-// Prompt is passed as a positional arg, NOT stdin: codex exec reads stdin
-// for "additional input" which behaves differently from the prompt slot.
+// Auth: `codex login` (ChatGPT subscription or API key). The runner does
+// not re-check auth on every call — failures surface as non-zero exit.
+//
+// Mode caveat: codex has no read-only equivalent of `claude --print`.
+// `analyze` and `execute` both invoke `exec`; analyze just adds a system-
+// hint to the prompt asking for a no-edit response. Documented per spec.
 
 import { spawnSync } from "node:child_process";
 import type { AgentRunner, AgentRunOptions, AgentRunResult } from "./types";
-import { DEFAULT_TIMEOUT_MS, capOutput } from "./types";
+import { DEFAULT_TIMEOUT_MS, capOutput, resolveModel } from "./types";
+
+/** Codex model nicknames. Keep small — codex's model surface is narrower. */
+export const CODEX_MODELS: Record<string, string> = {
+  default: "codex",
+};
+
+const ANALYZE_HINT =
+  "Read-only mode: explain or describe only. Do NOT edit files, run shell commands, or commit. Output your analysis as text.";
 
 export const codexRunner: AgentRunner = {
   name: "codex",
@@ -23,9 +33,18 @@ export const codexRunner: AgentRunner = {
   },
 
   run(opts: AgentRunOptions): AgentRunResult {
+    const mode = opts.mode ?? "execute";
+    const resolvedModel = resolveModel(opts.model, CODEX_MODELS);
+
     const args = ["exec", "--skip-git-repo-check"];
+    if (resolvedModel) args.push("--model", resolvedModel);
     if (opts.extraArgs?.length) args.push(...opts.extraArgs);
-    args.push(opts.prompt);
+
+    // Codex has no native --print mode. Prepend a hint in analyze-mode so
+    // the model self-restricts. Best-effort, not enforced by the CLI.
+    const finalPrompt =
+      mode === "analyze" ? `${ANALYZE_HINT}\n\n${opts.prompt}` : opts.prompt;
+    args.push(finalPrompt);
 
     const start = Date.now();
     const r = spawnSync("codex", args, {
@@ -44,6 +63,8 @@ export const codexRunner: AgentRunner = {
       stdout: capOutput(r.stdout ?? ""),
       stderr: capOutput(r.stderr ?? ""),
       timedOut: r.signal === "SIGTERM" && (r.status ?? 0) !== 0,
+      mode,
+      resolvedModel,
     };
   },
 };
