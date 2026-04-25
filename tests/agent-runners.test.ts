@@ -20,6 +20,7 @@ import {
   CLAUDE_MODELS,
   buildClaudeArgs,
   extractSessionId,
+  pickParentSessionId,
 } from "../src/agent-runners/claude";
 import { CODEX_MODELS } from "../src/agent-runners/codex";
 import { GEMINI_MODELS } from "../src/agent-runners/gemini";
@@ -151,21 +152,16 @@ describe("Claude session continuity (fan-out 6/6)", () => {
   });
 
   // End-to-end of the dispatcher pattern: a judge-FAIL on a parent task
-  // produces a follow-up task. The dispatcher only forwards the parent's
-  // session_id when the follow-up's reuse_session flag is set — proving
-  // the kill switch works and the runner stays opt-in (not auto-pull).
-  test("judge-FAIL → retry chain: dispatcher forwards parent session_id only when reuse_session=true", () => {
+  // produces a follow-up task. The dispatcher (pickParentSessionId) only
+  // forwards the parent's session_id when the follow-up's reuse_session
+  // flag is set — proving the kill switch works and the runner stays
+  // opt-in (not auto-pull from the DB).
+  test("judge-FAIL → retry chain: pickParentSessionId gates --continue on reuse_session", () => {
     const PARENT_SESSION = "feedface-1234-5678-9abc-def012345678";
-
-    // Simulated parent task row that captured a session id from its run.
     const parent = { external_id: "p1", session_id: PARENT_SESSION };
 
-    // Tiny dispatcher: this is the gating logic the loop will own. Only
-    // forward parent session_id when the follow-up explicitly opted in.
     function dispatchArgs(followUp: { reuse_session?: boolean }): string[] {
-      const parentSessionId = followUp.reuse_session
-        ? parent.session_id
-        : undefined;
+      const parentSessionId = pickParentSessionId(parent, followUp);
       return buildClaudeArgs(
         { prompt: "retry attempt", cwd: "/tmp", parentSessionId },
         undefined,
@@ -181,6 +177,13 @@ describe("Claude session continuity (fan-out 6/6)", () => {
     const idx = continuingArgs.indexOf("--continue");
     expect(idx).toBeGreaterThanOrEqual(0);
     expect(continuingArgs[idx + 1]).toBe(PARENT_SESSION);
+  });
+
+  test("pickParentSessionId returns undefined when parent has no session", () => {
+    expect(
+      pickParentSessionId({ session_id: undefined }, { reuse_session: true }),
+    ).toBeUndefined();
+    expect(pickParentSessionId(null, { reuse_session: true })).toBeUndefined();
   });
 });
 

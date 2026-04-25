@@ -137,6 +137,26 @@ export function buildClaudeArgs(
 }
 
 /**
+ * Dispatcher hook: decide whether a follow-up should reuse the parent's
+ * Claude session. This is the single place the loop calls when building a
+ * retry — it keeps the gating policy (default fresh, opt-in via
+ * reuse_session) in one place instead of scattering the same conditional
+ * across every callsite that wants to spawn a continuation.
+ *
+ * Returns the parent session id when the follow-up opted into reuse AND
+ * the parent actually has a session id on file; undefined otherwise. The
+ * undefined return is what tells claudeRunner.run to start a fresh session.
+ */
+export function pickParentSessionId(
+  parent: { session_id?: string | null } | null | undefined,
+  followUp: { reuse_session?: boolean | null } | null | undefined,
+): string | undefined {
+  if (!parent?.session_id) return undefined;
+  if (!followUp?.reuse_session) return undefined;
+  return parent.session_id;
+}
+
+/**
  * Pull the Claude session id out of captured stdout. Claude emits it in two
  * shapes depending on `--output-format`: the JSON/stream-json variants yield
  * `"session_id":"<uuid>"` (possibly with whitespace), and human-readable
