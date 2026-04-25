@@ -29,6 +29,15 @@ export function availableTools(): AgentTool[] {
   return IMPLEMENTED_TOOLS.filter((t) => REGISTRY[t].available());
 }
 
+export {
+  detectTaskType,
+  routeTask,
+  ROUTING_TABLE,
+  DEFAULT_ROUTING,
+  TASK_TYPES,
+} from "./routing";
+export type { TaskType, RoutingDecision } from "./routing";
+
 export type {
   AgentRunner,
   AgentRunOptions,

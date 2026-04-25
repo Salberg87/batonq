@@ -16,6 +16,7 @@ import {
   syncTasks as syncTasksCore,
   selectCandidate,
   claimCandidate,
+  resolveCandidateRouting,
   detectFragileGitLog,
   runVerify,
   runJudge as runJudgeCore,
@@ -1894,6 +1895,7 @@ function pickTask(): void {
       console.log("Task was claimed by another session between sync and claim. Run /pick-next again.");
       return;
     }
+    const routing = resolveCandidateRouting(candidate);
     console.log(`TASK_CLAIMED`);
     console.log(`external_id: ${candidate.external_id}`);
     console.log(`repo:        ${candidate.repo}`);
@@ -1901,6 +1903,8 @@ function pickTask(): void {
     if (candidate.scheduled_for) {
       console.log(`scheduled:   ${candidate.scheduled_for}`);
     }
+    console.log(`agent:       ${routing.agent}`);
+    console.log(`model:       ${routing.model}`);
     console.log(`session:     ${session}`);
     console.log(``);
     console.log(`TASK:`);

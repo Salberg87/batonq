@@ -15,6 +15,8 @@ import {
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { IMPLEMENTED_TOOLS } from "./agent-runners/types";
+import { routeTask, type RoutingDecision } from "./agent-runners/routing";
 
 // OpenClaw-inspired claim TTL: claimed tasks must show progress (PostToolUse
 // touches `last_progress_at`) within this window or they're candidates for
@@ -40,6 +42,57 @@ export interface ParsedTask {
   priority?: TaskPriority;
   // ISO-8601 UTC. A task with scheduled_for > now() is not pickable.
   scheduledFor?: string;
+  // Multi-CLI dispatch annotations parsed from `@agent:` / `@model:` tokens
+  // in the task body. Both are stripped from `body` before persisting so the
+  // DB row holds clean prose. `agent` is populated only when the parsed
+  // value is in IMPLEMENTED_TOOLS+'any' — unknown agents are stripped from
+  // the body but not assigned (Zod validation would reject them anyway).
+  agent?: string;
+  model?: string;
+}
+
+// Pattern from oxo's orchestrator. Annotations are written inline in the
+// task body to pin a specific runner / model for that task:
+//   - [ ] **batonq** — fix bug @agent:gemini @model:flash
+//
+// Edge cases (documented choices):
+//   - `\w+` matches [a-zA-Z0-9_] only. Hyphens stop the match, so
+//     `@agent:gemini-flash` parses agent='gemini' and leaves `-flash` in
+//     the body. We treat hyphenated agent annotations as malformed; use
+//     `@model:flash` separately if you want a hyphenless split.
+//   - `@agent:` (empty value) doesn't match `\w+` at all — left in body
+//     verbatim.
+//   - Unknown agent (not in IMPLEMENTED_TOOLS+'any') is stripped from the
+//     body but the `agent` field is left undefined so downstream defaulting
+//     still picks 'any'. Stripping makes the parse idempotent: re-parsing
+//     a previously-cleaned body yields the same result.
+//   - Multiple `@agent:` tokens: first match wins; later occurrences are
+//     also stripped so the persisted body never contains annotation tokens.
+const ANNOTATION_AGENT_RE = /@agent:(\w+)/g;
+const ANNOTATION_MODEL_RE = /@model:(\w+)/g;
+const VALID_ANNOTATION_AGENTS = new Set<string>([...IMPLEMENTED_TOOLS, "any"]);
+
+export interface AnnotationParseResult {
+  body: string;
+  agent?: string;
+  model?: string;
+}
+
+export function extractAnnotations(rawBody: string): AnnotationParseResult {
+  const agentMatch = rawBody.match(/@agent:(\w+)/);
+  const modelMatch = rawBody.match(/@model:(\w+)/);
+  let agent: string | undefined;
+  let model: string | undefined;
+  if (agentMatch && VALID_ANNOTATION_AGENTS.has(agentMatch[1]!)) {
+    agent = agentMatch[1];
+  }
+  if (modelMatch) model = modelMatch[1];
+  const body = rawBody
+    .replace(ANNOTATION_AGENT_RE, "")
+    .replace(ANNOTATION_MODEL_RE, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return { body, agent, model };
 }
 
 // Normalise whatever the user typed into one of the three priority tokens.
@@ -140,11 +193,14 @@ export function parseTasksText(text: string): {
             : m[1] === "?"
               ? "draft"
               : "done";
+      const annotated = extractAnnotations(m[3]!.trim());
       current = {
         repo: m[2]!.trim(),
-        body: m[3]!.trim(),
+        body: annotated.body,
         status,
         lineIdx: i,
+        agent: annotated.agent,
+        model: annotated.model,
       };
       tasks.push(current);
       continue;
@@ -212,7 +268,8 @@ export function initTaskSchema(db: Database): void {
       last_progress_at TEXT,
       priority TEXT NOT NULL DEFAULT 'normal',
       scheduled_for TEXT,
-      agent TEXT
+      agent TEXT,
+      model TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status);
     CREATE INDEX IF NOT EXISTS idx_task_repo_status ON tasks(repo, status);
@@ -255,8 +312,9 @@ export function initTaskSchema(db: Database): void {
   // (task-schema.ts) defaults missing values to 'any'. NULL on legacy rows
   // is interpreted the same as 'any' by the dispatcher. Migration helper
   // lives in migrate.ts alongside the other one-shot rename migrations.
-  const { migrateAgentColumn } = require("./migrate");
+  const { migrateAgentColumn, migrateModelColumn } = require("./migrate");
   migrateAgentColumn(db);
+  migrateModelColumn(db);
   // The pick index is created after ALTERs so migrating DBs get it too.
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_task_pick ON tasks(status, priority, scheduled_for, created_at)`,
@@ -309,13 +367,17 @@ export function syncTasks(
     const judge = t.judgeCmd ?? null;
     const priority = t.priority ?? DEFAULT_PRIORITY;
     const scheduledFor = t.scheduledFor ?? null;
+    // Annotation-derived agent overrides the 'any' default; missing → 'any'.
+    // Model is freeform and only persisted when present.
+    const agent = t.agent ?? "any";
+    const model = t.model ?? null;
     // Map MD status → DB status. `claimed` in MD is treated as pending on
     // insert (DB owns claim state); draft and done pass through verbatim.
     const insertStatus =
       t.status === "done" ? "done" : t.status === "draft" ? "draft" : "pending";
     if (!existing) {
       db.run(
-        `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd, priority, scheduled_for) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd, priority, scheduled_for, agent, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           eid,
           t.repo,
@@ -326,6 +388,8 @@ export function syncTasks(
           judge,
           priority,
           scheduledFor,
+          agent,
+          model,
         ],
       );
       if (t.status !== "done") added++;
@@ -370,6 +434,21 @@ export function syncTasks(
         if (scheduledFor !== existing.scheduled_for) {
           db.run(`UPDATE tasks SET scheduled_for = ? WHERE external_id = ?`, [
             scheduledFor,
+            eid,
+          ]);
+        }
+        // Agent/model annotations are editable in-place too: a user adding
+        // `@agent:gemini` to a previously-synced pending task on disk must
+        // re-route that task on the next pick.
+        if (agent !== (existing.agent ?? "any")) {
+          db.run(`UPDATE tasks SET agent = ? WHERE external_id = ?`, [
+            agent,
+            eid,
+          ]);
+        }
+        if (model !== (existing.model ?? null)) {
+          db.run(`UPDATE tasks SET model = ? WHERE external_id = ?`, [
+            model,
             eid,
           ]);
         }
@@ -452,6 +531,20 @@ export function selectCandidate(db: Database, opts: PickOptions): any {
        LIMIT 1`,
     )
     .get(nowIso);
+}
+
+/**
+ * Resolve the (agent, model) routing for a candidate task row. Wraps
+ * `routeTask` so the pick command can announce the dispatch target without
+ * importing the routing module directly. Accepts any object with a body
+ * and an optional agent field — matches the shape returned by
+ * `selectCandidate` (raw DB row).
+ */
+export function resolveCandidateRouting(row: {
+  body: string;
+  agent?: string | null;
+}): RoutingDecision {
+  return routeTask(row.body, row.agent ?? null);
 }
 
 export function claimCandidate(
@@ -1344,6 +1437,10 @@ export interface TaskInput {
   judge?: string;
   status?: TaskStatus;
   agent?: TaskAgent;
+  // Freeform model nickname (`opus`, `haiku`, `flash`, …) parsed from
+  // `@model:` annotations or set explicitly via JSON import. Resolved by
+  // the runner at dispatch time.
+  model?: string;
 }
 
 // Raised from insertTask when the computed external_id already exists. Carries
@@ -1374,9 +1471,10 @@ export function insertTask(
   const priority = t.priority ?? DEFAULT_PRIORITY;
   const scheduledFor = t.scheduledFor ?? null;
   const agent = t.agent ?? DEFAULT_AGENT;
+  const model = t.model ?? null;
   db.run(
-    `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd, priority, scheduled_for, agent)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd, priority, scheduled_for, agent, model)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       eid,
       repo,
@@ -1388,6 +1486,7 @@ export function insertTask(
       priority,
       scheduledFor,
       agent,
+      model,
     ],
   );
   return eid;
@@ -1413,10 +1512,20 @@ export function validatedInsertTask(
   };
   const repo =
     typeof input.repo === "string" ? (input.repo as string).trim() : "";
-  const body =
+  const rawBody =
     typeof input.body === "string"
       ? (input.body as string).replace(/\s+/g, " ").trim()
       : "";
+
+  // Extract `@agent:` / `@model:` annotations from the body so a user typing
+  // `batonq add --body "fix bug @agent:gemini"` sees the same routing as if
+  // they'd written it on a TASKS.md line. Explicit fields beat annotations:
+  // `--agent claude` on a body containing `@agent:gemini` wins for claude
+  // (the body is still cleaned).
+  const annotated = extractAnnotations(rawBody);
+  const body = annotated.body;
+  if (!input.agent && annotated.agent) input.agent = annotated.agent;
+  if (!input.model && annotated.model) input.model = annotated.model;
 
   input.repo = repo;
   input.body = body;
@@ -1451,6 +1560,7 @@ export function validatedInsertTask(
         typeof input.judge === "string" ? (input.judge as string) : undefined,
       status: input.status as TaskStatus,
       agent: input.agent as TaskAgent,
+      model: typeof input.model === "string" ? input.model : undefined,
     },
     nowIso,
   );
@@ -1524,6 +1634,8 @@ export function parseMarkdownTasksForImport(text: string): TaskInput[] {
       priority: t.priority,
       scheduledFor: t.scheduledFor,
       status,
+      agent: t.agent as TaskAgent | undefined,
+      model: t.model,
     });
   }
   return out;
