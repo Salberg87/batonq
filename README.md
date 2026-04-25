@@ -56,36 +56,22 @@ by vibe. You need the gate to fire when it says it fires, and you need
 the receipts when it doesn't.
 
 The repo ships a [cheat-detection scorecard](./evals/results/2026-04-24-cheat-detection.md)
-that demonstrates this concretely: 5 cheating-agent scenarios (stub
-tests, skipped commits, undocumented code, rigged tests, comment-only
-"implementations"), a hard-coded cheat per scenario, and a side-by-side
-table of what batonq's verify gate concludes vs. what bare `claude -p`
-would have closed. Current run: **5/5 cheats blocked by batonq, 5/5
-silently closed by bare claude -p.** See [`evals/`](./evals/) for the
-runner, the JSON tasks, and how to re-generate the scorecard.
 
-Running multiple agents against the same repo also creates coordination
-chaos — two instances claiming the same task, edits colliding on the same
-file, a crashed run holding a lock nobody can see. The usual answer —
-Claude Squad, ccswarm — bundles coordination inside a full workspace
-orchestrator: you buy into their tmux layout, their lifecycle, their
-mental model. That's a lot of product for what is, underneath, a shared
-queue, a file lock, and a verify gate.
+## Multi-CLI fan-out
 
-batonq is a single binary with a handful of unix-shaped verbs: `pick`,
-`done`, `abandon`, `lock`, `release`. Under the hood it's SQLite and
-`flock(2)` — no daemon to configure, no DSL to learn, no workspace to opt
-into. It composes with whatever you already use: Claude Code, aider, a
-bash loop, a cron job, tmux panes, git worktrees. Point any number of
-agents at the same queue and they politely pass the baton: one picks a
-task, works it, _proves_ it, drops it, the next one picks the next. Files
-held by a peer are visible; stale locks expire; every state change is
-inspectable with `cat` and `sqlite3`.
+batonq orchestrates parallel agents across the four major CLI runners — Claude (`claude`), OpenAI Codex (`codex`), Google Gemini (`gemini`), and Anthropic's opencode — with a single shared queue and verify gate. Each runner speaks its own dialect: `claude -p`, `codex`, `gemini cli`, and `opencode` all map to batonq's same `pick` / `done` primitives. List available agents:
 
-Think of it as the unix-tool cousin of Claude Squad and ccswarm — the
-part you'd reach for when you want coordination as a _primitive_, not a
-platform. Pass the baton, finish the leg, prove the work. Small surface,
-big leverage, boring on purpose.
+```sh
+batonq agent-list
+```
+
+Run a task on a specific runner:
+
+```sh
+batonq agent-run --tool=claude <task-id>
+```
+
+The anti-cheat gates (`verify:`, `judge:`) fire identically regardless of which runner executes the work — no runner-specific exceptions exist.
 
 For an honest side-by-side vs claude-squad, crystal, conductor, manual
 `/loop` scripts, and ccswarm — including where those tools beat batonq —
