@@ -19,7 +19,7 @@
 <p align="center">
   <a href="https://github.com/Salberg87/batonq/actions/workflows/ci.yml"><img src="https://github.com/Salberg87/batonq/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/Salberg87/batonq/releases/latest"><img src="https://img.shields.io/github/v/release/Salberg87/batonq?color=4ADE80&label=release" alt="Latest release v0.2.0 badge"></a>
-  <a href="./docs/coverage.svg"><img src="https://img.shields.io/badge/coverage-86%25-97CA00.svg" alt="Coverage 86%"></a>
+  <a href="./docs/coverage.svg"><img src="https://img.shields.io/badge/coverage-82%25-97CA00.svg" alt="Coverage 82%"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-4ADE80.svg" alt="License: MIT"></a>
 </p>
 
