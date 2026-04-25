@@ -37,6 +37,15 @@ export const codexRunner: AgentRunner = {
     const resolvedModel = resolveModel(opts.model, CODEX_MODELS);
 
     const args = ["exec", "--skip-git-repo-check"];
+    // Sandbox mode: codex defaults to read-only, so without an explicit flag
+    // it can't edit files or run git. Mirror Claude's --dangerously-skip-
+    // permissions: in execute mode we want full workspace write + auto-
+    // approval. Analyze stays read-only.
+    if (mode === "execute") {
+      args.push("--full-auto"); // = workspace-write sandbox + on-failure approval
+    } else {
+      args.push("--sandbox", "read-only");
+    }
     if (resolvedModel) args.push("--model", resolvedModel);
     if (opts.extraArgs?.length) args.push(...opts.extraArgs);
 

@@ -2777,7 +2777,7 @@ describe("agent field", () => {
       expect(AGENTS).toContain(tool);
     }
     expect(AGENTS).toContain("any");
-    expect(AGENTS.length).toBe(IMPLEMENTED_TOOLS.length + 1);
+    expect(Number(AGENTS.length)).toBe(IMPLEMENTED_TOOLS.length + 1);
   });
 
   test("schema rejects an unknown agent value with ZodError", () => {
