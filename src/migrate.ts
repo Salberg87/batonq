@@ -142,3 +142,15 @@ export function migrateAgentColumn(db: Database): void {
   if (cols.some((c) => c.name === "agent")) return;
   db.exec("ALTER TABLE tasks ADD COLUMN agent TEXT");
 }
+
+// Add `model TEXT` column. Companion to agent: an explicit nickname pins
+// the model used by the resolved runner (`opus`, `haiku`, `flash`, …); NULL
+// lets the runner pick its own default. Populated by the @model: annotation
+// parser in tasks-core. Idempotent for the same reason as migrateAgentColumn.
+export function migrateModelColumn(db: Database): void {
+  const cols = db
+    .query("SELECT name FROM pragma_table_info('tasks')")
+    .all() as { name: string }[];
+  if (cols.some((c) => c.name === "model")) return;
+  db.exec("ALTER TABLE tasks ADD COLUMN model TEXT");
+}

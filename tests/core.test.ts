@@ -2919,3 +2919,181 @@ describe("agent field", () => {
     db.close();
   });
 });
+
+describe("@agent: / @model: annotations on TASKS.md task lines", () => {
+  test("parser extracts @agent: annotation and strips it from the body", () => {
+    const md = [
+      "## Pending",
+      "",
+      "- [ ] **batonq** — fix the parser bug @agent:gemini",
+    ].join("\n");
+    const { tasks } = parseTasksText(md);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]!.agent).toBe("gemini");
+    expect(tasks[0]!.model).toBeUndefined();
+    expect(tasks[0]!.body).toBe("fix the parser bug");
+    expect(tasks[0]!.body).not.toContain("@agent");
+  });
+
+  test("parser extracts @model: annotation and strips it from the body", () => {
+    const md = [
+      "## Pending",
+      "",
+      "- [ ] **batonq** — refactor the loop @model:flash",
+    ].join("\n");
+    const { tasks } = parseTasksText(md);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]!.agent).toBeUndefined();
+    expect(tasks[0]!.model).toBe("flash");
+    expect(tasks[0]!.body).toBe("refactor the loop");
+    expect(tasks[0]!.body).not.toContain("@model");
+  });
+
+  test("both annotations together: agent + model parsed, body cleaned", () => {
+    const md = [
+      "## Pending",
+      "",
+      "- [ ] **batonq** — fix bug @agent:gemini @model:flash",
+    ].join("\n");
+    const { tasks } = parseTasksText(md);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]!.agent).toBe("gemini");
+    expect(tasks[0]!.model).toBe("flash");
+    expect(tasks[0]!.body).toBe("fix bug");
+  });
+
+  test("no annotations: agent stays undefined on ParsedTask, defaults to 'any' on insert", () => {
+    const md = [
+      "## Pending",
+      "",
+      "- [ ] **batonq** — plain old task body, no annotations here",
+    ].join("\n");
+    const { tasks } = parseTasksText(md);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]!.agent).toBeUndefined();
+    expect(tasks[0]!.model).toBeUndefined();
+    expect(tasks[0]!.body).toBe("plain old task body, no annotations here");
+
+    const db = memDb();
+    syncTasks(db, tasks);
+    const row = db
+      .query("SELECT agent, model FROM tasks WHERE repo = 'batonq'")
+      .get() as { agent: string; model: string | null };
+    expect(row.agent).toBe("any");
+    expect(row.model).toBeNull();
+    db.close();
+  });
+
+  test("re-parsing a stripped body is idempotent (same agent/model/body)", () => {
+    const md = [
+      "## Pending",
+      "",
+      "- [ ] **batonq** — fix bug @agent:codex @model:opus",
+    ].join("\n");
+    const first = parseTasksText(md).tasks[0]!;
+
+    const cleaned = [
+      "## Pending",
+      "",
+      `- [ ] **${first.repo}** — ${first.body}`,
+    ].join("\n");
+    const second = parseTasksText(cleaned).tasks[0]!;
+
+    expect(second.body).toBe(first.body);
+    // First pass had annotations → first.agent='codex'. Cleaned body has none
+    // → second.agent=undefined. The body itself is stable across re-parses,
+    // which is the property that matters for external_id stability.
+    expect(second.agent).toBeUndefined();
+    expect(second.model).toBeUndefined();
+  });
+
+  test("unknown agent annotation is stripped from body but agent stays unset", () => {
+    // `cursor` isn't in IMPLEMENTED_TOOLS, but the annotation token is still
+    // removed so a later sync after the user fixes the typo doesn't get
+    // confused by stale `@agent:` cruft in the persisted body.
+    const md = [
+      "## Pending",
+      "",
+      "- [ ] **batonq** — explore something @agent:cursor",
+    ].join("\n");
+    const { tasks } = parseTasksText(md);
+    expect(tasks[0]!.agent).toBeUndefined();
+    expect(tasks[0]!.body).toBe("explore something");
+    expect(tasks[0]!.body).not.toContain("@agent");
+  });
+
+  test("syncTasks persists agent + model from annotations onto the row", () => {
+    const md = [
+      "## Pending",
+      "",
+      "- [ ] **batonq** — implement routing @agent:gemini @model:flash",
+    ].join("\n");
+    const { tasks } = parseTasksText(md);
+    const db = memDb();
+    syncTasks(db, tasks);
+    const row = db
+      .query("SELECT agent, model, body FROM tasks WHERE repo = 'batonq'")
+      .get() as { agent: string; model: string; body: string };
+    expect(row.agent).toBe("gemini");
+    expect(row.model).toBe("flash");
+    expect(row.body).toBe("implement routing");
+    db.close();
+  });
+
+  test("validatedInsertTask: explicit --agent flag wins over body annotation", () => {
+    // Mirrors the CLI flow: caller passes both `--agent claude` and a body
+    // that happens to contain `@agent:gemini`. The explicit field wins, but
+    // the body is still cleaned of annotation tokens.
+    const db = memDb();
+    const eid = validatedInsertTask(db, {
+      repo: "any:infra",
+      body: "fix the broken thing @agent:gemini @model:flash extra padding to clear floor",
+      agent: "claude",
+    });
+    const row = db
+      .query("SELECT agent, model, body FROM tasks WHERE external_id = ?")
+      .get(eid) as { agent: string; model: string | null; body: string };
+    expect(row.agent).toBe("claude");
+    // Model came from annotation (no explicit model field) — annotation
+    // overrides absent default but loses to explicit fields.
+    expect(row.model).toBe("flash");
+    expect(row.body).not.toContain("@agent");
+    expect(row.body).not.toContain("@model");
+    db.close();
+  });
+
+  test("validatedInsertTask: annotation overrides 'any' default when no flag given", () => {
+    const db = memDb();
+    const eid = validatedInsertTask(db, {
+      repo: "any:infra",
+      body: "ship a feature @agent:codex with enough body to clear the 20-char floor",
+    });
+    const row = db
+      .query("SELECT agent FROM tasks WHERE external_id = ?")
+      .get(eid) as { agent: string };
+    expect(row.agent).toBe("codex");
+    db.close();
+  });
+
+  test("initTaskSchema model migration is idempotent", () => {
+    // Legacy DB without the model column.
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        external_id TEXT UNIQUE NOT NULL,
+        repo TEXT NOT NULL,
+        body TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL
+      );
+    `);
+    initTaskSchema(db);
+    expect(() => initTaskSchema(db)).not.toThrow();
+    const cols = db
+      .query("SELECT name FROM pragma_table_info('tasks')")
+      .all() as { name: string }[];
+    expect(cols.filter((c) => c.name === "model").length).toBe(1);
+    db.close();
+  });
+});
