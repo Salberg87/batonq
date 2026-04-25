@@ -43,6 +43,12 @@ import {
   migratePath,
 } from "./migrate-path";
 import { parseTaskInput } from "./task-schema";
+import {
+  availableTools,
+  getRunner,
+  IMPLEMENTED_TOOLS,
+  type AgentTool,
+} from "./agent-runners";
 import { ZodError } from "zod";
 // Static import so `bun build --compile` inlines the version into the binary.
 // At dev-runtime bun resolves it from disk; at compile-time the bundler
@@ -168,6 +174,12 @@ switch (cmd) {
   case "ship-status":
     runShipStatus();
     break;
+  case "agent-run":
+    runAgentRun(process.argv.slice(3));
+    break;
+  case "agent-list":
+    runAgentList();
+    break;
   default:
     console.error(
       "usage: batonq\n" +
@@ -180,6 +192,7 @@ switch (cmd) {
         "  Drafts:        enrich <id> | promote <id>\n" +
         "  Dashboard:     tui | loop-status [--json]\n" +
         "  Ship:          ship-status\n" +
+        "  Agents:        agent-list | agent-run --tool=<claude|codex> --prompt=<text> [--cwd=<dir>] [--timeout-sec=N]\n" +
         "  Exit:          uninstall [--remove-state|--keep-state]"
     );
     process.exit(2);
@@ -201,6 +214,80 @@ function runShipStatus(): void {
     cwd: resolve(__dirname, ".."),
   });
   process.exit(res.status ?? 0);
+}
+
+// agent-list: print which AgentRunners are implemented and which are
+// available on PATH right now. Used by humans + the upcoming loop dispatch
+// to validate config.
+function runAgentList(): void {
+  const present = new Set(availableTools());
+  for (const t of IMPLEMENTED_TOOLS) {
+    const mark = present.has(t) ? "✓" : "✗";
+    console.log(`${mark}  ${t}`);
+  }
+  console.log(
+    `\n${present.size}/${IMPLEMENTED_TOOLS.length} implemented runners available on PATH.`,
+  );
+}
+
+// agent-run: smoke-test entry point for the AgentRunner abstraction. Lets
+// us invoke any tool head-to-head from the shell, e.g.
+//   batonq agent-run --tool=codex --prompt="say hi" --cwd=/tmp
+// Exits with the agent's exit code so callers can chain on success.
+function runAgentRun(args: string[]): void {
+  const flags = parseAgentFlags(args);
+  if (!flags.tool || !flags.prompt) {
+    console.error(
+      "usage: batonq agent-run --tool=<claude|codex> --prompt=<text> [--cwd=<dir>] [--timeout-sec=N] [--system-prompt=<text>]",
+    );
+    process.exit(2);
+  }
+  if (!IMPLEMENTED_TOOLS.includes(flags.tool)) {
+    console.error(
+      `unknown tool: ${flags.tool} (implemented: ${IMPLEMENTED_TOOLS.join(", ")})`,
+    );
+    process.exit(2);
+  }
+  const runner = getRunner(flags.tool);
+  if (!runner.available()) {
+    console.error(`tool '${flags.tool}' is not on PATH`);
+    process.exit(127);
+  }
+  const result = runner.run({
+    prompt: flags.prompt,
+    cwd: flags.cwd ?? process.cwd(),
+    timeoutMs: flags.timeoutSec ? flags.timeoutSec * 1000 : undefined,
+    systemPrompt: flags.systemPrompt,
+  });
+  process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  console.error(
+    `\n[agent-run] ${result.tool} exited ${result.exitCode} after ${result.durationMs}ms${result.timedOut ? " (timeout)" : ""}`,
+  );
+  process.exit(result.exitCode);
+}
+
+// Tiny --key=value parser scoped to agent-run flags. Keeping it local so we
+// don't pull a CLI-arg lib into the binary.
+function parseAgentFlags(args: string[]): {
+  tool?: AgentTool;
+  prompt?: string;
+  cwd?: string;
+  timeoutSec?: number;
+  systemPrompt?: string;
+} {
+  const out: ReturnType<typeof parseAgentFlags> = {};
+  for (const a of args) {
+    const m = a.match(/^--([a-z-]+)=(.*)$/);
+    if (!m) continue;
+    const [, k, v] = m;
+    if (k === "tool") out.tool = v as AgentTool;
+    else if (k === "prompt") out.prompt = v;
+    else if (k === "cwd") out.cwd = v;
+    else if (k === "timeout-sec") out.timeoutSec = Number(v);
+    else if (k === "system-prompt") out.systemPrompt = v;
+  }
+  return out;
 }
 
 function runLoopStatus(args: string[]): void {
