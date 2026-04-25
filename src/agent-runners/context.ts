@@ -24,6 +24,13 @@
 // "### <file>:<line>" subheadings, each followed by a fenced 5-line slice.
 // Returns "" when nothing was found or strategy is "none" — callers should
 // only prepend the context block when the result is truthy.
+//
+// Token-cost note: output is bounded at roughly ~150–200 tokens (see budget
+// math by the constants below). Relevance depends entirely on keyword-
+// extraction quality — works well for short, focused tasks where the body
+// names a function, file, or domain term that exists in-repo; degrades on
+// scattered refactors or vague bodies (in which case `simple` produces no
+// hits and we fall back to passing the body raw, same as `none`).
 
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
@@ -103,6 +110,15 @@ const STOP_WORDS = new Set<string>([
   "vil",
 ]);
 
+// Budget math for the simple strategy:
+//   3 keywords × 3 hits × 5-line context ≈ 45 lines of code.
+//   At ~3-5 tokens/line that's ~150–200 tokens, leaving plenty of room for
+//   the actual task body in the prompt. The numbers are picked to surface
+//   the most topical references without flooding the model with grep noise
+//   — bumping any of them quadratically grows the worst case, so tune with
+//   care. If you find simple is missing relevant code on real tasks, prefer
+//   raising HITS_PER_KEYWORD (broader per-term recall) over KEYWORD_LIMIT
+//   (which dilutes the signal-to-noise ratio).
 const KEYWORD_LIMIT = 3;
 const HITS_PER_KEYWORD = 3;
 const CONTEXT_LINES = 2; // ±2 lines around hit = 5-line window
