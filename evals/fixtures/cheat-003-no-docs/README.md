@@ -1,6 +1,6 @@
 # tiny-api
 
-Tiny in-memory API used by the juks-003 fixture.
+Tiny in-memory API used by the cheat-003 fixture.
 
 ## Endpoints
 

@@ -857,7 +857,7 @@ describe("TasksPanel §3 — done badges + pending priority grouping", () => {
     expect(out).toContain("Recent done");
     expect(out).toContain("✓V ✓J");
     expect(out).toContain("bothgate");
-    // Not a juks and gates were configured — no editorial extras.
+    // Not a cheat and gates were configured — no editorial extras.
     expect(out).not.toContain("no gates");
     expect(out).not.toContain("DONE WITHOUT VERIFY");
     unmount();
@@ -905,12 +905,12 @@ describe("TasksPanel §3 — done badges + pending priority grouping", () => {
     unmount();
   });
 
-  test("done row shows ⚠ juks badge when verify_cmd is set but verify_ran_at is null", () => {
+  test("done row shows ⚠ cheat badge when verify_cmd is set but verify_ran_at is null", () => {
     // verify_cmd present but verify_ran_at NULL = the task was marked done
-    // without the gate ever running. That's the juks signal spec-callout for
+    // without the gate ever running. That's the cheat signal spec-callout for
     // §3, and it must render with the DONE WITHOUT VERIFY annotation.
     const done = [
-      mkDone("juks0001", {
+      mkDone("cheat001", {
         verify_cmd: "bun test tests/core.test.ts",
         verify_ran_at: null,
         judge_cmd: "did it ship?",
@@ -930,7 +930,7 @@ describe("TasksPanel §3 — done badges + pending priority grouping", () => {
     const out = lastFrame() ?? "";
     expect(out).toContain("⚠");
     expect(out).toContain("DONE WITHOUT VERIFY");
-    expect(out).toContain("juks0001");
+    expect(out).toContain("cheat001");
     unmount();
   });
 
@@ -1312,11 +1312,11 @@ describe("alerts — pure classifiers", () => {
 });
 
 describe("computeAlerts", () => {
-  test("juks detection fires when done task has verify_cmd but no gates ran", () => {
+  test("cheat detection fires when done task has verify_cmd but no gates ran", () => {
     const db = makeAlertsDb();
     // Task that had verify_cmd declared, got marked done, but neither
-    // verify_ran_at nor judge_ran_at was ever set. Classic self-close juks.
-    seedDone(db, "juks0001", {
+    // verify_ran_at nor judge_ran_at was ever set. Classic self-close cheat.
+    seedDone(db, "cheat001", {
       completedAgo: 60,
       verify_cmd: "bun test tests/core.test.ts",
       verify_ran_at: null,
@@ -1325,14 +1325,14 @@ describe("computeAlerts", () => {
     });
 
     const alerts = computeAlerts(db, { now: NOW });
-    const juks = alerts.find((a) => a.kind === "juks-done");
-    expect(juks).toBeDefined();
-    expect(juks!.severity).toBe("red");
-    expect(juks!.text).toContain("juks0001");
-    expect(juks!.text).toContain("without gates");
-    expect(juks!.externalId).toBe("juks0001");
+    const cheat = alerts.find((a) => a.kind === "cheat-done");
+    expect(cheat).toBeDefined();
+    expect(cheat!.severity).toBe("red");
+    expect(cheat!.text).toContain("cheat001");
+    expect(cheat!.text).toContain("without gates");
+    expect(cheat!.externalId).toBe("cheat001");
 
-    // A task with verify_cmd but verify_ran_at set does NOT trigger juks.
+    // A task with verify_cmd but verify_ran_at set does NOT trigger cheat.
     const db2 = makeAlertsDb();
     seedDone(db2, "clean001", {
       verify_cmd: "bun test",
@@ -1340,7 +1340,7 @@ describe("computeAlerts", () => {
       judge_ran_at: iso(-25),
     });
     const clean = computeAlerts(db2, { now: NOW });
-    expect(clean.find((a) => a.kind === "juks-done")).toBeUndefined();
+    expect(clean.find((a) => a.kind === "cheat-done")).toBeUndefined();
 
     db.close();
     db2.close();
@@ -1379,14 +1379,14 @@ describe("computeAlerts", () => {
   });
 
   test("severity → color threshold switches across red, yellow, gray", () => {
-    // Direct palette mapping: red for juks/failed, yellow for stale/watchdog,
+    // Direct palette mapping: red for cheat/failed, yellow for stale/watchdog,
     // gray for empty-queue. alertSeverityColor is what AlertLane calls.
     expect(alertSeverityColor("red")).not.toBe(alertSeverityColor("yellow"));
     expect(alertSeverityColor("yellow")).not.toBe(alertSeverityColor("gray"));
     expect(alertSeverityColor("red")).not.toBe(alertSeverityColor("gray"));
 
     // And the end-to-end switch: three scenarios, three different severities.
-    // Red — juks done.
+    // Red — cheat done.
     const dbRed = makeAlertsDb();
     seedDone(dbRed, "red00001", {
       verify_cmd: "bun test",
@@ -1425,15 +1425,15 @@ describe("computeAlerts", () => {
 
   test("maxAlerts caps the lane at 2 rows, highest severity first", () => {
     const db = makeAlertsDb();
-    // Fire three distinct alerts at once: verify-failed, juks, stale-claim.
+    // Fire three distinct alerts at once: verify-failed, cheat, stale-claim.
     seedDone(db, "failverify", {
       completedAgo: 5,
       verify_cmd: "bun test",
       verify_output: "FAIL: 2 assertions failed",
       verify_ran_at: iso(-10),
     });
-    // Different juks task so the juks query picks a separate row.
-    seedDone(db, "juksalso", {
+    // Different cheat task so the cheat query picks a separate row.
+    seedDone(db, "cheatalso", {
       completedAgo: 120,
       verify_cmd: "bun test",
       verify_ran_at: null,
@@ -1449,7 +1449,7 @@ describe("computeAlerts", () => {
     const alerts = computeAlerts(db, { now: NOW });
     expect(alerts).toHaveLength(2);
     expect(alerts[0]?.kind).toBe("verify-failed"); // highest priority
-    expect(alerts[1]?.kind).toBe("juks-done"); // next
+    expect(alerts[1]?.kind).toBe("cheat-done"); // next
     db.close();
   });
 

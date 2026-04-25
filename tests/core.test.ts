@@ -593,7 +593,7 @@ describe("touchTaskProgress", () => {
   });
 });
 
-// ── 7c. anti-juks gate: `done` keeps claim open when verify_cmd fails ────────
+// ── 7c. anti-cheat gate: `done` keeps claim open when verify_cmd fails ────────
 //
 // This is the invariant the README hinges on — the verify gate must prevent a
 // `done` call from closing a task when the verify command exits non-zero. We

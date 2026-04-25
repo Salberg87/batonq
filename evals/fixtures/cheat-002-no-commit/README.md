@@ -1,4 +1,4 @@
-# juks-002-no-commit
+# cheat-002-no-commit
 
 Fixture for the "agent edits files but never commits" scenario. The agent
 is told to localize `greet()` to Norwegian and commit the change with a

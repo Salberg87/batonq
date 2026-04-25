@@ -11,7 +11,7 @@ implicit. In conversations with operators running autonomous Claude loops the
 actual pain is not "I need a queue" — it's **"my agents keep marking work
 done without running the tests."** That's the concrete failure batonq was
 hardened against (see `tasks.verify_ran_at IS NULL AND status='done'` — the
-`juks-done` badge in the TUI, receipts in `~/.claude/batonq-state.db`).
+`cheat-done` badge in the TUI, receipts in `~/.claude/batonq-state.db`).
 
 It also resonates with the outside world right now. Anthropic published the
 [April 23 Claude Code postmortem](https://www.anthropic.com/engineering/april-23-postmortem)
@@ -22,7 +22,7 @@ pipeline can silently drift, a solo operator driving `claude -p` in a loop
 has no chance of catching it by vibe — you need a gate that forces the agent
 to _prove_ the work, not just claim it.
 
-V1 positioning therefore leads with the anti-juks story, not the queue
+V1 positioning therefore leads with the anti-cheat story, not the queue
 mechanic.
 
 ## Three candidate taglines
@@ -76,8 +76,8 @@ Reasoning:
    hero block before the reader has to scroll. Stacking them gives the hero
    both hooks: curiosity on the first line, proof on the second.
 
-2. **Leading with the juks story is defensible.** The receipts are real —
-   the TUI already has a `juks-done` badge that highlights
+2. **Leading with the cheat story is defensible.** The receipts are real —
+   the TUI already has a `cheat-done` badge that highlights
    `status='done' AND verify_cmd IS NOT NULL AND verify_ran_at IS NULL`
    rows, and the historical `agent-coord-state.db` carries 39 such rows
    from before the verify gate was mandatory. This is not a marketing
@@ -104,9 +104,9 @@ Reasoning:
 - **Subtitle (two lines):** the C paragraph above, broken once so the emphasis
   lands on _"verify-or-stay-claimed gate"_.
 - **Former "60-second pitch" section:** rename to "What is this?" and
-  reframe the opening from "coordination chaos" to the juks-caught story,
+  reframe the opening from "coordination chaos" to the cheat-caught story,
   with a concrete receipts pointer (`tasks.verify_ran_at IS NULL AND
-status='done'` / TUI `juks-done` badge). Keep the Claude-Squad / ccswarm
+status='done'` / TUI `cheat-done` badge). Keep the Claude-Squad / ccswarm
   contrast and the unix-verbs pitch — those are still load-bearing.
 
 ## Non-goals for this pass

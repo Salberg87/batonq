@@ -15,7 +15,7 @@ export type AlertSeverity = "red" | "yellow" | "gray";
 export type AlertKind =
   | "verify-failed"
   | "judge-failed"
-  | "juks-done"
+  | "cheat-done"
   | "stale-claim"
   | "watchdog-kill"
   | "empty-queue";
@@ -32,7 +32,7 @@ export type Alert = {
 export const ALERT_PRIORITY: AlertKind[] = [
   "verify-failed",
   "judge-failed",
-  "juks-done",
+  "cheat-done",
   "stale-claim",
   "watchdog-kill",
   "empty-queue",
@@ -41,7 +41,7 @@ export const ALERT_PRIORITY: AlertKind[] = [
 export const ALERT_SEVERITY: Record<AlertKind, AlertSeverity> = {
   "verify-failed": "red",
   "judge-failed": "red",
-  "juks-done": "red",
+  "cheat-done": "red",
   "stale-claim": "yellow",
   "watchdog-kill": "yellow",
   "empty-queue": "gray",
@@ -130,7 +130,7 @@ export function computeAlerts(
   const found: Alert[] = [];
 
   // Latest done task drives verify-failed / judge-failed. Even if no gates
-  // ran, we still fetch it so juks detection (below) uses the same row.
+  // ran, we still fetch it so cheat detection (below) uses the same row.
   const latestDone = db
     .query(
       `SELECT external_id, verify_cmd, verify_output, verify_ran_at,
@@ -176,10 +176,10 @@ export function computeAlerts(
     }
   }
 
-  // Juks detection runs across ALL done tasks — a task that self-closed past
+  // Cheat detection runs across ALL done tasks — a task that self-closed past
   // its gates is the biggest trust failure we can surface, and it deserves an
   // alert even if it's not the most recent done row.
-  const juks = db
+  const cheat = db
     .query(
       `SELECT external_id FROM tasks
        WHERE status = 'done'
@@ -189,12 +189,12 @@ export function computeAlerts(
        ORDER BY completed_at DESC LIMIT 1`,
     )
     .get() as { external_id: string } | undefined;
-  if (juks) {
+  if (cheat) {
     found.push({
-      kind: "juks-done",
+      kind: "cheat-done",
       severity: "red",
-      externalId: juks.external_id,
-      text: `⚠ task ${juks.external_id.slice(0, 8)} marked done without gates — investigate`,
+      externalId: cheat.external_id,
+      text: `⚠ task ${cheat.external_id.slice(0, 8)} marked done without gates — investigate`,
     });
   }
 

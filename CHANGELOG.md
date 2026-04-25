@@ -13,7 +13,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 **TUI** — live work surface (TUI UX v2)
 
-- Alert lane §1 — juks / `verify_ran_at` classifier with inline receipts.
+- Alert lane §1 — cheat / `verify_ran_at` classifier with inline receipts.
 - Current-task card §2 — scans all claim cwds for `any:*` tasks, not just
   the current repo.
 - Tasks panel §3 — verify/judge badges, priority grouping, with
@@ -55,13 +55,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Linux compatibility for `batonq-loop` and the installer (uname /
   Darwin / linux branching).
 - Micro-eval harness scaffold for the batonq pipeline.
-- Juks-detection scorecard — 5 scenarios with receipts.
+- Cheat-detection scorecard — 5 scenarios with receipts.
 
 **CI**
 
 - Coverage report + badge + threshold enforcement, with a preload-print
   threshold banner so the verify regex matches.
-- Anti-juks gate test + verify-gate hot-paths + dynamic badge.
+- Anti-cheat gate test + verify-gate hot-paths + dynamic badge.
 - End-to-end install test on CI.
 
 **Docs**
@@ -69,7 +69,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - TUI UX v2 spec — live work surface replacing the static dashboard.
 - Architecture diagrams (mermaid).
 - FAQ expanded with 10 real-world troubleshooting entries.
-- Hero reframed around the anti-juks story; honest side-by-side vs
+- Hero reframed around the anti-cheat story; honest side-by-side vs
   related tools, with a verify-gate marker for the CI grep check.
 - Demo GIF embedded in the README hero; docs references integrated.
 - Inline documentation for alert-lane classifier, tasks-panel badges,

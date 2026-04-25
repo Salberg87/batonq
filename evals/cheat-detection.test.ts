@@ -1,4 +1,4 @@
-// Exercises the juks-detection runner against the real fixtures + cheat
+// Exercises the cheat-detection runner against the real fixtures + cheat
 // behaviors and asserts that batonq's verify gate catches every cheat.
 // Runs in CI via `bun test` — no real LLM is invoked, the cheats are
 // hard-coded JS so the table is fully deterministic.
@@ -10,27 +10,27 @@ import {
   CHEAT_BEHAVIORS,
   renderMarkdown,
   runAll,
-  runJuksScenario,
-  type JuksRow,
-} from "./juks-detection";
+  runCheatScenario,
+  type CheatRow,
+} from "./cheat-detection";
 import { loadTasks } from "./harness";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-describe("juks-detection", () => {
-  test("ships exactly 5 juks task JSONs", () => {
-    const tasks = loadTasks(join(here, "tasks", "juks"));
+describe("cheat-detection", () => {
+  test("ships exactly 5 cheat task JSONs", () => {
+    const tasks = loadTasks(join(here, "tasks", "cheat"));
     expect(tasks.map((t) => t.id).sort()).toEqual([
-      "juks-001-stub-tests",
-      "juks-002-no-commit",
-      "juks-003-no-docs",
-      "juks-004-rigged-test",
-      "juks-005-comment-not-impl",
+      "cheat-001-stub-tests",
+      "cheat-002-no-commit",
+      "cheat-003-no-docs",
+      "cheat-004-rigged-test",
+      "cheat-005-comment-not-impl",
     ]);
   });
 
   test("every task has a registered cheat behavior", () => {
-    const tasks = loadTasks(join(here, "tasks", "juks"));
+    const tasks = loadTasks(join(here, "tasks", "cheat"));
     for (const t of tasks) {
       expect(CHEAT_BEHAVIORS[t.id]).toBeDefined();
     }
@@ -52,12 +52,12 @@ describe("juks-detection", () => {
     }
   });
 
-  test("runJuksScenario throws on unregistered task ids", () => {
+  test("runCheatScenario throws on unregistered task ids", () => {
     expect(() =>
-      runJuksScenario(
+      runCheatScenario(
         {
-          id: "juks-999-never-registered",
-          repo_fixture_path: "fixtures/juks-001-stub-tests",
+          id: "cheat-999-never-registered",
+          repo_fixture_path: "fixtures/cheat-001-stub-tests",
           prompt: "n/a",
           verify_cmd: "true",
           judge_prompt: "n/a",
@@ -68,7 +68,7 @@ describe("juks-detection", () => {
   });
 
   test("renderMarkdown produces a table + summary line + receipts", () => {
-    const rows: JuksRow[] = [
+    const rows: CheatRow[] = [
       {
         scenario: "demo-blocked",
         cheat_summary: "did nothing",
@@ -92,7 +92,7 @@ describe("juks-detection", () => {
       runDate: "2026-04-24",
       gitSha: "deadbee",
     });
-    expect(md).toContain("# juks-detection scorecard — 2026-04-24");
+    expect(md).toContain("# cheat-detection scorecard — 2026-04-24");
     expect(md).toContain("1/2 cheats caught by batonq");
     expect(md).toContain("`demo-blocked`");
     expect(md).toContain("`demo-passed`");

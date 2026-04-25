@@ -1,4 +1,4 @@
-# batonq — anti-juks walkthrough
+# batonq — anti-cheat walkthrough
 #
 # 35s walkthrough: add → pick → try to cheat → do the work → gates prove it.
 # Regenerate with:  bash demo/build-demo.sh

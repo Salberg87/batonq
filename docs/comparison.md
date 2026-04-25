@@ -19,7 +19,7 @@ is prior art we learned from.
 | Peer-visible file locks  | yes (`flock(2)`+DB)  | n/a (isolated)       | n/a (isolated)         | n/a (isolated)       | no                     | n/a (isolated)      |
 | `verify:` gate on `done` | yes                  | no                   | no                     | no                   | no                     | no                  |
 | Judge-LLM review gate    | yes (`judge:` dir.)  | no (human diff view) | no (human diff view)   | no (human diff view) | no                     | unknown             |
-| Anti-juks hardened       | yes (named goal)     | no                   | no                     | no                   | no                     | no                  |
+| Anti-cheat hardened       | yes (named goal)     | no                   | no                     | no                   | no                     | no                  |
 | Reproducible eval rig    | yes (`evals/`)       | no                   | no                     | no                   | no                     | no                  |
 | TUI                      | yes (Ink)            | yes (Bubbletea)      | no (Electron GUI)      | no (native macOS)    | no                     | yes (terminal UI)   |
 | Standalone install       | single binary        | single binary        | desktop app            | macOS-only app       | n/a (bash)             | cargo / release bin |

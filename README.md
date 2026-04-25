@@ -7,7 +7,7 @@
 <p align="center"><strong>Stop AI coding agents from faking test results.</strong></p>
 
 <p align="center">
-  <img src="./demo/intro.gif" alt="batonq anti-juks walkthrough — add → try to skip the gate → verify+judge pass → ✓V ✓J" width="820">
+  <img src="./demo/intro.gif" alt="batonq anti-cheat walkthrough — add → try to skip the gate → verify+judge pass → ✓V ✓J" width="820">
 </p>
 
 <p align="center">
@@ -40,7 +40,7 @@ sqlite3 ~/.claude/batonq/state.db \
 ```
 
 This is the failure mode batonq was hardened against. The TUI flags those
-rows with a red `juks-done` badge; `batonq done <id>` now runs the
+rows with a red `cheat-done` badge; `batonq done <id>` now runs the
 `verify:` command itself and keeps the claim open on a non-zero exit, so
 the agent _cannot_ close past the gate. An optional `judge:` directive
 adds a second-layer LLM review — only a `PASS` verdict lets the task
@@ -55,7 +55,7 @@ your solo `claude -p` loop has zero chance of catching a fabricated `done`
 by vibe. You need the gate to fire when it says it fires, and you need
 the receipts when it doesn't.
 
-The repo ships a [juks-detection scorecard](./evals/results/2026-04-24-juks-detection.md)
+The repo ships a [cheat-detection scorecard](./evals/results/2026-04-24-cheat-detection.md)
 that demonstrates this concretely: 5 cheating-agent scenarios (stub
 tests, skipped commits, undocumented code, rigged tests, comment-only
 "implementations"), a hard-coded cheat per scenario, and a side-by-side
@@ -487,7 +487,7 @@ batonq ship-status       # or: scripts/check-ship.sh
 Example output:
 
 ```
-PASS  SHIP-001  README anti-juks tagline present
+PASS  SHIP-001  README anti-cheat tagline present
 PASS  SHIP-002  install.sh shell-syntax valid
 PASS  SHIP-003  install.sh uses strict mode and chmods binaries
 …
@@ -526,7 +526,7 @@ and a file lock, meant to be composed with whatever you already use. If you
 want a product, use Squad. If you want a primitive, use batonq.
 
 **An agent marked a task `done` without actually doing the work.**
-The TUI flags this as `juks-done` — a done task where `verify_cmd` is set but
+The TUI flags this as `cheat-done` — a done task where `verify_cmd` is set but
 `verify_ran_at` and `judge_ran_at` are both null, meaning the agent closed
 the claim past the gate. Confirm on the DB:
 

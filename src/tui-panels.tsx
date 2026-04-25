@@ -140,7 +140,7 @@ function PendingByPriority({ tasks }: { tasks: TaskRow[] }) {
   );
 }
 
-// Badge colours: ⚠ is red+bold (juks — operator must investigate), ⊘ is dim
+// Badge colours: ⚠ is red+bold (cheat — operator must investigate), ⊘ is dim
 // (no gates configured), everything else is ok-green (gates ran).
 function DoneBadgeCell({ badge }: { badge: DoneBadge }) {
   const color = badge === "⚠" ? C.err : badge === "⊘" ? C.dim : C.ok;

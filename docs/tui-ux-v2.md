@@ -36,7 +36,7 @@ Alert conditions (priority order, higher wins if only 2 slots):
 | ------------- | --------------------------------------------------------------------------------------- | ------ | ----------------------------------------------------- |
 | Verify failed | latest done row has `verify_output` containing `FAIL` or `exit !0`                      | red    | `✗ verify FAILED on <id>: <first line of output>`     |
 | Judge failed  | latest done row has `judge_output` containing `FAIL` as first token                     | red    | `✗ judge FAILED on <id>: <reason>`                    |
-| Juks done     | done task with `verify_ran_at IS NULL AND judge_ran_at IS NULL AND verify_cmd NOT NULL` | red    | `⚠ task <id> marked done without gates — investigate` |
+| Cheat done     | done task with `verify_ran_at IS NULL AND judge_ran_at IS NULL AND verify_cmd NOT NULL` | red    | `⚠ task <id> marked done without gates — investigate` |
 | Stale claim   | active claim with `claimed_at < now() - 30min AND last_progress_at < now() - 10min`     | yellow | `⚠ claim <id> stale for <minutes>m`                   |
 | Watchdog kill | loop-log last 100 lines contains `[watchdog]…killing`                                   | yellow | `⚠ watchdog killed claude ~<minutes>m ago`            |
 | Empty queue   | pending=0 for >15min                                                                    | gray   | `ℹ queue empty for <minutes>m`                        |
@@ -91,10 +91,10 @@ Badge alphabet:
 - `✓V —` / `— ✓J` — one ran, other absent (task had no gate for it)
 - `✗V` / `✗J` — gate ran and FAILED (should never appear in done if gates work)
 - `⊘` — task had no gates
-- `⚠` — task done without gates running despite gates existing (juks signal, matches alert-lane condition)
+- `⚠` — task done without gates running despite gates existing (cheat signal, matches alert-lane condition)
 
 **Badge visibility:** `⚠` must be impossible to miss — rendered red + bold,
-all other badges are green (`✓V ✓J`, `✓V —`) or dim (`⊘`). A juks row
+all other badges are green (`✓V ✓J`, `✓V —`) or dim (`⊘`). A cheat row
 should catch the eye on first glance at the Tasks panel.
 
 **Badges show status, not duration.** A ✓V ✓J row means "both gates ran";
@@ -172,7 +172,7 @@ Existing bindings preserved: `q`, `Tab`, `j`/`k`, `/`, `n` new, `e` enrich, `p` 
 
 - Poll interval stays 2s for panel refresh. Live feed polls every 500ms for smoother tail.
 - All DB reads are read-only snapshots (open fresh connection, close immediately) — TUI must never block write paths.
-- The "juks" detection (done without gates) runs on every done-list fetch. Alert persists until operator explicitly dismisses (`d` on the alert).
+- The "cheat" detection (done without gates) runs on every done-list fetch. Alert persists until operator explicitly dismisses (`d` on the alert).
 - Color palette reuses `brand.accent` / `brand.dim` / standard `red`/`yellow`/`green`/`cyan` from ink. No new deps.
 
 ## What this does not cover
@@ -189,5 +189,5 @@ An operator who has not seen batonq before can, within 5 minutes of launching `b
 1. Tell whether the queue is healthy.
 2. Identify the currently-running task and roughly how far along it is.
 3. See the most recent commit it produced.
-4. Notice any gate failure or juks attempt without reading logs.
+4. Notice any gate failure or cheat attempt without reading logs.
 5. Drill into any task to understand why it is in its current state.

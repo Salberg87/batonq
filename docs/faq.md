@@ -170,7 +170,7 @@ sqlite3 -header -column ~/.claude/batonq/state.db \
 `batonq tasks` and `batonq status` cover the common views without SQL.
 
 **An agent marked a task `done` without actually doing the work.**
-The TUI flags this as `juks-done` — a done task where `verify_cmd` is set but
+The TUI flags this as `cheat-done` — a done task where `verify_cmd` is set but
 `verify_ran_at` and `judge_ran_at` are both null, meaning the agent closed
 the claim past the gate. Confirm on the DB:
 
@@ -189,5 +189,5 @@ sqlite3 ~/.claude/batonq/state.db \
 ```
 
 Structural fix: give every non-trivial task a `verify:` line so the gate has
-to run before `done` sticks, and watch the TUI's `juks-done` badge during
+to run before `done` sticks, and watch the TUI's `cheat-done` badge during
 rollouts of new prompts.

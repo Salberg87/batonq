@@ -20,17 +20,17 @@ files edited, and commits produced.
 ```
 evals/
   tasks/                       # 5 JSON task specs (bug-fix matrix)
-    juks/                      # + 5 JSON specs for cheat-detection scenarios
+    cheat/                      # + 5 JSON specs for cheat-detection scenarios
   fixtures/buggy-cli/          # shared Node.js CLI skeleton with intentional bugs
-  fixtures/juks-001-…/         # one tiny fixture per cheat scenario
+  fixtures/cheat-001-…/         # one tiny fixture per cheat scenario
   harness.ts                   # runs each task × variant, writes JSONL
   compare.ts                   # aggregates last N runs, prints a table
-  juks-detection.ts            # cheat-detection runner (deterministic, no LLM)
+  cheat-detection.ts            # cheat-detection runner (deterministic, no LLM)
   harness.test.ts              # exercises harness with a mock claude
   compare.test.ts              # exercises compare with synthetic rows
-  juks-detection.test.ts       # exercises juks runner against real fixtures
+  cheat-detection.test.ts       # exercises cheat runner against real fixtures
   results/                     # JSONL outputs (gitignored) + checked-in
-                               # *-juks-detection.md scorecards
+                               # *-cheat-detection.md scorecards
 ```
 
 Each task JSON has the shape
@@ -81,20 +81,20 @@ operators. `bun test`'s default glob (`*.test.*`) does not pick up
 
 ## Results
 
-The juks-detection runner is fully deterministic (no LLM calls — the
+The cheat-detection runner is fully deterministic (no LLM calls — the
 cheats are hard-coded JS against fixed fixtures) so its scorecard is
 checked into the repo. Latest run:
 
-- **2026-04-24 — [`results/2026-04-24-juks-detection.md`](./results/2026-04-24-juks-detection.md)** — 5/5 cheats blocked by batonq's verify gate; bare `claude -p` would have closed all 5 silently.
+- **2026-04-24 — [`results/2026-04-24-cheat-detection.md`](./results/2026-04-24-cheat-detection.md)** — 5/5 cheats blocked by batonq's verify gate; bare `claude -p` would have closed all 5 silently.
 
 Re-generate with:
 
 ```bash
-bun run evals/juks-detection.ts
+bun run evals/cheat-detection.ts
 ```
 
-Each scenario lives as one JSON in `tasks/juks/` paired with a hard-coded
-"cheat" behavior in `juks-detection.ts`. The cheat runs against a fresh
+Each scenario lives as one JSON in `tasks/cheat/` paired with a hard-coded
+"cheat" behavior in `cheat-detection.ts`. The cheat runs against a fresh
 fixture workspace; we then record what each variant would conclude
 (gates-on / gates-off) and a one-line verdict per row. The receipts
 table at the bottom of each scorecard records the verify exit code and
@@ -102,7 +102,7 @@ stderr per scenario.
 
 ## Why the bug-fix harness is preliminary
 
-The juks-detection scorecard above is real (deterministic). The bug-fix
+The cheat-detection scorecard above is real (deterministic). The bug-fix
 matrix (`harness.ts` against `tasks/*.json`) is still a **scaffold**:
 
 - The "judge" in the default spawner is a placeholder — it just checks
@@ -121,7 +121,7 @@ matrix (`harness.ts` against `tasks/*.json`) is still a **scaffold**:
   That is deliberately future work.
 
 Treat numbers from `harness.ts` as a smoke signal for wiring, not a
-claim about batonq's effect on agent quality. The juks-detection results
+claim about batonq's effect on agent quality. The cheat-detection results
 are stronger because every input and gate is reproducible — they only
 say "the gate fires when we make it fire," but that's the load-bearing
 claim batonq makes.

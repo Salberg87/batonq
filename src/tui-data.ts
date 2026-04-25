@@ -128,7 +128,7 @@ export function shortId(id: string, n: number = 8): string {
 // ── done badges / priority grouping ───────────────────────────────────────────
 
 // Badge for a done task. Branches, in order:
-//   ⚠     — verify_cmd set but never ran (juks — task self-closed without gate)
+//   ⚠     — verify_cmd set but never ran (cheat — task self-closed without gate)
 //   ✓V ✓J — both gates ran
 //   ✓V —  — verify ran, judge absent
 //   — ✓J  — judge ran, verify absent

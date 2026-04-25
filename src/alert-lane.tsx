@@ -16,7 +16,7 @@ const COLOR_RED = "#EF4444";
 const COLOR_YELLOW = "#F59E0B";
 const COLOR_GRAY = "gray";
 
-// Map alert severity → terminal color. Red for failures/juks, yellow for
+// Map alert severity → terminal color. Red for failures/cheat, yellow for
 // liveness warnings (stale claim / watchdog kill), gray for the info-level
 // empty-queue notice.
 export function alertSeverityColor(sev: AlertSeverity): string {

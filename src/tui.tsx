@@ -180,7 +180,7 @@ function useSnapshot(now: number): Snapshot | null {
 //
 // Classifier lives in src/alerts.ts. Alert kinds surfaced here:
 //   verify-failed / judge-failed — done row with FAIL in captured output
-//   juks-done — done task where verify_cmd IS NOT NULL AND verify_ran_at IS
+//   cheat-done — done task where verify_cmd IS NOT NULL AND verify_ran_at IS
 //               NULL AND judge_ran_at IS NULL (the task self-closed past
 //               its own gates — highest-trust failure we can detect)
 //   stale-claim — >30m claimed, >10m since last progress
@@ -648,7 +648,7 @@ export function App() {
         <Box flexDirection="column" flexGrow={1}>
           {/* §3: TasksPanel gets pending + done so it can render the
               priority-grouped pending list ([H]/[N]/[L]) and the recent-done
-              rows with verify/judge badges (✓V ✓J / ✓V — / ⊘ / ⚠). The ⚠ juks
+              rows with verify/judge badges (✓V ✓J / ✓V — / ⊘ / ⚠). The ⚠ cheat
               badge fires when verify_cmd is set but verify_ran_at is null —
               same signal the alert lane uses, surfaced inline here. */}
           <TasksPanel
