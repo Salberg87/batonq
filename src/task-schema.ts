@@ -15,6 +15,7 @@
 //     almost always typos — e.g. a leftover `true` from a debug edit)
 
 import { z } from "zod";
+import { IMPLEMENTED_TOOLS } from "./agent-runners/types";
 
 export const PRIORITIES = ["high", "normal", "low"] as const;
 export const STATUSES = [
@@ -25,10 +26,12 @@ export const STATUSES = [
   "lost",
 ] as const;
 
-// Multi-CLI dispatch target. `any` (the default) means the loop is free to
-// route to whichever runner has capacity / is installed; explicit values pin
-// the task to a specific CLI. Keep in sync with `AgentTool` in agent-runners.
-export const AGENTS = ["claude", "codex", "gemini", "opencode", "any"] as const;
+// Multi-CLI dispatch target. Derived from IMPLEMENTED_TOOLS so adding a new
+// runner in agent-runners/types.ts automatically widens the schema — no
+// chance of a hand-edited list drifting away from the runner registry. `any`
+// (the default) means the loop is free to route to whichever runner has
+// capacity / is installed; explicit values pin the task to a specific CLI.
+export const AGENTS = [...IMPLEMENTED_TOOLS, "any"] as const;
 export const DEFAULT_AGENT = "any";
 
 export const TaskSchema = z.object({

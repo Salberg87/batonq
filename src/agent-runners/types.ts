@@ -14,7 +14,16 @@
 // code + captured stdio + duration. No streaming, no progress events.
 // Loop-side stays as a simple bash poll for now.
 
-export type AgentTool = "claude" | "codex" | "gemini" | "opencode";
+// Runtime canonical list — the schema layer (task-schema.ts) imports this
+// directly to derive its agent enum, so adding a runner here is the only
+// place we need to touch when integrating a new CLI.
+export const IMPLEMENTED_TOOLS = [
+  "claude",
+  "codex",
+  "gemini",
+  "opencode",
+] as const;
+export type AgentTool = (typeof IMPLEMENTED_TOOLS)[number];
 
 /**
  * Whether the agent runs in read-only or autonomous mode.

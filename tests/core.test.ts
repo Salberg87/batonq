@@ -52,6 +52,7 @@ import {
   type TaskRecoveryContext,
 } from "../src/tasks-core";
 import { AGENTS, parseTaskInput, TaskSchema } from "../src/task-schema";
+import { IMPLEMENTED_TOOLS } from "../src/agent-runners/types";
 import {
   DESTRUCTIVE,
   MAX_HASH_BYTES,
@@ -2766,6 +2767,16 @@ describe("agent field", () => {
     const defaulted = parseTaskInput({ ...MIN_VALID });
     expect(defaulted.agent).toBe(DEFAULT_AGENT);
     expect(defaulted.agent).toBe("any");
+  });
+
+  test("AGENTS is derived from IMPLEMENTED_TOOLS — no hand-edited drift", () => {
+    // Every runner registered in agent-runners must be a valid agent value,
+    // and the only extra entry is 'any' (the round-robin default).
+    for (const tool of IMPLEMENTED_TOOLS) {
+      expect(AGENTS).toContain(tool);
+    }
+    expect(AGENTS).toContain("any");
+    expect(AGENTS.length).toBe(IMPLEMENTED_TOOLS.length + 1);
   });
 
   test("schema rejects an unknown agent value with ZodError", () => {

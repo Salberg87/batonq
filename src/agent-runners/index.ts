@@ -1,6 +1,7 @@
 // agent-runners/index.ts — registry + dispatch for AgentRunner implementations.
 
 import type { AgentRunner, AgentTool } from "./types";
+import { IMPLEMENTED_TOOLS } from "./types";
 import { claudeRunner } from "./claude";
 import { codexRunner } from "./codex";
 import { geminiRunner } from "./gemini";
@@ -20,13 +21,8 @@ export function getRunner(name: AgentTool): AgentRunner {
   return r;
 }
 
-/** Tools that have first-class implementations. */
-export const IMPLEMENTED_TOOLS: readonly AgentTool[] = [
-  "claude",
-  "codex",
-  "gemini",
-  "opencode",
-];
+/** Re-exported from types.ts so callers don't depend on the runner imports. */
+export { IMPLEMENTED_TOOLS } from "./types";
 
 /** Tools whose binary is on PATH (best-effort). */
 export function availableTools(): AgentTool[] {
