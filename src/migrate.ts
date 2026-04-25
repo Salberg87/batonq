@@ -16,6 +16,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import type { Database } from "bun:sqlite";
 
 const HOME = homedir();
 
@@ -126,4 +127,18 @@ export function migrate(opts: MigrateOptions = {}): void {
       unlinkSync(lockPath);
     } catch {}
   }
+}
+
+// Add `agent TEXT` column to the tasks table if it doesn't already exist.
+// Multi-CLI dispatch foundation — explicit value pins a task to a runner;
+// NULL / 'any' lets the loop round-robin over installed runners. Defaults
+// are owned by the schema layer (task-schema.ts), so the column is nullable
+// at the DB layer. Idempotent via pragma_table_info inspection — safe to
+// invoke on every CLI start, hook fire, or test setup.
+export function migrateAgentColumn(db: Database): void {
+  const cols = db
+    .query("SELECT name FROM pragma_table_info('tasks')")
+    .all() as { name: string }[];
+  if (cols.some((c) => c.name === "agent")) return;
+  db.exec("ALTER TABLE tasks ADD COLUMN agent TEXT");
 }

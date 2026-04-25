@@ -253,8 +253,10 @@ export function initTaskSchema(db: Database): void {
     db.exec("ALTER TABLE tasks ADD COLUMN scheduled_for TEXT");
   // Multi-CLI dispatch target. Nullable at the DB layer; the schema layer
   // (task-schema.ts) defaults missing values to 'any'. NULL on legacy rows
-  // is interpreted the same as 'any' by the dispatcher.
-  if (!has("agent")) db.exec("ALTER TABLE tasks ADD COLUMN agent TEXT");
+  // is interpreted the same as 'any' by the dispatcher. Migration helper
+  // lives in migrate.ts alongside the other one-shot rename migrations.
+  const { migrateAgentColumn } = require("./migrate");
+  migrateAgentColumn(db);
   // The pick index is created after ALTERs so migrating DBs get it too.
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_task_pick ON tasks(status, priority, scheduled_for, created_at)`,
