@@ -24,6 +24,7 @@ import {
   DEFAULT_PRIORITY,
   detectFragileGitLog,
   enrichTaskBody,
+  extractAnnotations,
   externalId,
   getGitDiffSinceClaim,
   initClaimsSchema,
@@ -3020,6 +3021,41 @@ describe("@agent: / @model: annotations on TASKS.md task lines", () => {
     expect(tasks[0]!.agent).toBeUndefined();
     expect(tasks[0]!.body).toBe("explore something");
     expect(tasks[0]!.body).not.toContain("@agent");
+  });
+
+  test("hyphenated annotation (`@agent:gemini-flash`) is rejected but stripped — idempotent", () => {
+    // Captured value `gemini-flash` is not in IMPLEMENTED_TOOLS+'any', so
+    // agent stays unset. Critically, the FULL token (including the
+    // `-flash` tail) is stripped so re-parsing the cleaned body yields the
+    // same result — no second-pass divergence.
+    const first = extractAnnotations("fix bug @agent:gemini-flash extra text");
+    expect(first.agent).toBeUndefined();
+    expect(first.body).toBe("fix bug extra text");
+    expect(first.body).not.toContain("@agent");
+    expect(first.body).not.toContain("gemini-flash");
+
+    const second = extractAnnotations(first.body);
+    expect(second.agent).toBe(first.agent);
+    expect(second.body).toBe(first.body);
+  });
+
+  test("empty annotation (`@agent:`) is left in body verbatim — not silently dropped", () => {
+    // `[\w-]+` requires ≥1 character after the colon. A bare `@agent:`
+    // with no value isn't an annotation — it's almost certainly a typo
+    // mid-edit. We leave it untouched so it's visible in the persisted
+    // body and the user can spot/fix it.
+    const result = extractAnnotations("fix bug @agent: trailing");
+    expect(result.agent).toBeUndefined();
+    expect(result.model).toBeUndefined();
+    expect(result.body).toBe("fix bug @agent: trailing");
+  });
+
+  test("@model: accepts hyphenated nicknames (no enum, freeform)", () => {
+    // Models are runner-specific freeform nicknames (`gpt-4o`,
+    // `claude-3-opus`, `gemini-pro`) so we accept hyphens verbatim.
+    const result = extractAnnotations("write something @model:gemini-pro");
+    expect(result.model).toBe("gemini-pro");
+    expect(result.body).toBe("write something");
   });
 
   test("syncTasks persists agent + model from annotations onto the row", () => {

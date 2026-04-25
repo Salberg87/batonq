@@ -55,21 +55,28 @@ export interface ParsedTask {
 // task body to pin a specific runner / model for that task:
 //   - [ ] **batonq** — fix bug @agent:gemini @model:flash
 //
+// Capture vs strip: the value regex captures `[\w-]+` (a strict superset of
+// `\w+` that also accepts hyphens). The body is stripped of the SAME range
+// regardless of whether we honour the captured value. That keeps parsing
+// idempotent — re-running on the cleaned body yields the same result.
+//
 // Edge cases (documented choices):
-//   - `\w+` matches [a-zA-Z0-9_] only. Hyphens stop the match, so
-//     `@agent:gemini-flash` parses agent='gemini' and leaves `-flash` in
-//     the body. We treat hyphenated agent annotations as malformed; use
-//     `@model:flash` separately if you want a hyphenless split.
-//   - `@agent:` (empty value) doesn't match `\w+` at all — left in body
-//     verbatim.
-//   - Unknown agent (not in IMPLEMENTED_TOOLS+'any') is stripped from the
-//     body but the `agent` field is left undefined so downstream defaulting
-//     still picks 'any'. Stripping makes the parse idempotent: re-parsing
-//     a previously-cleaned body yields the same result.
+//   - `@agent:gemini` → agent='gemini' (valid IMPLEMENTED_TOOLS member).
+//   - `@agent:gemini-flash` → captured value 'gemini-flash' is NOT in
+//     IMPLEMENTED_TOOLS+'any', so the agent field stays undefined. The
+//     annotation is still removed from the body so the operation is
+//     idempotent (parse 2x of the same body gives the same result). The
+//     user almost certainly meant `@agent:gemini @model:flash`.
+//   - `@agent:` (empty value) doesn't match `[\w-]+` at all (needs ≥1
+//     char) — left in body verbatim. Treated as a typo, not an annotation.
+//   - Unknown agent like `@agent:cursor`: parsed and stripped, but agent
+//     stays undefined so downstream defaulting picks 'any'.
 //   - Multiple `@agent:` tokens: first match wins; later occurrences are
 //     also stripped so the persisted body never contains annotation tokens.
-const ANNOTATION_AGENT_RE = /@agent:(\w+)/g;
-const ANNOTATION_MODEL_RE = /@model:(\w+)/g;
+//   - `@model:` has no enum (models are freeform nicknames per runner) so
+//     `@model:gemini-pro` parses model='gemini-pro' verbatim.
+const ANNOTATION_AGENT_RE = /@agent:([\w-]+)/g;
+const ANNOTATION_MODEL_RE = /@model:([\w-]+)/g;
 const VALID_ANNOTATION_AGENTS = new Set<string>([...IMPLEMENTED_TOOLS, "any"]);
 
 export interface AnnotationParseResult {
@@ -79,8 +86,8 @@ export interface AnnotationParseResult {
 }
 
 export function extractAnnotations(rawBody: string): AnnotationParseResult {
-  const agentMatch = rawBody.match(/@agent:(\w+)/);
-  const modelMatch = rawBody.match(/@model:(\w+)/);
+  const agentMatch = rawBody.match(/@agent:([\w-]+)/);
+  const modelMatch = rawBody.match(/@model:([\w-]+)/);
   let agent: string | undefined;
   let model: string | undefined;
   if (agentMatch && VALID_ANNOTATION_AGENTS.has(agentMatch[1]!)) {
