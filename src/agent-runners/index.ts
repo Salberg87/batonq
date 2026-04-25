@@ -38,6 +38,13 @@ export {
 } from "./routing";
 export type { TaskType, RoutingDecision } from "./routing";
 
+export {
+  gatherContext,
+  CONTEXT_STRATEGIES,
+  DEFAULT_CONTEXT_STRATEGY,
+} from "./context";
+export type { ContextStrategy } from "./context";
+
 export type {
   AgentRunner,
   AgentRunOptions,

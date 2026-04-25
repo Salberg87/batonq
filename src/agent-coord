@@ -48,7 +48,11 @@ import {
   availableTools,
   getRunner,
   IMPLEMENTED_TOOLS,
+  gatherContext,
+  CONTEXT_STRATEGIES,
+  DEFAULT_CONTEXT_STRATEGY,
   type AgentTool,
+  type ContextStrategy,
 } from "./agent-runners";
 import { ZodError } from "zod";
 // Static import so `bun build --compile` inlines the version into the binary.
@@ -415,7 +419,7 @@ function runAgentRun(args: string[]): void {
   const flags = parseAgentFlags(args);
   if (!flags.tool || !flags.prompt) {
     console.error(
-      "usage: batonq agent-run --tool=<claude|codex> --prompt=<text> [--cwd=<dir>] [--timeout-sec=N] [--system-prompt=<text>]",
+      "usage: batonq agent-run --tool=<claude|codex> --prompt=<text> [--cwd=<dir>] [--timeout-sec=N] [--system-prompt=<text>] [--context-strategy=<none|simple|rlm|auto>]",
     );
     process.exit(2);
   }
@@ -425,14 +429,32 @@ function runAgentRun(args: string[]): void {
     );
     process.exit(2);
   }
+  const strategy: ContextStrategy =
+    flags.contextStrategy ?? DEFAULT_CONTEXT_STRATEGY;
+  if (!CONTEXT_STRATEGIES.includes(strategy)) {
+    console.error(
+      `unknown context-strategy: ${strategy} (valid: ${CONTEXT_STRATEGIES.join(", ")})`,
+    );
+    process.exit(2);
+  }
   const runner = getRunner(flags.tool);
   if (!runner.available()) {
     console.error(`tool '${flags.tool}' is not on PATH`);
     process.exit(127);
   }
+  const cwd = flags.cwd ?? process.cwd();
+
+  // Optionally prepend a context block. Format: `<context>\n\n<body>` so the
+  // body stays contiguous and parseable downstream.
+  let prompt = flags.prompt;
+  if (strategy !== "none") {
+    const ctx = gatherContext(flags.prompt, strategy, cwd);
+    if (ctx) prompt = `${ctx}\n\n${flags.prompt}`;
+  }
+
   const result = runner.run({
-    prompt: flags.prompt,
-    cwd: flags.cwd ?? process.cwd(),
+    prompt,
+    cwd,
     timeoutMs: flags.timeoutSec ? flags.timeoutSec * 1000 : undefined,
     systemPrompt: flags.systemPrompt,
   });
@@ -452,10 +474,15 @@ function parseAgentFlags(args: string[]): {
   cwd?: string;
   timeoutSec?: number;
   systemPrompt?: string;
+  contextStrategy?: ContextStrategy;
 } {
   const out: ReturnType<typeof parseAgentFlags> = {};
   for (const a of args) {
-    const m = a.match(/^--([a-z-]+)=(.*)$/);
+    // [\s\S]* (manual dotall) so `--prompt=...` and `--system-prompt=...`
+    // accept multi-line values — the loop passes the entire pick output
+    // (with newlines) through --prompt to preserve task context. Plain
+    // `.*` stops at the first \n and the regex fails to match.
+    const m = a.match(/^--([a-z-]+)=([\s\S]*)$/);
     if (!m) continue;
     const [, k, v] = m;
     if (k === "tool") out.tool = v as AgentTool;
@@ -463,6 +490,7 @@ function parseAgentFlags(args: string[]): {
     else if (k === "cwd") out.cwd = v;
     else if (k === "timeout-sec") out.timeoutSec = Number(v);
     else if (k === "system-prompt") out.systemPrompt = v;
+    else if (k === "context-strategy") out.contextStrategy = v as ContextStrategy;
   }
   return out;
 }

@@ -16,6 +16,10 @@
 
 import { z } from "zod";
 import { IMPLEMENTED_TOOLS } from "./agent-runners/types";
+import {
+  CONTEXT_STRATEGIES,
+  DEFAULT_CONTEXT_STRATEGY,
+} from "./agent-runners/context";
 
 export const PRIORITIES = ["high", "normal", "low"] as const;
 export const STATUSES = [
@@ -50,6 +54,13 @@ export const TaskSchema = z.object({
     .optional(),
   status: z.enum(STATUSES),
   agent: z.enum(AGENTS).optional().default(DEFAULT_AGENT),
+  // Optional context-gathering strategy (oxo port). Defaults to "none" so
+  // existing tasks behave unchanged; opt in per-task to get keyword-based
+  // grep slices prepended to the prompt. See agent-runners/context.ts.
+  context_strategy: z
+    .enum(CONTEXT_STRATEGIES)
+    .optional()
+    .default(DEFAULT_CONTEXT_STRATEGY),
 });
 
 export type Task = z.infer<typeof TaskSchema>;
