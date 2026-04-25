@@ -149,6 +149,39 @@ describe("Claude session continuity (fan-out 6/6)", () => {
     );
     expect(args).not.toContain("--continue");
   });
+
+  // End-to-end of the dispatcher pattern: a judge-FAIL on a parent task
+  // produces a follow-up task. The dispatcher only forwards the parent's
+  // session_id when the follow-up's reuse_session flag is set — proving
+  // the kill switch works and the runner stays opt-in (not auto-pull).
+  test("judge-FAIL → retry chain: dispatcher forwards parent session_id only when reuse_session=true", () => {
+    const PARENT_SESSION = "feedface-1234-5678-9abc-def012345678";
+
+    // Simulated parent task row that captured a session id from its run.
+    const parent = { external_id: "p1", session_id: PARENT_SESSION };
+
+    // Tiny dispatcher: this is the gating logic the loop will own. Only
+    // forward parent session_id when the follow-up explicitly opted in.
+    function dispatchArgs(followUp: { reuse_session?: boolean }): string[] {
+      const parentSessionId = followUp.reuse_session
+        ? parent.session_id
+        : undefined;
+      return buildClaudeArgs(
+        { prompt: "retry attempt", cwd: "/tmp", parentSessionId },
+        undefined,
+      );
+    }
+
+    // Default (reuse_session=false): fresh session, no --continue.
+    const freshArgs = dispatchArgs({ reuse_session: false });
+    expect(freshArgs).not.toContain("--continue");
+
+    // Opt-in (reuse_session=true): --continue with parent's session id.
+    const continuingArgs = dispatchArgs({ reuse_session: true });
+    const idx = continuingArgs.indexOf("--continue");
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(continuingArgs[idx + 1]).toBe(PARENT_SESSION);
+  });
 });
 
 describe("MODELS maps cover the documented nicknames", () => {

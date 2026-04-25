@@ -19,6 +19,24 @@
 // JSON form `"session_id":"<uuid>"` and the human form `Session ID: <uuid>`)
 // and surface it on the AgentRunResult so the caller can persist it on the
 // task row and feed it back into a follow-up dispatch.
+//
+// IMPORTANT — when to reuse a session vs start fresh:
+//   Reuse (set parentSessionId) only when the follow-up task wants the prior
+//   agent's *mental model* preserved: incremental fixes on a near-correct
+//   solution where re-loading the codebase would burn tokens to rebuild the
+//   same understanding (e.g. judge said "looks good but missing edge case
+//   X" or verify failed on a single typo in a 500-line refactor).
+//
+//   Start fresh (leave parentSessionId undefined) when the prior approach
+//   was wrong at the architectural level. Reusing the session anchors the
+//   new attempt to the failed reasoning — the agent rationalises around
+//   its old plan instead of reconsidering. judge-FAIL on a logic-level
+//   critique is the canonical "start fresh" case.
+//
+//   The runner is intentionally agnostic: it does NOT auto-pull session_id
+//   from a parent task row. The dispatcher decides per-retry whether to
+//   pass parentSessionId, gated by Task.reuse_session (opt-in flag in
+//   task-schema.ts). Default is fresh — continuity is the explicit choice.
 
 import { spawnSync } from "node:child_process";
 import type { AgentRunner, AgentRunOptions, AgentRunResult } from "./types";

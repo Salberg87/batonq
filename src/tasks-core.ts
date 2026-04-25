@@ -277,7 +277,8 @@ export function initTaskSchema(db: Database): void {
       scheduled_for TEXT,
       agent TEXT,
       model TEXT,
-      session_id TEXT
+      session_id TEXT,
+      reuse_session INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status);
     CREATE INDEX IF NOT EXISTS idx_task_repo_status ON tasks(repo, status);
@@ -324,10 +325,12 @@ export function initTaskSchema(db: Database): void {
     migrateAgentColumn,
     migrateModelColumn,
     migrateSessionIdColumn,
+    migrateReuseSessionColumn,
   } = require("./migrate");
   migrateAgentColumn(db);
   migrateModelColumn(db);
   migrateSessionIdColumn(db);
+  migrateReuseSessionColumn(db);
   // The pick index is created after ALTERs so migrating DBs get it too.
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_task_pick ON tasks(status, priority, scheduled_for, created_at)`,

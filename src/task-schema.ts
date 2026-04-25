@@ -64,8 +64,15 @@ export const TaskSchema = z.object({
   // Claude session id captured from the most recent run on this task chain.
   // Only Claude reports it (other CLIs ignore the column). The loop hands
   // this back to the runner as parentSessionId on a follow-up dispatch
-  // (e.g. judge-FAIL retry) so `claude --continue <id>` rehydrates context.
+  // (e.g. judge-FAIL retry) ONLY when reuse_session is true.
   session_id: z.string().min(1).optional(),
+  // Opt-in kill switch for session continuity. Default false = a follow-up
+  // dispatch starts a fresh Claude session even if the parent has a
+  // session_id on file. Set true on the follow-up task only when the prior
+  // agent's mental model is worth preserving (incremental fix on a near-
+  // correct solution). Leaving it false avoids anchoring a retry to a
+  // failed reasoning approach — see claude.ts for the full rationale.
+  reuse_session: z.boolean().optional().default(false),
 });
 
 export type Task = z.infer<typeof TaskSchema>;
