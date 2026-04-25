@@ -154,3 +154,17 @@ export function migrateModelColumn(db: Database): void {
   if (cols.some((c) => c.name === "model")) return;
   db.exec("ALTER TABLE tasks ADD COLUMN model TEXT");
 }
+
+// Add `session_id TEXT` column. Holds the Claude session id captured from a
+// prior run on the same task chain. When a follow-up task (e.g. judge-FAIL
+// retry) is dispatched and inherits a parent's session_id, the loop passes
+// it to claude as `--continue <id>` so the new invocation keeps the prior
+// turn-by-turn context. Other CLIs (codex, gemini, opencode) don't expose
+// session continuity and ignore the field. Idempotent.
+export function migrateSessionIdColumn(db: Database): void {
+  const cols = db
+    .query("SELECT name FROM pragma_table_info('tasks')")
+    .all() as { name: string }[];
+  if (cols.some((c) => c.name === "session_id")) return;
+  db.exec("ALTER TABLE tasks ADD COLUMN session_id TEXT");
+}

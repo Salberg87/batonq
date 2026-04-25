@@ -276,7 +276,8 @@ export function initTaskSchema(db: Database): void {
       priority TEXT NOT NULL DEFAULT 'normal',
       scheduled_for TEXT,
       agent TEXT,
-      model TEXT
+      model TEXT,
+      session_id TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status);
     CREATE INDEX IF NOT EXISTS idx_task_repo_status ON tasks(repo, status);
@@ -319,9 +320,14 @@ export function initTaskSchema(db: Database): void {
   // (task-schema.ts) defaults missing values to 'any'. NULL on legacy rows
   // is interpreted the same as 'any' by the dispatcher. Migration helper
   // lives in migrate.ts alongside the other one-shot rename migrations.
-  const { migrateAgentColumn, migrateModelColumn } = require("./migrate");
+  const {
+    migrateAgentColumn,
+    migrateModelColumn,
+    migrateSessionIdColumn,
+  } = require("./migrate");
   migrateAgentColumn(db);
   migrateModelColumn(db);
+  migrateSessionIdColumn(db);
   // The pick index is created after ALTERs so migrating DBs get it too.
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_task_pick ON tasks(status, priority, scheduled_for, created_at)`,

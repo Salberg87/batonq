@@ -69,6 +69,14 @@ export interface AgentRunOptions {
    * (`--append-system-prompt`). Other tools ignore it.
    */
   systemPrompt?: string;
+  /**
+   * Claude session id of a previous run on the same task chain. When set,
+   * the claude runner adds `--continue <id>` so the new invocation reuses
+   * the prior session's context (turn history, mental model). Used for
+   * follow-up tasks like judge-FAIL retries. Other CLIs (codex, gemini,
+   * opencode) don't expose session continuity and silently ignore this.
+   */
+  parentSessionId?: string;
   /** Escape hatch: extra argv tokens appended after the tool's standard args. */
   extraArgs?: string[];
 }
@@ -87,6 +95,13 @@ export interface AgentRunResult {
   mode: ExecutionMode;
   /** Resolved model id sent to the CLI, or undefined if no -m flag was used. */
   resolvedModel?: string;
+  /**
+   * Session id reported by the runner (only Claude does today). Persisted on
+   * the task row so a follow-up dispatch can pass it back as parentSessionId
+   * to keep context across the chain. Undefined for runners that don't
+   * surface a session id.
+   */
+  sessionId?: string;
 }
 
 export interface AgentRunner {

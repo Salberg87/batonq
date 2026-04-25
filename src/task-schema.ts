@@ -61,6 +61,11 @@ export const TaskSchema = z.object({
     .enum(CONTEXT_STRATEGIES)
     .optional()
     .default(DEFAULT_CONTEXT_STRATEGY),
+  // Claude session id captured from the most recent run on this task chain.
+  // Only Claude reports it (other CLIs ignore the column). The loop hands
+  // this back to the runner as parentSessionId on a follow-up dispatch
+  // (e.g. judge-FAIL retry) so `claude --continue <id>` rehydrates context.
+  session_id: z.string().min(1).optional(),
 });
 
 export type Task = z.infer<typeof TaskSchema>;

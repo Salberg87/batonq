@@ -16,7 +16,11 @@ import {
   resolveModel,
   STDOUT_CAP_BYTES,
 } from "../src/agent-runners/types";
-import { CLAUDE_MODELS } from "../src/agent-runners/claude";
+import {
+  CLAUDE_MODELS,
+  buildClaudeArgs,
+  extractSessionId,
+} from "../src/agent-runners/claude";
 import { CODEX_MODELS } from "../src/agent-runners/codex";
 import { GEMINI_MODELS } from "../src/agent-runners/gemini";
 
@@ -93,6 +97,57 @@ describe("resolveModel — nickname → real id translation", () => {
     expect(resolveModel("gemini-99-ultra", GEMINI_MODELS)).toBe(
       "gemini-99-ultra",
     );
+  });
+});
+
+describe("Claude session continuity (fan-out 6/6)", () => {
+  test("extractSessionId pulls the id out of stream-json output", () => {
+    // Mimics what `claude -p --output-format stream-json` emits per event.
+    const stdout =
+      `{"type":"system","session_id":"3f2b1c0a-1111-2222-3333-abcdef012345"}\n` +
+      `{"type":"message","content":"hello"}\n`;
+    expect(extractSessionId(stdout)).toBe(
+      "3f2b1c0a-1111-2222-3333-abcdef012345",
+    );
+  });
+
+  test("extractSessionId also handles the human 'Session ID:' form", () => {
+    const stdout = "doing work...\nSession ID: deadbeef-cafe-1234\nbye\n";
+    expect(extractSessionId(stdout)).toBe("deadbeef-cafe-1234");
+  });
+
+  test("extractSessionId returns undefined when no id is present", () => {
+    expect(extractSessionId("")).toBeUndefined();
+    expect(
+      extractSessionId("just plain output, no session here"),
+    ).toBeUndefined();
+  });
+
+  test("follow-up dispatch with parentSessionId emits --continue <id>", () => {
+    const args = buildClaudeArgs(
+      {
+        prompt: "retry after judge FAIL",
+        cwd: "/tmp",
+        parentSessionId: "3f2b1c0a-1111-2222-3333-abcdef012345",
+      },
+      undefined,
+    );
+    const idx = args.indexOf("--continue");
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe("3f2b1c0a-1111-2222-3333-abcdef012345");
+  });
+
+  test("no parentSessionId → no --continue flag (fresh session)", () => {
+    const args = buildClaudeArgs({ prompt: "hello", cwd: "/tmp" }, undefined);
+    expect(args).not.toContain("--continue");
+  });
+
+  test("blank parentSessionId is treated as absent (no --continue)", () => {
+    const args = buildClaudeArgs(
+      { prompt: "hello", cwd: "/tmp", parentSessionId: "   " },
+      undefined,
+    );
+    expect(args).not.toContain("--continue");
   });
 });
 
