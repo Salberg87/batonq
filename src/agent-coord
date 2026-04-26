@@ -191,6 +191,9 @@ switch (cmd) {
   case "snapshot":
     runSnapshot(process.argv.slice(3));
     break;
+  case "burn":
+    runBurn(process.argv.slice(3));
+    break;
   default:
     console.error(
       "usage: batonq\n" +
@@ -205,6 +208,7 @@ switch (cmd) {
         "  Ship:          ship-status\n" +
         "  Agents:        agent-list | agent-run --tool=<claude|codex> --prompt=<text> [--cwd=<dir>] [--timeout-sec=N] [--role=<worker|judge|pr-runner|explorer|reviewer>]\n" +
         "  Snapshot:      snapshot [--md] (paste-ready status block for overseer chat)\n" +
+        "  Quota:         burn [--json] (current Claude 5h-bucket consumption + projection)\n" +
         "  Exit:          uninstall [--remove-state|--keep-state]"
     );
     process.exit(2);
@@ -412,6 +416,31 @@ function runAgentList(): void {
   console.log(
     `\n${present.size}/${IMPLEMENTED_TOOLS.length} implemented runners available on PATH.`,
   );
+}
+
+// burn: estimate Claude subscription 5h-bucket consumption from session
+// jsonl logs. Used to throttle overnight loops before they smelt the
+// bucket (observed 2026-04-23 — 4-hour stall mid-run). Reads ~/.claude/
+// projects/<slug>/*.jsonl, sums every assistant turn's usage tokens,
+// returns one-screen text or --json for scripts/cron.
+function runBurn(args: string[]): void {
+  const {
+    BUCKET_MS,
+    defaultProjectsDir,
+    readTurns,
+    summarize,
+    renderReport,
+  } = require("./burn-tracker");
+  const asJson = args.includes("--json");
+  const projectsDir = defaultProjectsDir(HOME, process.cwd());
+  const now = Date.now();
+  const turns = readTurns(projectsDir, now - BUCKET_MS);
+  const summary = summarize(turns, now);
+  if (asJson) {
+    console.log(JSON.stringify(summary));
+    return;
+  }
+  console.log(renderReport(summary, now));
 }
 
 // agent-run: smoke-test entry point for the AgentRunner abstraction. Lets
