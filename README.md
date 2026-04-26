@@ -56,6 +56,10 @@ by vibe. You need the gate to fire when it says it fires, and you need
 the receipts when it doesn't.
 
 The repo ships a [cheat-detection scorecard](./evals/results/2026-04-24-cheat-detection.md)
+and, since v0.4.0, a
+[cross-tool scorecard](./evals/results/2026-04-26-cross-tool.md) that
+runs every cheat scenario through claude / codex / gemini / opencode
+and reports per-runner pass-rate. Reproduce with `bun evals/cross-tool.ts`.
 
 ## Multi-CLI fan-out
 
