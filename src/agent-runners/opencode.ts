@@ -15,6 +15,8 @@
 import { spawnSync } from "node:child_process";
 import type { AgentRunner, AgentRunOptions, AgentRunResult } from "./types";
 import { DEFAULT_TIMEOUT_MS, capOutput } from "./types";
+import { loadRoleSkill } from "./role-skills";
+import { applySkillToPrompt } from "./prompt-prepend";
 
 export const opencodeRunner: AgentRunner = {
   name: "opencode",
@@ -26,9 +28,10 @@ export const opencodeRunner: AgentRunner = {
 
   run(opts: AgentRunOptions): AgentRunResult {
     const mode = opts.mode ?? "execute";
-
-    const args = ["run", opts.prompt];
-    if (opts.extraArgs?.length) args.push(...opts.extraArgs);
+    const skillContent = opts.role
+      ? loadRoleSkill(opts.role).content
+      : undefined;
+    const args = buildOpencodeArgs(opts, skillContent);
 
     const start = Date.now();
     const r = spawnSync("opencode", args, {
@@ -52,3 +55,22 @@ export const opencodeRunner: AgentRunner = {
     };
   },
 };
+
+/**
+ * Build the argv for `opencode run`. Exported for tests so role-skill
+ * prepending can be verified without spawning the binary.
+ *
+ * opencode's `run` doesn't take a system flag, and per-agent config lives
+ * under `.opencode/agents/` (per-cwd) — mutating that on every task would
+ * leave stray files behind. Prepending SKILL.md inline keeps the
+ * invocation stateless.
+ */
+export function buildOpencodeArgs(
+  opts: AgentRunOptions,
+  skillContent?: string,
+): string[] {
+  const finalPrompt = applySkillToPrompt(opts.prompt, skillContent);
+  const args = ["run", finalPrompt];
+  if (opts.extraArgs?.length) args.push(...opts.extraArgs);
+  return args;
+}

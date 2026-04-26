@@ -70,6 +70,18 @@ export interface AgentRunOptions {
    */
   systemPrompt?: string;
   /**
+   * Optional role hint. When set, the runner loads the matching SKILL.md
+   * from `~/.batonq/skills/<role>/SKILL.md` (auto-fetched from the
+   * `Salberg87/batonq-skills` repo on first use) and injects it via the
+   * tool's native system-prompt mechanism — Claude uses
+   * `--append-system-prompt-file <cached-path>`; codex / gemini / opencode
+   * prepend the SKILL.md content to the user prompt with a
+   * `=== SYSTEM === / === USER ===` separator (none of them expose a
+   * one-shot system-prompt flag that doesn't require mutating per-cwd
+   * config). Cache is busted with `BATONQ_SKILLS_REFRESH=1`.
+   */
+  role?: import("./role-skills").AgentRole;
+  /**
    * Claude session id of a previous run on the same task chain. When set,
    * the claude runner adds `--continue <id>` so the new invocation reuses
    * the prior session's context (turn history, mental model). Used for

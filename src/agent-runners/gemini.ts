@@ -23,6 +23,8 @@
 import { spawnSync } from "node:child_process";
 import type { AgentRunner, AgentRunOptions, AgentRunResult } from "./types";
 import { DEFAULT_TIMEOUT_MS, capOutput, resolveModel } from "./types";
+import { loadRoleSkill } from "./role-skills";
+import { applySkillToPrompt } from "./prompt-prepend";
 
 export const GEMINI_MODELS: Record<string, string> = {
   pro: "gemini-2.5-pro",
@@ -40,14 +42,10 @@ export const geminiRunner: AgentRunner = {
   run(opts: AgentRunOptions): AgentRunResult {
     const mode = opts.mode ?? "execute";
     const resolvedModel = resolveModel(opts.model, GEMINI_MODELS);
-
-    // -p enables non-interactive mode. --approval-mode controls tool gating
-    // without requiring the admin-policy-sensitive --yolo. Caller can still
-    // pass `--approval-mode=yolo` via extraArgs when their account allows.
-    const args = ["-p", opts.prompt];
-    if (resolvedModel) args.push("-m", resolvedModel);
-    args.push("--approval-mode", mode === "analyze" ? "plan" : "auto_edit");
-    if (opts.extraArgs?.length) args.push(...opts.extraArgs);
+    const skillContent = opts.role
+      ? loadRoleSkill(opts.role).content
+      : undefined;
+    const args = buildGeminiArgs(opts, resolvedModel, skillContent);
 
     const start = Date.now();
     const r = spawnSync("gemini", args, {
@@ -70,3 +68,28 @@ export const geminiRunner: AgentRunner = {
     };
   },
 };
+
+/**
+ * Build the argv for `gemini`. Exported for tests so role-skill prepending
+ * + approval-mode wiring can be verified without spawning the binary.
+ *
+ * Gemini's GEMINI.md auto-discovery is per-cwd and would force every task
+ * dir to carry a marker file — we prepend the SKILL.md to the user prompt
+ * with a SYSTEM/USER separator instead, the same way codex/opencode do.
+ */
+export function buildGeminiArgs(
+  opts: AgentRunOptions,
+  resolvedModel: string | undefined,
+  skillContent?: string,
+): string[] {
+  const mode = opts.mode ?? "execute";
+  const finalPrompt = applySkillToPrompt(opts.prompt, skillContent);
+  // -p enables non-interactive mode. --approval-mode controls tool gating
+  // without requiring the admin-policy-sensitive --yolo. Caller can still
+  // pass `--approval-mode=yolo` via extraArgs when their account allows.
+  const args = ["-p", finalPrompt];
+  if (resolvedModel) args.push("-m", resolvedModel);
+  args.push("--approval-mode", mode === "analyze" ? "plan" : "auto_edit");
+  if (opts.extraArgs?.length) args.push(...opts.extraArgs);
+  return args;
+}

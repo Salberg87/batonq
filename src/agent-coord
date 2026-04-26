@@ -51,7 +51,10 @@ import {
   gatherContext,
   CONTEXT_STRATEGIES,
   DEFAULT_CONTEXT_STRATEGY,
+  AGENT_ROLES,
+  isAgentRole,
   type AgentTool,
+  type AgentRole,
   type ContextStrategy,
 } from "./agent-runners";
 import { ZodError } from "zod";
@@ -194,13 +197,13 @@ switch (cmd) {
         "  Setup:         init [--yes]\n" +
         "  Coordination:  check | doctor | status | release <path> | sweep | sweep-tasks\n" +
         "  Measurement:   tail [-n N] | logs [-f] [-n N] [--source events|loop|both] | report [--since ISO] [--until ISO] [--json]\n" +
-        "  Tasks:         add --body <text> [--repo <name>] [--verify <sh>] [--judge <prompt>] [--priority high|normal|low] [--at <ISO>] [--status draft|pending] [--agent claude|codex|gemini|opencode|any] [--json]\n" +
+        "  Tasks:         add --body <text> [--repo <name>] [--verify <sh>] [--judge <prompt>] [--priority high|normal|low] [--at <ISO>] [--status draft|pending] [--agent claude|codex|gemini|opencode|any] [--role worker|judge|pr-runner|explorer|reviewer] [--json]\n" +
         "                 import <file.yaml|file.md> | export --md [--file PATH]\n" +
         "                 sync-tasks | pick | mine | done [<id>] | abandon [<id>] | tasks\n" +
         "  Drafts:        enrich <id> | promote <id>\n" +
         "  Dashboard:     tui | loop-status [--json]\n" +
         "  Ship:          ship-status\n" +
-        "  Agents:        agent-list | agent-run --tool=<claude|codex> --prompt=<text> [--cwd=<dir>] [--timeout-sec=N]\n" +
+        "  Agents:        agent-list | agent-run --tool=<claude|codex> --prompt=<text> [--cwd=<dir>] [--timeout-sec=N] [--role=<worker|judge|pr-runner|explorer|reviewer>]\n" +
         "  Snapshot:      snapshot [--md] (paste-ready status block for overseer chat)\n" +
         "  Exit:          uninstall [--remove-state|--keep-state]"
     );
@@ -419,7 +422,7 @@ function runAgentRun(args: string[]): void {
   const flags = parseAgentFlags(args);
   if (!flags.tool || !flags.prompt) {
     console.error(
-      "usage: batonq agent-run --tool=<claude|codex> --prompt=<text> [--cwd=<dir>] [--timeout-sec=N] [--system-prompt=<text>] [--context-strategy=<none|simple|rlm|auto>]",
+      "usage: batonq agent-run --tool=<claude|codex> --prompt=<text> [--cwd=<dir>] [--timeout-sec=N] [--system-prompt=<text>] [--context-strategy=<none|simple|rlm|auto>] [--role=<worker|judge|pr-runner|explorer|reviewer>]",
     );
     process.exit(2);
   }
@@ -434,6 +437,12 @@ function runAgentRun(args: string[]): void {
   if (!CONTEXT_STRATEGIES.includes(strategy)) {
     console.error(
       `unknown context-strategy: ${strategy} (valid: ${CONTEXT_STRATEGIES.join(", ")})`,
+    );
+    process.exit(2);
+  }
+  if (flags.role && !isAgentRole(flags.role)) {
+    console.error(
+      `unknown role: ${flags.role} (valid: ${AGENT_ROLES.join(", ")})`,
     );
     process.exit(2);
   }
@@ -457,6 +466,7 @@ function runAgentRun(args: string[]): void {
     cwd,
     timeoutMs: flags.timeoutSec ? flags.timeoutSec * 1000 : undefined,
     systemPrompt: flags.systemPrompt,
+    role: flags.role as AgentRole | undefined,
   });
   process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
@@ -475,6 +485,7 @@ function parseAgentFlags(args: string[]): {
   timeoutSec?: number;
   systemPrompt?: string;
   contextStrategy?: ContextStrategy;
+  role?: string;
 } {
   const out: ReturnType<typeof parseAgentFlags> = {};
   for (const a of args) {
@@ -491,6 +502,7 @@ function parseAgentFlags(args: string[]): {
     else if (k === "timeout-sec") out.timeoutSec = Number(v);
     else if (k === "system-prompt") out.systemPrompt = v;
     else if (k === "context-strategy") out.contextStrategy = v as ContextStrategy;
+    else if (k === "role") out.role = v;
   }
   return out;
 }

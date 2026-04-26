@@ -15,6 +15,8 @@
 import { spawnSync } from "node:child_process";
 import type { AgentRunner, AgentRunOptions, AgentRunResult } from "./types";
 import { DEFAULT_TIMEOUT_MS, capOutput, resolveModel } from "./types";
+import { loadRoleSkill } from "./role-skills";
+import { applySkillToPrompt } from "./prompt-prepend";
 
 /** Codex model nicknames. Keep small — codex's model surface is narrower. */
 export const CODEX_MODELS: Record<string, string> = {
@@ -35,25 +37,10 @@ export const codexRunner: AgentRunner = {
   run(opts: AgentRunOptions): AgentRunResult {
     const mode = opts.mode ?? "execute";
     const resolvedModel = resolveModel(opts.model, CODEX_MODELS);
-
-    const args = ["exec", "--skip-git-repo-check"];
-    // Sandbox mode: codex defaults to read-only, so without an explicit flag
-    // it can't edit files or run git. Mirror Claude's --dangerously-skip-
-    // permissions: in execute mode we want full workspace write + auto-
-    // approval. Analyze stays read-only.
-    if (mode === "execute") {
-      args.push("--full-auto"); // = workspace-write sandbox + on-failure approval
-    } else {
-      args.push("--sandbox", "read-only");
-    }
-    if (resolvedModel) args.push("--model", resolvedModel);
-    if (opts.extraArgs?.length) args.push(...opts.extraArgs);
-
-    // Codex has no native --print mode. Prepend a hint in analyze-mode so
-    // the model self-restricts. Best-effort, not enforced by the CLI.
-    const finalPrompt =
-      mode === "analyze" ? `${ANALYZE_HINT}\n\n${opts.prompt}` : opts.prompt;
-    args.push(finalPrompt);
+    const skillContent = opts.role
+      ? loadRoleSkill(opts.role).content
+      : undefined;
+    const args = buildCodexArgs(opts, resolvedModel, skillContent);
 
     const start = Date.now();
     const r = spawnSync("codex", args, {
@@ -77,3 +64,41 @@ export const codexRunner: AgentRunner = {
     };
   },
 };
+
+/**
+ * Build the argv for `codex`. Exported for tests so role-skill injection +
+ * analyze-hint composition can be verified without spawning the binary.
+ *
+ * `skillContent` is the cached SKILL.md text resolved by
+ * `loadRoleSkill(opts.role)` in `run()`. Tests pass it directly.
+ */
+export function buildCodexArgs(
+  opts: AgentRunOptions,
+  resolvedModel: string | undefined,
+  skillContent?: string,
+): string[] {
+  const mode = opts.mode ?? "execute";
+  const args = ["exec", "--skip-git-repo-check"];
+  // Sandbox mode: codex defaults to read-only, so without an explicit flag
+  // it can't edit files or run git. Mirror Claude's --dangerously-skip-
+  // permissions: in execute mode we want full workspace write + auto-
+  // approval. Analyze stays read-only.
+  if (mode === "execute") {
+    args.push("--full-auto"); // = workspace-write sandbox + on-failure approval
+  } else {
+    args.push("--sandbox", "read-only");
+  }
+  if (resolvedModel) args.push("--model", resolvedModel);
+  if (opts.extraArgs?.length) args.push(...opts.extraArgs);
+
+  // Codex has no native --print mode. Prepend a hint in analyze-mode so
+  // the model self-restricts. Best-effort, not enforced by the CLI.
+  let finalPrompt =
+    mode === "analyze" ? `${ANALYZE_HINT}\n\n${opts.prompt}` : opts.prompt;
+  // Role SKILL.md is prepended *outside* the analyze hint so the SYSTEM
+  // block reads as the role definition, not as the analyze instruction —
+  // the hint stays inside the USER block where it belongs.
+  finalPrompt = applySkillToPrompt(finalPrompt, skillContent);
+  args.push(finalPrompt);
+  return args;
+}

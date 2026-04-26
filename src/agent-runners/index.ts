@@ -53,3 +53,13 @@ export type {
   ExecutionMode,
   ModelNickname,
 } from "./types";
+
+export {
+  AGENT_ROLES,
+  isAgentRole,
+  loadRoleSkill,
+  skillUrl,
+  skillCachePath,
+  defaultSkillCacheDir,
+} from "./role-skills";
+export type { AgentRole, SkillLoaderDeps, LoadedSkill } from "./role-skills";

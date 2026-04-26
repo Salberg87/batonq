@@ -41,6 +41,7 @@
 import { spawnSync } from "node:child_process";
 import type { AgentRunner, AgentRunOptions, AgentRunResult } from "./types";
 import { DEFAULT_TIMEOUT_MS, capOutput, resolveModel } from "./types";
+import { loadRoleSkill } from "./role-skills";
 
 /**
  * Nickname → versioned model id. Caller writes `model: "opus"`, we send the
@@ -77,7 +78,8 @@ export const claudeRunner: AgentRunner = {
   run(opts: AgentRunOptions): AgentRunResult {
     const mode = opts.mode ?? "execute";
     const resolvedModel = resolveModel(opts.model, CLAUDE_MODELS);
-    const args = buildClaudeArgs(opts, resolvedModel);
+    const skillPath = opts.role ? loadRoleSkill(opts.role).path : undefined;
+    const args = buildClaudeArgs(opts, resolvedModel, skillPath);
 
     const start = Date.now();
     const r = spawnSync("claude", args, {
@@ -107,11 +109,17 @@ export const claudeRunner: AgentRunner = {
 
 /**
  * Build the argv for `claude`. Exported for tests so we can verify the
- * `--continue <parentSessionId>` wiring without spawning a real binary.
+ * `--continue <parentSessionId>` and `--append-system-prompt-file <path>`
+ * wiring without spawning a real binary.
+ *
+ * The optional `skillPath` arg is the cached SKILL.md path resolved by
+ * `loadRoleSkill(opts.role)` in `run()`. Tests pass a synthetic path
+ * directly so they don't have to touch the filesystem cache.
  */
 export function buildClaudeArgs(
   opts: AgentRunOptions,
   resolvedModel: string | undefined,
+  skillPath?: string,
 ): string[] {
   const mode = opts.mode ?? "execute";
   // Mode → flag. `--print` is read-only one-shot (no tools). `--dangerously-
@@ -131,6 +139,12 @@ export function buildClaudeArgs(
   if (resolvedModel) args.push("--model", resolvedModel);
   if (opts.systemPrompt && mode === "execute") {
     args.push("--append-system-prompt", opts.systemPrompt);
+  }
+  // Role SKILL.md → claude's native file-based system-prompt loader. Stays
+  // out of analyze mode because `--print` ignores append-system-prompt and
+  // surfacing the flag there would mislead callers about its effect.
+  if (skillPath && mode === "execute") {
+    args.push("--append-system-prompt-file", skillPath);
   }
   if (opts.extraArgs?.length) args.push(...opts.extraArgs);
   return args;
