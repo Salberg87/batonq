@@ -18,7 +18,14 @@ import { existsSync, readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { isAbsolute, resolve, basename } from "node:path";
 import { homedir } from "node:os";
-import { hashFile, extractBashPaths, extractDoneEid, DESTRUCTIVE, MAX_HASH_BYTES } from "./hook-core";
+import {
+  hashFile,
+  extractBashPaths,
+  extractDoneEid,
+  countMutatingEventsSinceClaim,
+  DESTRUCTIVE,
+  MAX_HASH_BYTES,
+} from "./hook-core";
 import { migrate } from "./migrate";
 import { migratePath, canonicalDbPath, canonicalDbDir } from "./migrate-path";
 import { runVerify } from "./tasks-core";
@@ -273,23 +280,49 @@ async function main() {
                 status: string;
               }
             | null;
-          if (row?.verify_cmd && row.verify_cmd.trim()) {
-            const { code, output } = runVerify(
-              row.verify_cmd,
-              cwd,
-              row.external_id,
+          if (row) {
+            // ── Tool-event audit (runs BEFORE verify_cmd so a no-edit cheat
+            // is caught even when verify_cmd happens to pass for unrelated
+            // reasons — e.g. a verify that only checks git state when a peer
+            // loop made the matching commit). Returns -1 on un-runnable
+            // audits (no claimed_at, unreadable log) → fail open per hook
+            // discipline. Read-only sessions (the agent never called
+            // Edit/Write/MultiEdit since claim) come back as 0 → deny.
+            const editCount = countMutatingEventsSinceClaim(
+              LOG_PATH,
+              session,
               row.claimed_at,
             );
-            if (code !== 0) {
-              const trimmed = (output || "").trim().slice(-1200);
+            if (editCount === 0) {
               emitDeny(
-                `verify-gate: verify_cmd FAILED for task ${row.external_id.slice(0, 8)} (exit ${code}). ` +
-                  `Do NOT call \`batonq done\` again until verify passes. ` +
-                  `Verify output (last 1.2KB):\n${trimmed}\n` +
-                  `Either fix the underlying issue and re-run verify yourself, ` +
-                  `or call \`batonq abandon ${row.external_id.slice(0, 8)}\` ` +
-                  `with a one-line reason if the task is genuinely impossible.`,
+                `verify-gate: no edits since claim — agent did not actually do the work ` +
+                  `(task ${row.external_id.slice(0, 8)}, session ${session.slice(0, 8)}, ` +
+                  `claimed_at ${row.claimed_at ?? "?"}). ` +
+                  `No Edit/Write/MultiEdit tool calls were recorded for this session ` +
+                  `between claim and \`batonq done\`. ` +
+                  `Either complete the task properly and retry, or call ` +
+                  `\`batonq abandon ${row.external_id.slice(0, 8)}\` with a one-line reason.`,
               );
+            }
+
+            if (row.verify_cmd && row.verify_cmd.trim()) {
+              const { code, output } = runVerify(
+                row.verify_cmd,
+                cwd,
+                row.external_id,
+                row.claimed_at,
+              );
+              if (code !== 0) {
+                const trimmed = (output || "").trim().slice(-1200);
+                emitDeny(
+                  `verify-gate: verify_cmd FAILED for task ${row.external_id.slice(0, 8)} (exit ${code}). ` +
+                    `Do NOT call \`batonq done\` again until verify passes. ` +
+                    `Verify output (last 1.2KB):\n${trimmed}\n` +
+                    `Either fix the underlying issue and re-run verify yourself, ` +
+                    `or call \`batonq abandon ${row.external_id.slice(0, 8)}\` ` +
+                    `with a one-line reason if the task is genuinely impossible.`,
+                );
+              }
             }
           }
         } finally {

@@ -6,6 +6,8 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 
+export const MUTATING_TOOLS = ["Edit", "Write", "MultiEdit"] as const;
+
 export const MAX_HASH_BYTES = 1_048_576;
 
 // Quote-aware: the `(?<!["'][^"']*)` lookbehind prevents false positives on
@@ -50,6 +52,49 @@ export function extractDoneEid(cmd: string): string | null {
   // are 8 chars. Trailing flag suffix ignored.
   const m = cmd.match(/\b(?:batonq|agent-coord)\s+done\s+([0-9a-f]{6,})\b/i);
   return m ? m[1]!.toLowerCase() : null;
+}
+
+// Tool-event audit for the verify-gate. Reads the measurement log and counts
+// mutating tool events (Edit | Write | MultiEdit) emitted by `sessionId` at or
+// after `claimedAtIso`. A return of 0 means the agent claimed a task and then
+// called `batonq done` without ever attempting an edit — the canonical
+// "no-work cheat". Returns -1 when the audit can't run reliably (missing log,
+// unparsable claim timestamp, fs error) so callers can fail-open.
+//
+// Counting only `phase === "pre"` avoids double-counting a single edit (which
+// emits both pre and post). `pre` is more reliable than `post` because the
+// pre-hook fires before the tool runs even if the tool itself errors.
+export function countMutatingEventsSinceClaim(
+  logPath: string,
+  sessionId: string,
+  claimedAtIso: string | null | undefined,
+): number {
+  if (!claimedAtIso) return -1;
+  const claimMs = Date.parse(claimedAtIso);
+  if (Number.isNaN(claimMs)) return -1;
+  if (!existsSync(logPath)) return 0;
+  let count = 0;
+  try {
+    const content = readFileSync(logPath, "utf8");
+    for (const line of content.split("\n")) {
+      if (!line) continue;
+      let ev: any;
+      try {
+        ev = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (ev.phase !== "pre") continue;
+      if (ev.session !== sessionId) continue;
+      if (!MUTATING_TOOLS.includes(ev.tool)) continue;
+      const evMs = Date.parse(ev.ts ?? "");
+      if (Number.isNaN(evMs) || evMs < claimMs) continue;
+      count++;
+    }
+  } catch {
+    return -1;
+  }
+  return count;
 }
 
 export function extractBashPaths(cmd: string, cwd: string): string[] {
