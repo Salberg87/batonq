@@ -840,8 +840,12 @@ function writeHookConfig(hookBin: string): void {
       hooks: [{ type: "command", command: `${hookBin} pre`, timeout: 2 }],
     },
     {
+      // Bash matcher gets a 300s timeout (vs 2s on pre/post) because the
+      // verify-gate runs verify_cmd inline when the agent calls `batonq done`.
+      // A 2s ceiling would kill `bun test` etc. mid-run and the gate would
+      // fall open silently. See agent-coord-hook MODE === "bash".
       matcher: "Bash",
-      hooks: [{ type: "command", command: `${hookBin} bash`, timeout: 2 }],
+      hooks: [{ type: "command", command: `${hookBin} bash`, timeout: 300 }],
     },
   ];
   const newPost = [

@@ -69,6 +69,21 @@ Hook event log: `~/.claude/batonq-measurement/events.jsonl`.
    Setting `AGENT_COORD_ALLOW_SKIP=1` does NOT re-enable them. If verify
    fails, fix the underlying issue or `batonq abandon <id>`.
 
+   **PreToolUse verify-gate (added 2026-04-26).** When the Claude runner
+   calls `Bash` with `batonq done <eid>`, `agent-coord-hook bash`
+   intercepts: looks up the task's `verify_cmd`, runs `runVerify` inline,
+   and emits a deny JSON response if exit ≠ 0. Cheats become
+   structurally impossible at the gate — Claude sees the verify output
+   as `permissionDecisionReason` and can self-correct. Caveats:
+   (a) only fires under Claude Code's hook system — codex/gemini/opencode
+   bypass entirely; (b) only catches "called done without verifying" —
+   agents that exit without calling done at all are still caught only
+   post-hoc by the watchdog. Settings.json template ships
+   `"timeout": 300` for the bash matcher so verify_cmd has time to run;
+   re-run install.sh if you upgraded from a 2s install. This is the
+   ONLY structurally-preventive anti-cheat measure. Everything else
+   (alert lane, cheat-done detector, cross-tool eval) is detective.
+
 3. **TASKS.md is deprecated.** It carries a `> ⚠️ DEPRECATED` header on
    line 1. Add new tasks via `batonq add` (Zod-validated, schema-strict)
    or `batonq import <file>` for bulk. The old `syncTasks()` auto-call

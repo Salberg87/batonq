@@ -299,7 +299,7 @@ ${SETTINGS} (under PreToolUse and PostToolUse):
     { "matcher": "Read|Edit|Write|MultiEdit",
       "hooks": [{ "type": "command", "command": "${bindir}/${NAME}-hook pre",  "timeout": 2 }] }
     { "matcher": "Bash",
-      "hooks": [{ "type": "command", "command": "${bindir}/${NAME}-hook bash", "timeout": 2 }] }
+      "hooks": [{ "type": "command", "command": "${bindir}/${NAME}-hook bash", "timeout": 300 }] }
   PostToolUse:
     { "matcher": "Edit|Write|MultiEdit",
       "hooks": [{ "type": "command", "command": "${bindir}/${NAME}-hook post", "timeout": 2 }] }
@@ -309,12 +309,15 @@ EOF
 
   mkdir -p "${CLAUDE_DIR}"
 
+  # bash matcher gets 300s timeout because the verify-gate runs verify_cmd
+  # inline (e.g. `bun test`) — a 2s ceiling kills it mid-suite. pre/post
+  # stay at 2s; they only do hashing + DB writes.
   new_config=$(jq -n --arg cmd "${bindir}/${NAME}-hook" '{
     PreToolUse: [
       { matcher: "Read|Edit|Write|MultiEdit",
         hooks: [{ type: "command", command: ($cmd + " pre"),  timeout: 2 }] },
       { matcher: "Bash",
-        hooks: [{ type: "command", command: ($cmd + " bash"), timeout: 2 }] }
+        hooks: [{ type: "command", command: ($cmd + " bash"), timeout: 300 }] }
     ],
     PostToolUse: [
       { matcher: "Edit|Write|MultiEdit",

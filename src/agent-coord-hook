@@ -18,9 +18,10 @@ import { existsSync, readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { isAbsolute, resolve, basename } from "node:path";
 import { homedir } from "node:os";
-import { hashFile, extractBashPaths, DESTRUCTIVE, MAX_HASH_BYTES } from "./hook-core";
+import { hashFile, extractBashPaths, extractDoneEid, DESTRUCTIVE, MAX_HASH_BYTES } from "./hook-core";
 import { migrate } from "./migrate";
 import { migratePath, canonicalDbPath, canonicalDbDir } from "./migrate-path";
+import { runVerify } from "./tasks-core";
 
 const MODE = process.argv[2]; // pre | post | bash
 const HOME = homedir();
@@ -235,6 +236,73 @@ async function main() {
 
   if (MODE === "bash") {
     const cmd = toolInput.command ?? "";
+
+    // ── Verify-gate (the only structurally-preventive anti-cheat measure
+    // we have, and only for the Claude Code runner). When the agent inside
+    // claude -p calls Bash with `batonq done <eid>`, we intercept here:
+    // look up the task's verify_cmd, run it inline, and emit a deny on
+    // failure so the agent sees "verify failed: <output>" as the tool
+    // result and can self-correct. On pass, return early so the destructive-
+    // pattern check below skips this command (a `done` invocation has no
+    // destructive content of its own — the gate decision is the whole story).
+    //
+    // Caveats called out so we don't oversell this:
+    //   1. Only fires when the agent goes through Claude Code's hook system
+    //      (claude runner). codex / gemini / opencode bypass this entirely.
+    //   2. Only catches the "called done without verifying" cheat. An agent
+    //      that exits without calling done at all is not gated here — the
+    //      watchdog catches that as a stale claim, post-hoc.
+    //   3. Settings.json template ships `"timeout": 300` for this matcher
+    //      so verify_cmd has time to run; older installs at 2s will kill
+    //      the hook mid-verify and fall open. Re-run install.sh after pull.
+    const doneEid = extractDoneEid(cmd);
+    if (doneEid) {
+      try {
+        const dbGate = openDb();
+        try {
+          const row = dbGate
+            .query(
+              `SELECT external_id, verify_cmd, claimed_at, status
+               FROM tasks WHERE external_id = ? OR external_id LIKE ?`,
+            )
+            .get(doneEid, `${doneEid}%`) as
+            | {
+                external_id: string;
+                verify_cmd: string | null;
+                claimed_at: string | null;
+                status: string;
+              }
+            | null;
+          if (row?.verify_cmd && row.verify_cmd.trim()) {
+            const { code, output } = runVerify(
+              row.verify_cmd,
+              cwd,
+              row.external_id,
+              row.claimed_at,
+            );
+            if (code !== 0) {
+              const trimmed = (output || "").trim().slice(-1200);
+              emitDeny(
+                `verify-gate: verify_cmd FAILED for task ${row.external_id.slice(0, 8)} (exit ${code}). ` +
+                  `Do NOT call \`batonq done\` again until verify passes. ` +
+                  `Verify output (last 1.2KB):\n${trimmed}\n` +
+                  `Either fix the underlying issue and re-run verify yourself, ` +
+                  `or call \`batonq abandon ${row.external_id.slice(0, 8)}\` ` +
+                  `with a one-line reason if the task is genuinely impossible.`,
+              );
+            }
+          }
+        } finally {
+          dbGate.close();
+        }
+      } catch {
+        // fail-open per hook discipline. A broken gate must not break agents.
+      }
+      // Done call passed (or no verify_cmd configured) — short-circuit the
+      // destructive-pattern audit so the bash log doesn't double-record this.
+      return;
+    }
+
     const m = cmd.match(DESTRUCTIVE);
     if (!m) return;
     bashPattern = m[0].trim();

@@ -58,6 +58,7 @@ import {
   DESTRUCTIVE,
   MAX_HASH_BYTES,
   extractBashPaths,
+  extractDoneEid,
   hashFile,
 } from "../src/hook-core";
 
@@ -854,6 +855,46 @@ describe("extractBashPaths", () => {
     expect(out.some((p) => p.endsWith("/rm"))).toBe(false);
     // Non-existent `missing.txt` excluded by existsSync filter
     expect(out.some((p) => p.endsWith("missing.txt"))).toBe(false);
+  });
+});
+
+// ── 11b. extractDoneEid — verify-gate trigger detector ───────────────────────
+
+describe("extractDoneEid", () => {
+  test("matches the canonical `batonq done <eid>` form", () => {
+    expect(extractDoneEid("batonq done abc123ef")).toBe("abc123ef");
+  });
+  test("matches the legacy `agent-coord done` name", () => {
+    expect(extractDoneEid("agent-coord done deadbeef")).toBe("deadbeef");
+  });
+  test("matches embedded calls: trailing &&, ||, ;, pipes", () => {
+    expect(extractDoneEid("git push && batonq done abc12345")).toBe("abc12345");
+    expect(extractDoneEid("batonq done abc12345 && echo ok")).toBe("abc12345");
+    expect(extractDoneEid("echo y | batonq done abc12345")).toBe("abc12345");
+    expect(extractDoneEid("batonq done abc12345; cleanup.sh")).toBe("abc12345");
+  });
+  test("case-insensitive match, output normalized to lowercase", () => {
+    expect(extractDoneEid("Batonq Done ABC123EF")).toBe("abc123ef");
+  });
+  test("rejects non-done batonq subcommands", () => {
+    expect(extractDoneEid("batonq pick")).toBeNull();
+    expect(extractDoneEid("batonq abandon abc12345")).toBeNull();
+    expect(extractDoneEid("batonq status")).toBeNull();
+  });
+  test("rejects unrelated commands containing the word 'done'", () => {
+    expect(extractDoneEid("echo done")).toBeNull();
+    expect(extractDoneEid("test done abc12345")).toBeNull();
+  });
+  test("rejects too-short eids (< 6 hex chars)", () => {
+    expect(extractDoneEid("batonq done abc")).toBeNull();
+    expect(extractDoneEid("batonq done abcd")).toBeNull();
+  });
+  test("rejects non-hex eids", () => {
+    expect(extractDoneEid("batonq done not-hex-here")).toBeNull();
+  });
+  test("empty / whitespace returns null without throwing", () => {
+    expect(extractDoneEid("")).toBeNull();
+    expect(extractDoneEid("   ")).toBeNull();
   });
 });
 
