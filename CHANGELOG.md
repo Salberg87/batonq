@@ -7,6 +7,49 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-26
+
+### Added
+
+**Per-task specialist roles via SKILL.md** — agents can now be loaded
+with role-specific personas drawn from the companion repo
+[Salberg87/batonq-skills](https://github.com/Salberg87/batonq-skills).
+
+- `role` field on tasks (Zod-validated: `worker | judge | pr-runner |
+explorer | reviewer`, default `worker`).
+- `@role:` annotation parsed from TASKS.md task lines, alongside
+  `@agent:` and `@model:`.
+- Per-runner SKILL.md injection via the CLI's native mechanism:
+  - **claude** — `--append-system-prompt-file <cached-path>`
+  - **codex** / **gemini** / **opencode** — prepend with explicit
+    `SYSTEM` / `USER` separator since none expose a system-prompt flag
+    in non-interactive mode.
+- Local skill cache at `~/.batonq/skills/<role>/SKILL.md`, auto-fetched
+  from the skills repo on first use, cached forever. Bust the cache
+  with `BATONQ_SKILLS_REFRESH=1`. Local edits beat remote — fetch is
+  bootstrap-only.
+- Graceful fetch fallback: if the cold-cache fetch fails (offline,
+  rate-limited), the runner logs a warning and runs without the
+  skill rather than crashing the loop.
+- New CLI flag: `batonq agent-run --role=<name>`.
+
+**Companion repo: `batonq-skills`**
+
+Five role definitions packaged as standard SKILL.md files
+(YAML frontmatter + markdown body) so any compatible CLI — Claude
+Code, Cursor, Codex, Gemini, opencode — can pick them up via its
+own loader. Karpathy-inspired worker baseline plus batonq-specific
+addenda (gates mandatory, `BATONQ_CLAIM_TS` for git assertions,
+atomic file writes, in-memory test DBs, conventional commits).
+
+### Notes
+
+- Live-verified end-to-end: `batonq agent-run --tool=claude
+--role=judge --prompt="..."` loaded the judge skill from the
+  remote repo, claude returned the verdict-only `PASS` output the
+  skill prescribes, in 5.4s.
+- Ship-criteria still passes 22/22 after every change in this release.
+
 ## [0.3.0] - 2026-04-25
 
 ### Added
