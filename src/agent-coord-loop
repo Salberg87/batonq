@@ -33,6 +33,15 @@ set -euo pipefail
 #   BATONQ_WATCHDOG_WARMUP_SEC  watchdog warm-up before first check (default 120)
 #   BATONQ_LOOP_TIMEOUT         timeout duration for dispatch (default 20m)
 #   BATONQ_FORCE_AGENT          ops-time agent pin (overrides routing)
+#   BATONQ_BURN_PCT_LIMIT       skip pick when 5h-bucket >= N% (default 85)
+#                               set to 100 to disable the burn gate
+#   BATONQ_BURN_BACKOFF_SEC     how long to sleep when burn-gated (default 600)
+#
+# Burn gate (added 2026-04-26 after the 4h overnight outage on 2026-04-23):
+# before each pick we read `batonq burn --json` and skip the dispatch if the
+# bucket is hot. The loop keeps running, just doesn't spawn fresh agents that
+# would push us into the synthetic-stop wall. When the bucket resets the
+# next iteration sees pct < limit and resumes normally.
 #
 # Multi-session caveat: the watchdog watches a *shared* hook log
 # (~/.claude/batonq-measurement/events.jsonl). The events log is written by
@@ -59,7 +68,32 @@ extract_pick_field() {
   printf '%s' "$value"
 }
 
+BURN_PCT_LIMIT="${BATONQ_BURN_PCT_LIMIT:-85}"
+BURN_BACKOFF_SEC="${BATONQ_BURN_BACKOFF_SEC:-600}"
+
+# burn_should_skip — returns 0 (skip) when the 5h-bucket is at or above the
+# pct limit. Returns 1 (proceed) on any failure to read burn — we'd rather
+# dispatch and hit the wall than freeze the loop on a parser hiccup.
+burn_should_skip() {
+  [ "$BURN_PCT_LIMIT" -ge 100 ] && return 1
+  local json pct
+  json=$(batonq burn --json 2>/dev/null) || return 1
+  # bucketAgeMs / (5h in ms) * 100, rounded to int. jq is not assumed; awk
+  # over a regex gives us the field with no extra deps.
+  local age
+  age=$(printf '%s' "$json" | awk -F'[:,}]' '/bucketAgeMs/ { for(i=1;i<=NF;i++) if($i ~ /bucketAgeMs/) print $(i+1); exit }' | tr -d ' "')
+  [ -z "$age" ] && return 1
+  pct=$(awk -v a="$age" 'BEGIN { printf "%d", (a / (5*60*60*1000)) * 100 }')
+  [ "$pct" -ge "$BURN_PCT_LIMIT" ]
+}
+
 while true; do
+  if burn_should_skip; then
+    echo "→ burn ${BURN_PCT_LIMIT}%+ — skipping pick, sleeping ${BURN_BACKOFF_SEC}s"
+    sleep "$BURN_BACKOFF_SEC"
+    continue
+  fi
+
   echo "→ batonq pick"
   PICK_OUTPUT=$(batonq pick 2>&1)
 

@@ -118,7 +118,11 @@ export function eventsAgeSec(
 // caller.
 
 export function probeLoopPid(): number | null {
-  const r = spawnSync("pgrep", ["-f", "agent-coord-loop"], {
+  // The loop binary was renamed `agent-coord-loop` → `batonq-loop` in v0.3.x;
+  // match both so freshly-installed and legacy checkouts both probe correctly.
+  // Without this the TUI shows `loop ✕ dead` against a perfectly-healthy
+  // batonq-loop process — the symptom seen on 2026-04-26.
+  const r = spawnSync("pgrep", ["-f", "batonq-loop|agent-coord-loop"], {
     encoding: "utf8",
   });
   if (r.status !== 0) return null;
