@@ -78,7 +78,7 @@ export const claudeRunner: AgentRunner = {
   run(opts: AgentRunOptions): AgentRunResult {
     const mode = opts.mode ?? "execute";
     const resolvedModel = resolveModel(opts.model, CLAUDE_MODELS);
-    const skillPath = opts.role ? loadRoleSkill(opts.role).path : undefined;
+    const skillPath = opts.role ? loadRoleSkill(opts.role)?.path : undefined;
     const args = buildClaudeArgs(opts, resolvedModel, skillPath);
 
     const start = Date.now();

@@ -75,25 +75,52 @@ export interface LoadedSkill {
  * cached file path (suitable for `--append-system-prompt-file`) and the
  * content (suitable for prompt-prepending in tools that lack a system flag).
  *
- * Throws if the fetch fails on a cold cache — the caller (a runner about to
- * spawn an agent) needs to know up front rather than silently shipping a
- * default-system-prompt run.
+ * Returns `null` and logs a warning to stderr when the fetch fails on a
+ * cold cache. We deliberately do NOT throw: the loop is the only realistic
+ * caller, and crashing it because a single SKILL.md couldn't be fetched is
+ * worse than running the agent without the role hint. Once the file is
+ * cached locally further runs are offline-safe.
+ *
+ * If a cached copy exists and `refresh` is on, a refresh-fetch failure
+ * keeps the existing cache rather than wiping it — same reasoning. Stale
+ * skill > no skill > crashed loop.
  */
 export function loadRoleSkill(
   role: AgentRole,
   deps: SkillLoaderDeps = {},
-): LoadedSkill {
+): LoadedSkill | null {
   const cacheDir = deps.cacheDir ?? defaultSkillCacheDir();
   const refresh = deps.refresh ?? process.env.BATONQ_SKILLS_REFRESH === "1";
   const path = skillCachePath(role, cacheDir);
+  const haveCache = existsSync(path);
 
-  if (!refresh && existsSync(path)) {
+  if (!refresh && haveCache) {
     return { role, path, content: readFileSync(path, "utf8"), fetched: false };
   }
 
   const url = skillUrl(role);
   const fetcher = deps.fetcher ?? defaultFetcher;
-  const content = fetcher(url);
+  let content: string;
+  try {
+    content = fetcher(url);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(
+      `[batonq] warn: could not fetch SKILL.md for role '${role}' (${msg}); ` +
+        (haveCache
+          ? `keeping cached copy at ${path}\n`
+          : `running without role skill\n`),
+    );
+    if (haveCache) {
+      return {
+        role,
+        path,
+        content: readFileSync(path, "utf8"),
+        fetched: false,
+      };
+    }
+    return null;
+  }
 
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, content);

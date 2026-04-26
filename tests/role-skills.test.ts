@@ -86,11 +86,12 @@ describe("loadRoleSkill — cache + fetch behavior", () => {
       },
     });
     expect(calls).toBe(1);
-    expect(result.fetched).toBe(true);
-    expect(result.content).toBe("# worker skill\n");
-    expect(result.path).toBe(`${dir}/worker/SKILL.md`);
-    expect(existsSync(result.path)).toBe(true);
-    expect(readFileSync(result.path, "utf8")).toBe("# worker skill\n");
+    expect(result).not.toBeNull();
+    expect(result!.fetched).toBe(true);
+    expect(result!.content).toBe("# worker skill\n");
+    expect(result!.path).toBe(`${dir}/worker/SKILL.md`);
+    expect(existsSync(result!.path)).toBe(true);
+    expect(readFileSync(result!.path, "utf8")).toBe("# worker skill\n");
   });
 
   test("cache hit on a populated dir does NOT call the fetcher", () => {
@@ -103,7 +104,7 @@ describe("loadRoleSkill — cache + fetch behavior", () => {
 
     // Cold cache — populates.
     const first = loadRoleSkill("judge", { cacheDir: dir, fetcher });
-    expect(first.fetched).toBe(true);
+    expect(first!.fetched).toBe(true);
 
     // Warm cache — must not re-fetch. We swap to a fetcher that throws to
     // prove the loader never calls it.
@@ -113,9 +114,9 @@ describe("loadRoleSkill — cache + fetch behavior", () => {
         throw new Error("fetcher must not run on cache hit");
       },
     });
-    expect(second.fetched).toBe(false);
-    expect(second.content).toBe("judge content v1");
-    expect(second.path).toBe(first.path);
+    expect(second!.fetched).toBe(false);
+    expect(second!.content).toBe("judge content v1");
+    expect(second!.path).toBe(first!.path);
   });
 
   test("refresh:true busts the cache and re-fetches", () => {
@@ -124,13 +125,13 @@ describe("loadRoleSkill — cache + fetch behavior", () => {
     const fetcher = () => `content v${++counter}`;
 
     const first = loadRoleSkill("explorer", { cacheDir: dir, fetcher });
-    expect(first.content).toBe("content v1");
-    expect(first.fetched).toBe(true);
+    expect(first!.content).toBe("content v1");
+    expect(first!.fetched).toBe(true);
 
     // Without refresh: cache hit.
     const cached = loadRoleSkill("explorer", { cacheDir: dir, fetcher });
-    expect(cached.content).toBe("content v1");
-    expect(cached.fetched).toBe(false);
+    expect(cached!.content).toBe("content v1");
+    expect(cached!.fetched).toBe(false);
 
     // With refresh: re-fetches and overwrites the cached file.
     const refreshed = loadRoleSkill("explorer", {
@@ -138,9 +139,9 @@ describe("loadRoleSkill — cache + fetch behavior", () => {
       fetcher,
       refresh: true,
     });
-    expect(refreshed.fetched).toBe(true);
-    expect(refreshed.content).toBe("content v2");
-    expect(readFileSync(refreshed.path, "utf8")).toBe("content v2");
+    expect(refreshed!.fetched).toBe(true);
+    expect(refreshed!.content).toBe("content v2");
+    expect(readFileSync(refreshed!.path, "utf8")).toBe("content v2");
   });
 
   test("BATONQ_SKILLS_REFRESH=1 env var also busts the cache", () => {
@@ -151,19 +152,70 @@ describe("loadRoleSkill — cache + fetch behavior", () => {
     loadRoleSkill("reviewer", { cacheDir: dir, fetcher });
     // Without env: cache hit.
     let result = loadRoleSkill("reviewer", { cacheDir: dir, fetcher });
-    expect(result.fetched).toBe(false);
+    expect(result!.fetched).toBe(false);
 
     // With env: re-fetches.
     const prev = process.env.BATONQ_SKILLS_REFRESH;
     process.env.BATONQ_SKILLS_REFRESH = "1";
     try {
       result = loadRoleSkill("reviewer", { cacheDir: dir, fetcher });
-      expect(result.fetched).toBe(true);
-      expect(result.content).toBe("env-bust v2");
+      expect(result!.fetched).toBe(true);
+      expect(result!.content).toBe("env-bust v2");
     } finally {
       if (prev === undefined) delete process.env.BATONQ_SKILLS_REFRESH;
       else process.env.BATONQ_SKILLS_REFRESH = prev;
     }
+  });
+
+  test("cold-cache fetch failure returns null + logs warning (no throw)", () => {
+    // Loop should not crash when the skills repo is unreachable on first
+    // use. The contract is "warn + run without skill", not "explode".
+    const dir = track(makeTmpCache());
+    const stderrChunks: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr.write as any) = (chunk: any) => {
+      stderrChunks.push(String(chunk));
+      return true;
+    };
+    try {
+      const result = loadRoleSkill("worker", {
+        cacheDir: dir,
+        fetcher: () => {
+          throw new Error("ENETUNREACH");
+        },
+      });
+      expect(result).toBeNull();
+    } finally {
+      process.stderr.write = origWrite;
+    }
+    const joined = stderrChunks.join("");
+    expect(joined).toContain("could not fetch SKILL.md");
+    expect(joined).toContain("worker");
+    expect(joined).toContain("ENETUNREACH");
+  });
+
+  test("refresh-fetch failure on a warm cache keeps the existing copy", () => {
+    // Stale skill > no skill. When the user opts into a refresh and the
+    // network is down, we don't want them to lose their already-cached
+    // role definition.
+    const dir = track(makeTmpCache());
+    // Populate cache with a known-good fetcher.
+    const seeded = loadRoleSkill("judge", {
+      cacheDir: dir,
+      fetcher: () => "v1",
+    });
+    expect(seeded!.content).toBe("v1");
+
+    const result = loadRoleSkill("judge", {
+      cacheDir: dir,
+      refresh: true,
+      fetcher: () => {
+        throw new Error("network down");
+      },
+    });
+    expect(result).not.toBeNull();
+    expect(result!.fetched).toBe(false);
+    expect(result!.content).toBe("v1");
   });
 });
 
@@ -292,27 +344,28 @@ describe("runner injection covers every implemented role", () => {
         cacheDir: dir,
         fetcher: () => `# ${role}`,
       });
+      expect(skill).not.toBeNull();
       const cArgs = buildClaudeArgs(
         { prompt: "p", cwd: "/tmp", role },
         undefined,
-        skill.path,
+        skill!.path,
       );
       expect(cArgs).toContain("--append-system-prompt-file");
       const xArgs = buildCodexArgs(
         { prompt: "p", cwd: "/tmp", role },
         undefined,
-        skill.content,
+        skill!.content,
       );
       expect(xArgs[xArgs.length - 1]).toContain(`# ${role}`);
       const gArgs = buildGeminiArgs(
         { prompt: "p", cwd: "/tmp", role },
         undefined,
-        skill.content,
+        skill!.content,
       );
       expect(gArgs[gArgs.indexOf("-p") + 1]).toContain(`# ${role}`);
       const oArgs = buildOpencodeArgs(
         { prompt: "p", cwd: "/tmp", role },
-        skill.content,
+        skill!.content,
       );
       expect(oArgs[1]).toContain(`# ${role}`);
     }

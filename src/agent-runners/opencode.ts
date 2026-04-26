@@ -29,7 +29,7 @@ export const opencodeRunner: AgentRunner = {
   run(opts: AgentRunOptions): AgentRunResult {
     const mode = opts.mode ?? "execute";
     const skillContent = opts.role
-      ? loadRoleSkill(opts.role).content
+      ? loadRoleSkill(opts.role)?.content
       : undefined;
     const args = buildOpencodeArgs(opts, skillContent);
 

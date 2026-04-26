@@ -43,7 +43,7 @@ export const geminiRunner: AgentRunner = {
     const mode = opts.mode ?? "execute";
     const resolvedModel = resolveModel(opts.model, GEMINI_MODELS);
     const skillContent = opts.role
-      ? loadRoleSkill(opts.role).content
+      ? loadRoleSkill(opts.role)?.content
       : undefined;
     const args = buildGeminiArgs(opts, resolvedModel, skillContent);
 
