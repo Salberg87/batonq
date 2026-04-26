@@ -209,9 +209,18 @@ batonq add --body "investigate flaky auth test on CI" \
            --verify "bun test tests/auth.test.ts" \
            --priority high
 
+# Pin the dispatched runner role so the agent loads the matching SKILL.md
+# (worker | judge | pr-runner | explorer | reviewer). Default: worker.
+batonq add --body "review the diff on #142 and emit PASS/FAIL" \
+           --role judge
+
 # Single task, JSON on stdin — useful from other tools / scripts.
 echo '{"body": "migrate login copy to new schema", "repo": "any:copy"}' \
   | batonq add --json
+
+# Inline annotations work the same as flags, including @role: for skill
+# selection. Annotations are stripped from the body before persisting.
+batonq add --body "audit the auth middleware @role:reviewer @agent:claude"
 
 # Bulk from YAML (array or { tasks: [...] } wrapper) or markdown.
 batonq import ~/DEV/my-backlog.yaml

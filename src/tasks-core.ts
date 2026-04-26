@@ -17,6 +17,7 @@ import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { IMPLEMENTED_TOOLS } from "./agent-runners/types";
 import { routeTask, type RoutingDecision } from "./agent-runners/routing";
+import { AGENT_ROLES, type AgentRole } from "./agent-runners/role-skills";
 
 // OpenClaw-inspired claim TTL: claimed tasks must show progress (PostToolUse
 // touches `last_progress_at`) within this window or they're candidates for
@@ -49,6 +50,11 @@ export interface ParsedTask {
   // the body but not assigned (Zod validation would reject them anyway).
   agent?: string;
   model?: string;
+  // `@role:<name>` annotation. Same strip-but-validate semantics as @agent:
+  // — the token is always removed from the body, but the field is only set
+  // when the captured value is a known AGENT_ROLES member (worker / judge /
+  // pr-runner / explorer / reviewer).
+  role?: AgentRole;
 }
 
 // Pattern from oxo's orchestrator. Annotations are written inline in the
@@ -75,31 +81,44 @@ export interface ParsedTask {
 //     also stripped so the persisted body never contains annotation tokens.
 //   - `@model:` has no enum (models are freeform nicknames per runner) so
 //     `@model:gemini-pro` parses model='gemini-pro' verbatim.
+//   - `@role:` accepts only AGENT_ROLES members (worker, judge, pr-runner,
+//     explorer, reviewer). Unknown roles are stripped but not assigned —
+//     same shape as @agent: above. Hyphenated values like `pr-runner` work
+//     because the value regex captures `[\w-]+`.
 const ANNOTATION_AGENT_RE = /@agent:([\w-]+)/g;
 const ANNOTATION_MODEL_RE = /@model:([\w-]+)/g;
+const ANNOTATION_ROLE_RE = /@role:([\w-]+)/g;
 const VALID_ANNOTATION_AGENTS = new Set<string>([...IMPLEMENTED_TOOLS, "any"]);
+const VALID_ANNOTATION_ROLES = new Set<string>(AGENT_ROLES);
 
 export interface AnnotationParseResult {
   body: string;
   agent?: string;
   model?: string;
+  role?: AgentRole;
 }
 
 export function extractAnnotations(rawBody: string): AnnotationParseResult {
   const agentMatch = rawBody.match(/@agent:([\w-]+)/);
   const modelMatch = rawBody.match(/@model:([\w-]+)/);
+  const roleMatch = rawBody.match(/@role:([\w-]+)/);
   let agent: string | undefined;
   let model: string | undefined;
+  let role: AgentRole | undefined;
   if (agentMatch && VALID_ANNOTATION_AGENTS.has(agentMatch[1]!)) {
     agent = agentMatch[1];
   }
   if (modelMatch) model = modelMatch[1];
+  if (roleMatch && VALID_ANNOTATION_ROLES.has(roleMatch[1]!)) {
+    role = roleMatch[1] as AgentRole;
+  }
   const body = rawBody
     .replace(ANNOTATION_AGENT_RE, "")
     .replace(ANNOTATION_MODEL_RE, "")
+    .replace(ANNOTATION_ROLE_RE, "")
     .replace(/\s+/g, " ")
     .trim();
-  return { body, agent, model };
+  return { body, agent, model, role };
 }
 
 // Normalise whatever the user typed into one of the three priority tokens.
@@ -208,6 +227,7 @@ export function parseTasksText(text: string): {
         lineIdx: i,
         agent: annotated.agent,
         model: annotated.model,
+        role: annotated.role,
       };
       tasks.push(current);
       continue;
@@ -278,7 +298,8 @@ export function initTaskSchema(db: Database): void {
       agent TEXT,
       model TEXT,
       session_id TEXT,
-      reuse_session INTEGER NOT NULL DEFAULT 0
+      reuse_session INTEGER NOT NULL DEFAULT 0,
+      role TEXT NOT NULL DEFAULT 'worker'
     );
     CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status);
     CREATE INDEX IF NOT EXISTS idx_task_repo_status ON tasks(repo, status);
@@ -326,11 +347,13 @@ export function initTaskSchema(db: Database): void {
     migrateModelColumn,
     migrateSessionIdColumn,
     migrateReuseSessionColumn,
+    migrateRoleColumn,
   } = require("./migrate");
   migrateAgentColumn(db);
   migrateModelColumn(db);
   migrateSessionIdColumn(db);
   migrateReuseSessionColumn(db);
+  migrateRoleColumn(db);
   // The pick index is created after ALTERs so migrating DBs get it too.
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_task_pick ON tasks(status, priority, scheduled_for, created_at)`,
@@ -387,13 +410,15 @@ export function syncTasks(
     // Model is freeform and only persisted when present.
     const agent = t.agent ?? "any";
     const model = t.model ?? null;
+    // Role defaults to 'worker' — same default semantics as the schema layer.
+    const role = t.role ?? "worker";
     // Map MD status → DB status. `claimed` in MD is treated as pending on
     // insert (DB owns claim state); draft and done pass through verbatim.
     const insertStatus =
       t.status === "done" ? "done" : t.status === "draft" ? "draft" : "pending";
     if (!existing) {
       db.run(
-        `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd, priority, scheduled_for, agent, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd, priority, scheduled_for, agent, model, role) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           eid,
           t.repo,
@@ -406,6 +431,7 @@ export function syncTasks(
           scheduledFor,
           agent,
           model,
+          role,
         ],
       );
       if (t.status !== "done") added++;
@@ -465,6 +491,12 @@ export function syncTasks(
         if (model !== (existing.model ?? null)) {
           db.run(`UPDATE tasks SET model = ? WHERE external_id = ?`, [
             model,
+            eid,
+          ]);
+        }
+        if (role !== (existing.role ?? "worker")) {
+          db.run(`UPDATE tasks SET role = ? WHERE external_id = ?`, [
+            role,
             eid,
           ]);
         }
@@ -1457,6 +1489,8 @@ export interface TaskInput {
   // `@model:` annotations or set explicitly via JSON import. Resolved by
   // the runner at dispatch time.
   model?: string;
+  // Per-task role identity. Selects which SKILL.md the runner injects.
+  role?: AgentRole;
 }
 
 // Raised from insertTask when the computed external_id already exists. Carries
@@ -1488,9 +1522,10 @@ export function insertTask(
   const scheduledFor = t.scheduledFor ?? null;
   const agent = t.agent ?? DEFAULT_AGENT;
   const model = t.model ?? null;
+  const role: AgentRole = t.role ?? "worker";
   db.run(
-    `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd, priority, scheduled_for, agent, model)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO tasks (external_id, repo, body, status, created_at, verify_cmd, judge_cmd, priority, scheduled_for, agent, model, role)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       eid,
       repo,
@@ -1503,6 +1538,7 @@ export function insertTask(
       scheduledFor,
       agent,
       model,
+      role,
     ],
   );
   return eid;
@@ -1542,6 +1578,7 @@ export function validatedInsertTask(
   const body = annotated.body;
   if (!input.agent && annotated.agent) input.agent = annotated.agent;
   if (!input.model && annotated.model) input.model = annotated.model;
+  if (!input.role && annotated.role) input.role = annotated.role;
 
   input.repo = repo;
   input.body = body;
@@ -1549,6 +1586,7 @@ export function validatedInsertTask(
   if (!input.status) input.status = "pending";
   if (!input.priority) input.priority = DEFAULT_PRIORITY;
   if (!input.agent) input.agent = DEFAULT_AGENT;
+  if (!input.role) input.role = "worker";
 
   // Canonicalise scheduled_for so lexicographic comparison in pick works.
   // If normaliser returns null we leave the raw value alone — Zod will
@@ -1577,6 +1615,7 @@ export function validatedInsertTask(
       status: input.status as TaskStatus,
       agent: input.agent as TaskAgent,
       model: typeof input.model === "string" ? input.model : undefined,
+      role: input.role as AgentRole,
     },
     nowIso,
   );
@@ -1652,6 +1691,7 @@ export function parseMarkdownTasksForImport(text: string): TaskInput[] {
       status,
       agent: t.agent as TaskAgent | undefined,
       model: t.model,
+      role: t.role,
     });
   }
   return out;

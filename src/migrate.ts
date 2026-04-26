@@ -185,3 +185,16 @@ export function migrateReuseSessionColumn(db: Database): void {
     "ALTER TABLE tasks ADD COLUMN reuse_session INTEGER NOT NULL DEFAULT 0",
   );
 }
+
+// Add `role TEXT` column. Selects which SKILL.md the runner injects
+// (worker / judge / pr-runner / explorer / reviewer — see
+// agent-runners/role-skills.ts). Defaults to 'worker' on legacy rows so existing
+// tasks behave as plain implementation work without re-routing. Idempotent
+// — same pattern as migrateAgentColumn.
+export function migrateRoleColumn(db: Database): void {
+  const cols = db
+    .query("SELECT name FROM pragma_table_info('tasks')")
+    .all() as { name: string }[];
+  if (cols.some((c) => c.name === "role")) return;
+  db.exec("ALTER TABLE tasks ADD COLUMN role TEXT NOT NULL DEFAULT 'worker'");
+}

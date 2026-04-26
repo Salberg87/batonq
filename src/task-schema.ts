@@ -20,6 +20,11 @@ import {
   CONTEXT_STRATEGIES,
   DEFAULT_CONTEXT_STRATEGY,
 } from "./agent-runners/context";
+import { AGENT_ROLES } from "./agent-runners/role-skills";
+
+// Default role for tasks without an explicit `@role:` annotation or --role
+// flag. `worker` matches the pre-roles behaviour (run, edit, test, commit).
+export const DEFAULT_ROLE = "worker" as const;
 
 export const PRIORITIES = ["high", "normal", "low"] as const;
 export const STATUSES = [
@@ -73,6 +78,12 @@ export const TaskSchema = z.object({
   // correct solution). Leaving it false avoids anchoring a retry to a
   // failed reasoning approach — see claude.ts for the full rationale.
   reuse_session: z.boolean().optional().default(false),
+  // Per-task role identity. The dispatcher uses this to inject the matching
+  // SKILL.md from `Salberg87/batonq-skills` into the agent's system prompt
+  // (loader lives in the runners). Defaults to `worker` so existing tasks
+  // and bare `batonq add` calls keep behaving as plain implementation work.
+  // See `agent-runners/role-skills.ts` for the canonical enum.
+  role: z.enum(AGENT_ROLES).optional().default(DEFAULT_ROLE),
 });
 
 export type Task = z.infer<typeof TaskSchema>;

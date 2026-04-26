@@ -3111,6 +3111,137 @@ describe("@agent: / @model: annotations on TASKS.md task lines", () => {
     db.close();
   });
 
+  test("schema accepts each AGENT_ROLES enum value", () => {
+    // Walk the canonical enum so adding a sixth role here doesn't drift from
+    // role-skills.ts — if someone widens AGENT_ROLES the loop catches it.
+    const { AGENT_ROLES } = require("../src/agent-runners/role-skills");
+    for (const role of AGENT_ROLES) {
+      const parsed = parseTaskInput({
+        external_id: "x".repeat(12),
+        repo: "any:infra",
+        body: "implement role acceptance for the task schema layer",
+        priority: "normal",
+        status: "pending",
+        role,
+      });
+      expect(parsed.role).toBe(role);
+    }
+  });
+
+  test("schema rejects unknown role with ZodError", () => {
+    const { ZodError } = require("zod");
+    expect(() =>
+      parseTaskInput({
+        external_id: "x".repeat(12),
+        repo: "any:infra",
+        body: "should be rejected because the role is bogus",
+        priority: "normal",
+        status: "pending",
+        role: "supervisor",
+      }),
+    ).toThrow(ZodError);
+  });
+
+  test("schema defaults role to 'worker' when omitted", () => {
+    // Mirrors the bare `batonq add` flow — no --role flag, no @role:
+    // annotation. The default keeps existing tasks behaving as plain
+    // implementation work (the pre-roles default).
+    const parsed = parseTaskInput({
+      external_id: "x".repeat(12),
+      repo: "any:infra",
+      body: "no role specified — should default to worker",
+      priority: "normal",
+      status: "pending",
+    });
+    expect(parsed.role).toBe("worker");
+  });
+
+  test("@role: annotation is parsed and stripped from the body", () => {
+    const md = [
+      "## Pending",
+      "",
+      "- [ ] **batonq** — review the latest diff @role:judge",
+    ].join("\n");
+    const { tasks } = parseTasksText(md);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]!.role).toBe("judge");
+    expect(tasks[0]!.body).toBe("review the latest diff");
+    expect(tasks[0]!.body).not.toContain("@role");
+
+    // Also verify the hyphenated case (`pr-runner`) — the regex captures
+    // `[\w-]+` so multi-word roles parse correctly.
+    const hyphenated = extractAnnotations(
+      "open the release PR @role:pr-runner trailing words",
+    );
+    expect(hyphenated.role).toBe("pr-runner");
+    expect(hyphenated.body).toBe("open the release PR trailing words");
+    expect(hyphenated.body).not.toContain("@role");
+  });
+
+  test("unknown @role: value is stripped but role stays unset", () => {
+    // `architect` isn't in AGENT_ROLES. Mirrors the @agent: behaviour:
+    // strip the token so re-parsing the cleaned body is idempotent, but
+    // leave the field undefined so downstream defaulting picks 'worker'.
+    const result = extractAnnotations("classify this @role:architect now");
+    expect(result.role).toBeUndefined();
+    expect(result.body).toBe("classify this now");
+    expect(result.body).not.toContain("@role");
+  });
+
+  test("syncTasks persists role from annotation onto the row", () => {
+    const md = [
+      "## Pending",
+      "",
+      "- [ ] **batonq** — audit the PR before merge @role:reviewer",
+    ].join("\n");
+    const { tasks } = parseTasksText(md);
+    const db = memDb();
+    syncTasks(db, tasks);
+    const row = db
+      .query("SELECT role FROM tasks WHERE repo = 'batonq'")
+      .get() as { role: string };
+    expect(row.role).toBe("reviewer");
+    db.close();
+  });
+
+  test("validatedInsertTask: explicit --role flag wins over body annotation", () => {
+    const db = memDb();
+    const eid = validatedInsertTask(db, {
+      repo: "any:infra",
+      body: "fix the broken thing @role:explorer extra padding to clear floor",
+      role: "judge",
+    });
+    const row = db
+      .query("SELECT role, body FROM tasks WHERE external_id = ?")
+      .get(eid) as { role: string; body: string };
+    expect(row.role).toBe("judge");
+    expect(row.body).not.toContain("@role");
+    db.close();
+  });
+
+  test("initTaskSchema role migration is idempotent on a legacy DB", () => {
+    // Legacy DB without the role column. The migration must add it on first
+    // initTaskSchema call and be a no-op on the second.
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        external_id TEXT UNIQUE NOT NULL,
+        repo TEXT NOT NULL,
+        body TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL
+      );
+    `);
+    initTaskSchema(db);
+    expect(() => initTaskSchema(db)).not.toThrow();
+    const cols = db
+      .query("SELECT name FROM pragma_table_info('tasks')")
+      .all() as { name: string }[];
+    expect(cols.filter((c) => c.name === "role").length).toBe(1);
+    db.close();
+  });
+
   test("initTaskSchema model migration is idempotent", () => {
     // Legacy DB without the model column.
     const db = new Database(":memory:");

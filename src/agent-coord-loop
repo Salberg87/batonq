@@ -7,6 +7,9 @@ set -euo pipefail
 # abstraction (src/agent-runners/*) instead of hard-coding `claude -p`. The
 # picked agent + model come from the routing layer (src/agent-runners/
 # routing.ts) and are emitted on `agent:` / `model:` lines in pick output.
+# The task's `role` (worker / judge / pr-runner / explorer / reviewer) flows
+# through the same channel so the runner can inject the matching SKILL.md
+# from `Salberg87/batonq-skills` into the agent's system prompt.
 #
 # Two operator-side escape hatches sit on top of routing:
 #
@@ -76,8 +79,10 @@ while true; do
     # default to claude/sonnet to preserve the old hard-coded behaviour.
     AGENT="$(extract_pick_field agent)"
     MODEL="$(extract_pick_field model)"
+    ROLE="$(extract_pick_field role)"
     AGENT="${AGENT:-claude}"
     MODEL="${MODEL:-sonnet}"
+    ROLE="${ROLE:-worker}"
 
     if [ -n "${BATONQ_FORCE_AGENT:-}" ]; then
       echo "→ BATONQ_FORCE_AGENT=${BATONQ_FORCE_AGENT} (overrides picked: ${AGENT})"
@@ -93,7 +98,7 @@ while true; do
       AGENT="claude"
     fi
 
-    echo "→ dispatching: batonq agent-run --tool=${AGENT} --model=${MODEL}"
+    echo "→ dispatching: batonq agent-run --tool=${AGENT} --model=${MODEL} --role=${ROLE}"
     echo
 
     # Liveness watchdog: if the shared hook event log goes mtime-stale for
@@ -116,6 +121,7 @@ while true; do
     "$TIMEOUT_CMD" "$LOOP_TIMEOUT" batonq agent-run \
         --tool="$AGENT" \
         --model="$MODEL" \
+        --role="$ROLE" \
         --prompt="$PICK_OUTPUT" \
         --system-prompt="$PICK_NEXT_SYSTEM_PROMPT" || true
 

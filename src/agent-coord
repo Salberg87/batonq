@@ -1945,6 +1945,7 @@ function pickTask(): void {
     }
     console.log(`agent:       ${routing.agent}`);
     console.log(`model:       ${routing.model}`);
+    console.log(`role:        ${candidate.role ?? "worker"}`);
     console.log(`session:     ${session}`);
     console.log(``);
     console.log(`TASK:`);
@@ -2238,6 +2239,7 @@ interface AddFlags {
   at?: string;
   status?: string;
   agent?: string;
+  role?: string;
   json: boolean;
 }
 
@@ -2278,13 +2280,16 @@ function parseAddFlags(args: string[]): AddFlags {
       case "--agent":
         flags.agent = takeNext("--agent");
         break;
+      case "--role":
+        flags.role = takeNext("--role");
+        break;
       case "--json":
         flags.json = true;
         break;
       default:
         console.error(`add: unknown flag: ${a}`);
         console.error(
-          "usage: batonq add --body <text> [--repo <name>] [--verify <sh>] [--judge <prompt>] [--priority high|normal|low] [--at <ISO>] [--status draft|pending] [--agent claude|codex|gemini|opencode|any] [--json]",
+          "usage: batonq add --body <text> [--repo <name>] [--verify <sh>] [--judge <prompt>] [--priority high|normal|low] [--at <ISO>] [--status draft|pending] [--agent claude|codex|gemini|opencode|any] [--role worker|judge|pr-runner|explorer|reviewer] [--json]",
         );
         process.exit(2);
     }
@@ -2335,6 +2340,7 @@ function addCmd(): void {
   if (flags.at !== undefined) input.scheduled_for = flags.at;
   if (flags.status !== undefined) input.status = flags.status;
   if (flags.agent !== undefined) input.agent = flags.agent;
+  if (flags.role !== undefined) input.role = flags.role;
 
   // Derive repo from the cwd git-root when neither flags nor JSON supplied one.
   if (!("repo" in input) || !input.repo) {
