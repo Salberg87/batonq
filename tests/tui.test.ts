@@ -1137,6 +1137,68 @@ describe("LoopStatusFooter rendering", () => {
     expect(out).toContain("no events.jsonl");
     unmount();
   });
+
+  test("burn line renders when burn prop has bucketStart, omitted otherwise", () => {
+    // Without burn → row absent
+    const noBurn = render(
+      React.createElement(LoopStatusFooter, { status: base }),
+    );
+    expect(noBurn.lastFrame() ?? "").not.toContain("burn:");
+    noBurn.unmount();
+
+    // With burn → row appears with formatted duration + tokens
+    const burn = {
+      bucketStart: 1_000_000_000,
+      bucketAgeMs: 90 * 60_000, // 1h 30m
+      bucketRemainingMs: 3 * 60 * 60_000 + 30 * 60_000, // 3h 30m
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreateTokens: 0,
+      cacheReadTokens: 12_345_000,
+      totalTokens: 12_345_000,
+      turns: 50,
+      burnRatePerMin: 137_000,
+      syntheticStops: 0,
+    };
+    const withBurn = render(
+      React.createElement(LoopStatusFooter, { status: base, burn }),
+    );
+    const out = withBurn.lastFrame() ?? "";
+    expect(out).toContain("burn:");
+    expect(out).toContain("1h 30m / 5h");
+    expect(out).toContain("12.35M"); // fmtTokens uses .toFixed(2) for M
+    expect(out).toContain("3h 30m");
+    withBurn.unmount();
+  });
+
+  test("null burn or null bucketStart skips the row", () => {
+    const nullBurn = render(
+      React.createElement(LoopStatusFooter, { status: base, burn: null }),
+    );
+    expect(nullBurn.lastFrame() ?? "").not.toContain("burn:");
+    nullBurn.unmount();
+
+    const emptyBurn = render(
+      React.createElement(LoopStatusFooter, {
+        status: base,
+        burn: {
+          bucketStart: null,
+          bucketAgeMs: 0,
+          bucketRemainingMs: 5 * 60 * 60_000,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheCreateTokens: 0,
+          cacheReadTokens: 0,
+          totalTokens: 0,
+          turns: 0,
+          burnRatePerMin: 0,
+          syntheticStops: 0,
+        },
+      }),
+    );
+    expect(emptyBurn.lastFrame() ?? "").not.toContain("burn:");
+    emptyBurn.unmount();
+  });
 });
 
 describe("eventsAgeColor threshold", () => {

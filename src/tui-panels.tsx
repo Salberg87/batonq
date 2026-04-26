@@ -28,6 +28,7 @@ import {
 } from "./loop-status";
 import type { FeedRecord, FeedSource, FeedState } from "./live-feed";
 import { visibleWindow } from "./live-feed";
+import { fmtDuration, fmtTokens, type BurnSummary } from "./burn-tracker";
 
 // Brand colors from /tmp/brand/colors.css
 export const C = {
@@ -427,7 +428,23 @@ export function LiveFeedPanel({
 // queue has stalled. Rendered below the four panels, auto-refreshed by the
 // main App tick. Colors: brand.accent for the running baton-pass, warn/err
 // when the event log goes mtime-stale past the watchdog thresholds.
-export function LoopStatusFooter({ status }: { status: LoopStatus }) {
+// Burn line color thresholds: below 60% of 5h-bucket = green, 60-90% = yellow,
+// >90% = red. Operator should see the bucket fill warning long before the
+// loop stalls on a synthetic stop.
+function burnColor(b: BurnSummary): string {
+  const pct = b.bucketAgeMs / (5 * 60 * 60_000);
+  if (pct >= 0.9) return C.err;
+  if (pct >= 0.6) return C.warn;
+  return C.ok;
+}
+
+export function LoopStatusFooter({
+  status,
+  burn,
+}: {
+  status: LoopStatus;
+  burn?: BurnSummary | null;
+}) {
   const stateColor =
     status.state === "running"
       ? C.ok
@@ -474,6 +491,18 @@ export function LoopStatusFooter({ status }: { status: LoopStatus }) {
         </Text>
         <Text color={C.dim}> to restart loop</Text>
       </Box>
+      {burn && burn.bucketStart !== null && (
+        <Box>
+          <Text color={C.paper}>burn: </Text>
+          <Text color={burnColor(burn)}>
+            {fmtDuration(burn.bucketAgeMs)} / 5h
+          </Text>
+          <Text color={C.dim}> · </Text>
+          <Text color={C.brand}>{fmtTokens(burn.totalTokens)}</Text>
+          <Text color={C.dim}> tokens · resets in </Text>
+          <Text color={C.brand}>{fmtDuration(burn.bucketRemainingMs)}</Text>
+        </Box>
+      )}
     </Box>
   );
 }

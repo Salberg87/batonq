@@ -11,7 +11,7 @@
 // surface wins. Body is rendered with visual wrap but stored as one line — the
 // TASKS.md format is line-oriented anyway.
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useApp, useInput } from "ink";
 import TextInput from "ink-text-input";
 import { spawn, spawnSync } from "node:child_process";
@@ -65,6 +65,13 @@ import {
   probeLoopPid,
   type LoopStatus,
 } from "./loop-status";
+import {
+  BUCKET_MS,
+  defaultProjectsDir,
+  readTurns,
+  summarize,
+  type BurnSummary,
+} from "./burn-tracker";
 import {
   DEFAULT_LOOP_GLOB,
   FEED_POLL_MS,
@@ -208,6 +215,32 @@ function useAlerts(now: number): Alert[] {
 // tied to the main refresh tick and not a separate interval. The events-age
 // cell compares `now` against the events.jsonl mtime; keybind 'L' opens the
 // restart-loop confirm (see useInput below).
+// useBurn — throttled. Reading every jsonl file every 2s tick is wasteful;
+// the bucket changes by at most a few hundred tokens/sec on steady-state
+// traffic. Recompute every 30s and cache between.
+const BURN_REFRESH_MS = 30_000;
+function useBurn(now: number): BurnSummary | null {
+  const cache = useRef<{ at: number; value: BurnSummary | null }>({
+    at: 0,
+    value: null,
+  });
+  return useMemo(() => {
+    if (now - cache.current.at < BURN_REFRESH_MS && cache.current.at > 0) {
+      return cache.current.value;
+    }
+    try {
+      const dir = defaultProjectsDir(homedir(), process.cwd());
+      const turns = readTurns(dir, now - BUCKET_MS);
+      const summary = summarize(turns, now);
+      cache.current = { at: now, value: summary };
+      return summary;
+    } catch {
+      cache.current = { at: now, value: null };
+      return null;
+    }
+  }, [now]);
+}
+
 function useLoopStatus(now: number): LoopStatus {
   return useMemo(() => {
     const loopPid = probeLoopPid();
@@ -244,6 +277,7 @@ export function App() {
   const { now, bump: forceRefresh } = useTick(REFRESH_MS);
   const snap = useSnapshot(now);
   const loopStatus = useLoopStatus(now);
+  const burn = useBurn(now);
   const alerts = useAlerts(now);
 
   const [focus, setFocus] = useState<PanelKey>("tasks");
@@ -673,7 +707,7 @@ export function App() {
       </Box>
 
       <Box paddingX={1}>
-        <LoopStatusFooter status={loopStatus} />
+        <LoopStatusFooter status={loopStatus} burn={burn} />
       </Box>
 
       <Box paddingX={1} flexDirection="column">
