@@ -400,6 +400,26 @@ function runSnapshot(args: string[]): void {
   } else {
     push("(no events.jsonl)");
   }
+  push();
+
+  // ── Burn (Claude 5h-bucket) ────────────────────────────────────────
+  push("## Burn");
+  try {
+    const {
+      BUCKET_MS,
+      defaultProjectsDir,
+      readTurns,
+      summarize,
+      renderReport,
+    } = require("./burn-tracker");
+    const burnDir = defaultProjectsDir(HOME, process.cwd());
+    const turns = readTurns(burnDir, now.getTime() - BUCKET_MS);
+    const summary = summarize(turns, now.getTime());
+    const report = renderReport(summary, now.getTime());
+    for (const line of report.split("\n")) push(line);
+  } catch (e) {
+    push(`(burn read failed: ${(e as Error).message})`);
+  }
 
   process.stdout.write(out.join("\n") + "\n");
 }
