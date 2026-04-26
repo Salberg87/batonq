@@ -59,6 +59,7 @@ import {
   taskBodyPreview,
   type LoopStatus,
 } from "../src/loop-status";
+import type { Alert as AlertType } from "../src/alerts";
 
 // ── schema helpers ────────────────────────────────────────────────────────────
 
@@ -1198,6 +1199,124 @@ describe("LoopStatusFooter rendering", () => {
     );
     expect(emptyBurn.lastFrame() ?? "").not.toContain("burn:");
     emptyBurn.unmount();
+  });
+});
+
+describe("HeaderBar — single-column action-first headline", () => {
+  const baseLoop: LoopStatus = {
+    state: "running",
+    loopPid: 999,
+    currentTask: null,
+    claude: { pid: 5555, uptimeSec: 42 },
+    eventsAgeSec: 3,
+  };
+  const burnHealthy = {
+    bucketStart: 1_000_000_000,
+    bucketAgeMs: 30 * 60_000, // 30m / 5h = 10%
+    bucketRemainingMs: 4 * 60 * 60_000 + 30 * 60_000,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheCreateTokens: 0,
+    cacheReadTokens: 100_000,
+    totalTokens: 100_000,
+    turns: 1,
+    burnRatePerMin: 3_000,
+    syntheticStops: 0,
+  };
+  const burnHot = {
+    ...burnHealthy,
+    bucketAgeMs: 4.6 * 60 * 60_000, // 92% of 5h → red
+  };
+
+  test("renders need-action / warning counts and burn pct", () => {
+    const HeaderBar = require("../src/header-bar").HeaderBar;
+    const alerts: AlertType[] = [
+      { kind: "verify-failed", severity: "red", text: "v failed" },
+      { kind: "stale-claim", severity: "yellow", text: "stale" },
+    ];
+    const { lastFrame, unmount } = render(
+      React.createElement(HeaderBar, {
+        alerts,
+        burn: burnHealthy,
+        loop: baseLoop,
+      }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("batonq");
+    expect(out).toContain("1 need-action");
+    expect(out).toContain("1 warning");
+    expect(out).toContain("30m/5h"); // burn formatted
+    expect(out).toContain("running");
+    unmount();
+  });
+
+  test("zero alerts + healthy burn + running loop → 'all quiet' (still renders zero counts)", () => {
+    const HeaderBar = require("../src/header-bar").HeaderBar;
+    const { lastFrame, unmount } = render(
+      React.createElement(HeaderBar, {
+        alerts: [],
+        burn: burnHealthy,
+        loop: baseLoop,
+      }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("batonq");
+    expect(out).toContain("0 need-action");
+    expect(out).toContain("0 warnings");
+    unmount();
+  });
+
+  test("hot burn + dead loop reflected in cells", () => {
+    const HeaderBar = require("../src/header-bar").HeaderBar;
+    const dead: LoopStatus = {
+      state: "dead",
+      loopPid: null,
+      currentTask: null,
+      claude: null,
+      eventsAgeSec: null,
+    };
+    const { lastFrame, unmount } = render(
+      React.createElement(HeaderBar, {
+        alerts: [],
+        burn: burnHot,
+        loop: dead,
+      }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("dead");
+    expect(out).toMatch(/4h \d+m\/5h/); // hot burn formatted
+    unmount();
+  });
+
+  test("null burn renders em-dash placeholder", () => {
+    const HeaderBar = require("../src/header-bar").HeaderBar;
+    const { lastFrame, unmount } = render(
+      React.createElement(HeaderBar, {
+        alerts: [],
+        burn: null,
+        loop: baseLoop,
+      }),
+    );
+    const out = lastFrame() ?? "";
+    expect(out).toContain("burn —");
+    unmount();
+  });
+});
+
+describe("headerCounts — alert aggregation", () => {
+  test("buckets alerts by severity, ignores gray", () => {
+    const { headerCounts } = require("../src/header-bar");
+    const alerts: AlertType[] = [
+      { kind: "verify-failed", severity: "red", text: "v" },
+      { kind: "judge-failed", severity: "red", text: "j" },
+      { kind: "stale-claim", severity: "yellow", text: "s" },
+      { kind: "empty-queue", severity: "gray", text: "e" }, // not counted
+    ];
+    expect(headerCounts(alerts)).toEqual({ needsHuman: 2, warnings: 1 });
+  });
+  test("empty array → zero counts", () => {
+    const { headerCounts } = require("../src/header-bar");
+    expect(headerCounts([])).toEqual({ needsHuman: 0, warnings: 0 });
   });
 });
 

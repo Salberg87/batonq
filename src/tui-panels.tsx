@@ -141,6 +141,154 @@ function PendingByPriority({ tasks }: { tasks: TaskRow[] }) {
   );
 }
 
+// PendingLane — standalone, borderless rendering of the pending queue for the
+// single-column layout. Same priority grouping as PendingByPriority but with:
+//   - selectable rows (cyan ›/index marker for the focused row)
+//   - section header that doubles as a status line
+//   - drafts mixed in at the top with a 📝 badge so the operator sees them
+//     without having to switch focus to a separate Tasks panel
+//
+// Draft rows render with the same body+repo content as pending so the keybind
+// targets ('e' enrich, 'p' promote) feel applied to a single combined list.
+export function PendingLane({
+  pending,
+  drafts,
+  draftCount,
+  selected,
+  focused,
+  expandedOriginals,
+}: {
+  pending: TaskRow[];
+  drafts: TaskRow[];
+  draftCount: number;
+  selected: number;
+  focused: boolean;
+  expandedOriginals?: Set<string>;
+}): React.ReactElement {
+  // Drafts hoist to top — they block the queue until enriched. Pending is
+  // priority-sorted within itself; drafts keep their upstream order. Dedupe
+  // on external_id so a snapshot race that placed the same task in both
+  // arrays can't trip React's key-collision warning.
+  const grouped = groupByPriority(pending);
+  const seen = new Set<string>();
+  const ordered: TaskRow[] = [];
+  for (const t of [...drafts, ...grouped.H, ...grouped.N, ...grouped.L]) {
+    if (seen.has(t.external_id)) continue;
+    seen.add(t.external_id);
+    ordered.push(t);
+    if (ordered.length >= 10) break;
+  }
+  const headerColor = focused ? C.brand : C.paper;
+  return (
+    <Box flexDirection="column" paddingX={1} marginTop={1}>
+      <Box>
+        <Text bold color={headerColor}>
+          NEXT
+        </Text>
+        <Text color={C.dim}>
+          {" "}
+          · {pending.length} pending · {draftCount} draft
+          {draftCount === 1 ? "" : "s"}
+        </Text>
+      </Box>
+      {ordered.length === 0 ? (
+        <Text color={C.dim}> queue empty</Text>
+      ) : (
+        ordered.map((t, i) => {
+          const isFocusedRow = focused && i === selected;
+          const marker = isFocusedRow ? "›" : " ";
+          const markerColor = isFocusedRow ? "cyan" : C.dim;
+          const isDraft = t.status === "draft";
+          const bucket = priorityBucket(t);
+          const tagColor = isDraft
+            ? C.warn
+            : bucket === "H"
+              ? C.err
+              : bucket === "L"
+                ? C.dim
+                : C.paper;
+          const tag = isDraft ? "📝" : `[${bucket}]`;
+          const hasOriginal =
+            isDraft && !!t.original_body && t.original_body !== t.body;
+          const expanded = expandedOriginals?.has(t.external_id) ?? false;
+          return (
+            <Box key={t.external_id} flexDirection="column">
+              <Box>
+                <Text color={markerColor}>{marker} </Text>
+                <Text color={tagColor} bold={bucket === "H" || isDraft}>
+                  {tag.padEnd(4)}
+                </Text>
+                <Text color={C.dim}> [{t.external_id.slice(0, 8)}] </Text>
+                <Text color={C.paper}>{truncate(t.body, 50)}</Text>
+                <Text color={C.dim}> {truncate(t.repo, 20).trimEnd()}</Text>
+              </Box>
+              {hasOriginal && !expanded && (
+                <Box paddingLeft={6}>
+                  <Text color={C.dim}>
+                    Original: {truncate(t.original_body!, 50)} (o: expand)
+                  </Text>
+                </Box>
+              )}
+              {hasOriginal && expanded && (
+                <Box paddingLeft={6}>
+                  <Text color={C.dim}>Original: {t.original_body} </Text>
+                  <Text color={C.dim}>(o: collapse)</Text>
+                </Box>
+              )}
+            </Box>
+          );
+        })
+      )}
+    </Box>
+  );
+}
+
+// RecentDoneLane — standalone, borderless rendering of last-done with verify/
+// judge badges. Cheat rows (⚠) hoist to top inside the lane so the operator
+// sees them without scrolling.
+export function RecentDoneLane({
+  done,
+  now,
+  focused,
+}: {
+  done: TaskRow[];
+  now: number;
+  focused: boolean;
+}): React.ReactElement {
+  // Hoist cheats to top — keep relative order otherwise.
+  const cheats = done.filter((t) => doneBadge(t) === "⚠");
+  const others = done.filter((t) => doneBadge(t) !== "⚠");
+  const ordered = [...cheats, ...others].slice(0, 6);
+  const headerColor = focused ? C.brand : C.paper;
+  return (
+    <Box flexDirection="column" paddingX={1} marginTop={1}>
+      <Box>
+        <Text bold color={headerColor}>
+          RECENT
+        </Text>
+        <Text color={C.dim}> · {done.length} done</Text>
+      </Box>
+      {ordered.length === 0 ? (
+        <Text color={C.dim}> no recent completions</Text>
+      ) : (
+        ordered.map((t, i) => {
+          const badge = doneBadge(t);
+          const age = t.completed_at ? formatAge(t.completed_at, now) : "?";
+          return (
+            <Box key={`${t.external_id}-${i}`}>
+              <Text> </Text>
+              <DoneBadgeCell badge={badge} />
+              <Text color={C.dim}> [{t.external_id.slice(0, 8)}] </Text>
+              <Text color={C.paper}>{truncate(t.body, 50)}</Text>
+              <Text color={C.dim}> {age.padStart(3)}</Text>
+            </Box>
+          );
+        })
+      )}
+    </Box>
+  );
+}
+
 // Badge colours: ⚠ is red+bold (cheat — operator must investigate), ⊘ is dim
 // (no gates configured), everything else is ok-green (gates ran).
 function DoneBadgeCell({ badge }: { badge: DoneBadge }) {

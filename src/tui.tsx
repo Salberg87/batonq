@@ -27,12 +27,14 @@ import {
 import {
   DEFAULT_DB_PATH,
   DEFAULT_EVENTS_PATH,
+  doneBadge,
   filterClaims,
   filterEvents,
   filterSessions,
   filterTasks,
   loadSnapshot,
   openStateDb,
+  priorityBucket,
   shortPath,
   type ClaimRow,
   type EventRow,
@@ -42,13 +44,14 @@ import {
 } from "./tui-data";
 import {
   C,
-  ClaimsPanel,
   HelpOverlay,
   LiveFeedPanel,
   LoopStatusFooter,
+  PendingLane,
+  RecentDoneLane,
   SessionsPanel,
-  TasksPanel,
 } from "./tui-panels";
+import { HeaderBar } from "./header-bar";
 import { computeAlerts, type Alert } from "./alerts";
 import { AlertLane } from "./alert-lane";
 import { buildDrillDownView, DrillDownOverlay } from "./drill-down";
@@ -88,8 +91,12 @@ import {
   type FeedState,
 } from "./live-feed";
 
-type PanelKey = "sessions" | "tasks" | "claims" | "events";
-const PANELS: PanelKey[] = ["sessions", "tasks", "claims", "events"];
+// The single-column action-first layout has only two interactive lanes:
+// the pending queue (drafts + priority-sorted pending) and the recent-done
+// list (cheats hoisted). Sessions and the live feed are still available
+// but only as overlays — see Mode "sessions-overlay" / "feed-overlay".
+type PanelKey = "pending" | "done";
+const PANELS: PanelKey[] = ["pending", "done"];
 
 type Mode =
   | "normal"
@@ -98,7 +105,9 @@ type Mode =
   | "confirm"
   | "add-task"
   | "questions"
-  | "drill-down";
+  | "drill-down"
+  | "sessions-overlay"
+  | "feed-overlay";
 type ConfirmAction =
   | { kind: "abandon"; task: TaskRow }
   | { kind: "release"; claim: ClaimRow }
@@ -115,6 +124,16 @@ const DEFAULT_TASKS_PATH = `${homedir()}/DEV/TASKS.md`;
 // Default loop-log path used by the Alert lane's watchdog-kill detector.
 // Matches runRestartLoop's output redirect so the two stay in sync.
 const DEFAULT_LOOP_LOG_PATH = "/tmp/batonq-loop.log";
+
+// Focus-scoped footer hints — only show the verbs that actually fire on the
+// focused lane (k9s pattern). Global keys (q / s / l / L / ?) live in the
+// help overlay so the footer stays terse.
+function focusFooterHints(focus: PanelKey): string {
+  if (focus === "pending") {
+    return "j/k nav · ↵ drill · n new · e enrich · p promote · a abandon · / filter · s sessions · l feed · ? help";
+  }
+  return "j/k nav · ↵ drill · a abandon · r release · / filter · s sessions · l feed · ? help";
+}
 
 function useTick(ms: number): { now: number; bump: () => void } {
   const [t, setT] = useState(() => Date.now());
@@ -280,19 +299,15 @@ export function App() {
   const burn = useBurn(now);
   const alerts = useAlerts(now);
 
-  const [focus, setFocus] = useState<PanelKey>("tasks");
+  const [focus, setFocus] = useState<PanelKey>("pending");
   const [selected, setSelected] = useState<Record<PanelKey, number>>({
-    sessions: 0,
-    tasks: 0,
-    claims: 0,
-    events: 0,
+    pending: 0,
+    done: 0,
   });
   const [mode, setMode] = useState<Mode>("normal");
   const [filters, setFilters] = useState<Record<PanelKey, string>>({
-    sessions: "",
-    tasks: "",
-    claims: "",
-    events: "",
+    pending: "",
+    done: "",
   });
   const [filterInput, setFilterInput] = useState("");
   const [flash, setFlash] = useState<{ msg: string; color: string } | null>(
@@ -328,13 +343,37 @@ export function App() {
   const dispatchFeed = (action: FeedAction) =>
     setFeedState((s) => feedReducer(s, action, feedRecords.length));
 
+  // The single-column layout has two interactive lanes:
+  //   pendingLane = drafts (hoisted) + priority-sorted pending
+  //   doneLane    = cheat rows (hoisted) + remaining done
+  //
+  // We compute the ordered arrays here once per tick so j/k navigation, Enter
+  // (drill-down), and the action keys (e/p/o/a) all resolve against the same
+  // index the user sees on screen. PendingLane / RecentDoneLane mirror this
+  // ordering exactly — they're pure presentation now.
   const filtered = useMemo(() => {
     if (!snap) return null;
+    const pendingFiltered = filterTasks(snap.tasks.pending, filters.pending);
+    const draftsFiltered = filterTasks(snap.tasks.drafts, filters.pending);
+    const doneFiltered = filterTasks(snap.tasks.done, filters.done);
+    const groupedPending = (() => {
+      const H = pendingFiltered.filter((t) => priorityBucket(t) === "H");
+      const N = pendingFiltered.filter((t) => priorityBucket(t) === "N");
+      const L = pendingFiltered.filter((t) => priorityBucket(t) === "L");
+      return [...H, ...N, ...L];
+    })();
+    const pendingLane = [...draftsFiltered, ...groupedPending];
+    const cheats = doneFiltered.filter((t) => doneBadge(t) === "⚠");
+    const others = doneFiltered.filter((t) => doneBadge(t) !== "⚠");
+    const doneLane = [...cheats, ...others];
     return {
-      sessions: filterSessions(snap.sessions, filters.sessions),
-      tasks: filterTasks(snap.tasks.latest, filters.tasks),
-      claims: filterClaims(snap.claims, filters.claims),
-      events: filterEvents(snap.events, filters.events),
+      pending: pendingLane,
+      drafts: draftsFiltered,
+      pendingOnly: pendingFiltered,
+      done: doneLane,
+      sessions: filterSessions(snap.sessions, ""),
+      claims: filterClaims(snap.claims, ""),
+      events: filterEvents(snap.events, ""),
     };
   }, [snap, filters]);
 
@@ -407,6 +446,23 @@ export function App() {
       });
   }
 
+  // Row currently under the cursor in the focused lane.
+  function selectedTask(): TaskRow | null {
+    if (!filtered) return null;
+    if (focus === "pending") return filtered.pending[selected.pending] ?? null;
+    return filtered.done[selected.done] ?? null;
+  }
+
+  // Claim attached to the actively running task. The single-column layout
+  // no longer has a Claims panel — `r` (release) targets the running task's
+  // claim instead. Returns null when the queue is idle.
+  function activeClaim(): ClaimRow | null {
+    if (!snap) return null;
+    const task = snap.tasks.claimed[0];
+    if (!task) return null;
+    return findClaimForTask(task, snap.claims);
+  }
+
   useInput((input, key) => {
     if (mode === "help") {
       setMode("normal");
@@ -414,6 +470,35 @@ export function App() {
     }
     if (mode === "add-task" || mode === "questions" || mode === "drill-down") {
       // Keys in these modes are handled by the embedded form/overlay.
+      return;
+    }
+    if (mode === "sessions-overlay") {
+      if (key.escape || input === "q" || input === "s") setMode("normal");
+      return;
+    }
+    if (mode === "feed-overlay") {
+      if (key.escape || input === "q" || input === "l") {
+        setMode("normal");
+        return;
+      }
+      // Inside the feed overlay arrows + F + End drive the feed reducer
+      // directly — no panel focus to worry about.
+      if (input === "F") {
+        dispatchFeed({ kind: "toggle-pause" });
+        return;
+      }
+      if (input === "k" || key.upArrow) {
+        dispatchFeed({ kind: "scroll-up" });
+        return;
+      }
+      if (input === "j" || key.downArrow) {
+        dispatchFeed({ kind: "scroll-down" });
+        return;
+      }
+      if ((key as any).end || input === "[F" || input === "[4~") {
+        dispatchFeed({ kind: "end" });
+        return;
+      }
       return;
     }
     if (mode === "filter") {
@@ -462,7 +547,15 @@ export function App() {
       setMode("help");
       return;
     }
-    // §5 keybind: `A` jumps to the first alert with an externalId and opens
+    if (input === "s") {
+      setMode("sessions-overlay");
+      return;
+    }
+    if (input === "l") {
+      setMode("feed-overlay");
+      return;
+    }
+    // `A` jumps to the first alert with an externalId and opens
     // the drill-down on its task. The Alert lane itself isn't focusable, so
     // rather than introduce a fifth panel focus just for this we short-circuit
     // straight to the modal — it's what the operator actually wants (see why
@@ -483,60 +576,27 @@ export function App() {
       return;
     }
     if (input === "j" || key.downArrow) {
-      // While the Live feed is focused, ↓ scrolls the feed forward (toward
-      // the tail). If we're at the bottom and not paused, this is a no-op —
-      // feedReducer ignores scroll-down unless already paused, matching the
-      // "arrow pauses, End resumes" contract.
-      if (focus === "events") {
-        dispatchFeed({ kind: "scroll-down" });
-        return;
-      }
+      const max =
+        focus === "pending"
+          ? (filtered?.pending.length ?? 0)
+          : (filtered?.done.length ?? 0);
       setSelected((s) => ({
         ...s,
-        [focus]: Math.min(
-          s[focus] + 1,
-          Math.max(0, maxIndex(focus, filtered) - 1),
-        ),
+        [focus]: Math.min(s[focus] + 1, Math.max(0, max - 1)),
       }));
       return;
     }
     if (input === "k" || key.upArrow) {
-      // Live-feed focus: ↑ scrolls back and auto-pauses auto-scroll (§4).
-      // The scroll-back puts a ⏸ marker above the feed; 'End' resumes.
-      if (focus === "events") {
-        dispatchFeed({ kind: "scroll-up" });
-        return;
-      }
       setSelected((s) => ({ ...s, [focus]: Math.max(0, s[focus] - 1) }));
       return;
     }
-    // 'End' / F work regardless of focus so the operator can resume or pause
-    // the feed without first Tab-cycling to it.
-    if (key.escape && focus === "events" && feedState.paused) {
-      // Bonus: Esc resumes when the feed is paused and focused. Keeps Esc's
-      // "back out" semantic consistent (matches Drill-down's Esc → close).
-      dispatchFeed({ kind: "end" });
-      return;
-    }
-    if (input === "F") {
-      dispatchFeed({ kind: "toggle-pause" });
-      return;
-    }
-    // ink's `useInput` surfaces the End key via the synthetic `key.end` flag
-    // on newer versions; we guard for both name shapes to stay robust.
-    if ((key as any).end || input === "[F" || input === "[4~") {
-      dispatchFeed({ kind: "end" });
-      return;
-    }
     if (key.return) {
-      // Enter on a Tasks-panel row opens the drill-down overlay (§5 of
-      // docs/tui-ux-v2.md). Other panels ignore Enter for now.
-      if (focus === "tasks") {
-        const t = filtered?.tasks[selected.tasks];
-        if (t) {
-          setDrillDownEid(t.external_id);
-          setMode("drill-down");
-        }
+      // Enter opens the drill-down overlay on the currently selected row in
+      // either lane. For done rows this is the cheat-investigation entry.
+      const t = selectedTask();
+      if (t) {
+        setDrillDownEid(t.external_id);
+        setMode("drill-down");
       }
       return;
     }
@@ -551,11 +611,7 @@ export function App() {
       return;
     }
     if (input === "a") {
-      if (focus !== "tasks") {
-        setFlash({ msg: "'a' only works on Tasks panel", color: C.warn });
-        return;
-      }
-      const t = filtered?.tasks[selected.tasks];
+      const t = selectedTask();
       if (!t) {
         setFlash({ msg: "no task selected", color: C.warn });
         return;
@@ -569,13 +625,11 @@ export function App() {
       return;
     }
     if (input === "r") {
-      if (focus !== "claims") {
-        setFlash({ msg: "'r' only works on Claims panel", color: C.warn });
-        return;
-      }
-      const c = filtered?.claims[selected.claims];
+      // 'r' releases the currently-running task's claim — the single-column
+      // layout has no separate Claims panel.
+      const c = activeClaim();
       if (!c) {
-        setFlash({ msg: "no claim selected", color: C.warn });
+        setFlash({ msg: "no active claim to release", color: C.warn });
         return;
       }
       setConfirm({ kind: "release", claim: c });
@@ -583,12 +637,11 @@ export function App() {
       return;
     }
     if (input === "e") {
-      // 'e'/_enrich keybind: enrich selected draft via `batonq enrich <id>`.
-      if (focus !== "tasks") {
-        setFlash({ msg: "'e' only works on Tasks panel", color: C.warn });
+      if (focus !== "pending") {
+        setFlash({ msg: "'e' only works on the NEXT lane", color: C.warn });
         return;
       }
-      const t = filtered?.tasks[selected.tasks];
+      const t = selectedTask();
       if (!t) {
         setFlash({ msg: "no task selected", color: C.warn });
         return;
@@ -597,12 +650,11 @@ export function App() {
       return;
     }
     if (input === "p") {
-      // 'p'/_promote keybind: flip selected draft → pending (pick will see it).
-      if (focus !== "tasks") {
-        setFlash({ msg: "'p' only works on Tasks panel", color: C.warn });
+      if (focus !== "pending") {
+        setFlash({ msg: "'p' only works on the NEXT lane", color: C.warn });
         return;
       }
-      const t = filtered?.tasks[selected.tasks];
+      const t = selectedTask();
       if (!t) {
         setFlash({ msg: "no task selected", color: C.warn });
         return;
@@ -621,11 +673,11 @@ export function App() {
       return;
     }
     if (input === "o") {
-      if (focus !== "tasks") return;
-      const t = filtered?.tasks[selected.tasks];
+      if (focus !== "pending") return;
+      const t = selectedTask();
       if (!t || t.status !== "draft" || !t.original_body) {
         setFlash({
-          msg: "no enriched draft selected (o reveals the user's original body)",
+          msg: "no enriched draft selected (o reveals the original body)",
           color: C.warn,
         });
         return;
@@ -651,65 +703,25 @@ export function App() {
 
   return (
     <Box flexDirection="column">
-      <Box paddingX={1} flexDirection="column">
-        <Logo />
-      </Box>
+      <HeaderBar alerts={alerts} burn={burn} loop={loopStatus} />
       <AlertLane alerts={alerts} />
-      <Box paddingX={1}>
-        <Text color={C.dim}>tui · refresh {REFRESH_MS / 1000}s · </Text>
-        <Text color={C.paper}>focus: </Text>
-        <Text color={C.brand} bold>
-          {focus}
-        </Text>
-        <Text color={C.dim}> (? for help)</Text>
-      </Box>
-
-      <Box flexDirection="row">
-        <Box flexDirection="column" flexGrow={1}>
-          <SessionsPanel
-            rows={filtered.sessions}
-            selected={selected.sessions}
-            focused={focus === "sessions"}
-            now={now}
-          />
-          {renderCurrentTaskArea(
-            snap,
-            filtered.claims,
-            now,
-            focus === "claims",
-          )}
-        </Box>
-        <Box flexDirection="column" flexGrow={1}>
-          {/* §3: TasksPanel gets pending + done so it can render the
-              priority-grouped pending list ([H]/[N]/[L]) and the recent-done
-              rows with verify/judge badges (✓V ✓J / ✓V — / ⊘ / ⚠). The ⚠ cheat
-              badge fires when verify_cmd is set but verify_ran_at is null —
-              same signal the alert lane uses, surfaced inline here. */}
-          <TasksPanel
-            latest={filtered.tasks}
-            counts={snap.tasks.counts}
-            selected={selected.tasks}
-            focused={focus === "tasks"}
-            expandedOriginals={expandedOriginals}
-            pending={snap.tasks.pending}
-            done={snap.tasks.done}
-            now={now}
-          />
-          {/* §4: Live feed replaces the old EventsPanel. The focus key
-              stays "events" to preserve Tab-cycling (sessions→tasks→claims
-              →feed) and the selected/filter records. */}
-          <LiveFeedPanel
-            records={feedRecords}
-            state={feedState}
-            focused={focus === "events"}
-          />
-        </Box>
-      </Box>
-
-      <Box paddingX={1}>
+      {renderCurrentTaskArea(snap, snap.claims, now, false)}
+      <PendingLane
+        pending={filtered.pendingOnly}
+        drafts={filtered.drafts}
+        draftCount={snap.tasks.counts.drafts}
+        selected={selected.pending}
+        focused={focus === "pending"}
+        expandedOriginals={expandedOriginals}
+      />
+      <RecentDoneLane
+        done={filtered.done}
+        now={now}
+        focused={focus === "done"}
+      />
+      <Box paddingX={1} marginTop={1}>
         <LoopStatusFooter status={loopStatus} burn={burn} />
       </Box>
-
       <Box paddingX={1} flexDirection="column">
         {filters[focus] && (
           <Text color={C.dim}>
@@ -734,16 +746,12 @@ export function App() {
         {flash && <Text color={flash.color}>{flash.msg}</Text>}
         {enrichingEid && !flash && (
           <Text color={C.brand}>
-            → enriching {enrichingEid.slice(0, 8)} (claude --model opus,
-            streaming)…
+            enriching {enrichingEid.slice(0, 8)} (claude --model opus,
+            streaming)
           </Text>
         )}
         {mode === "normal" && !flash && !enrichingEid && (
-          <Text color={C.dim}>
-            q quit · Tab focus · j/k nav · / filter · n new · e enrich · p
-            promote · o original · a abandon · r release · L restart loop · F
-            pause feed · End resume · ? help
-          </Text>
+          <Text color={C.dim}>{focusFooterHints(focus)}</Text>
         )}
       </Box>
 
@@ -839,6 +847,33 @@ export function App() {
       {mode === "help" && (
         <Box marginTop={1}>
           <HelpOverlay />
+        </Box>
+      )}
+
+      {/* Sessions overlay — shown only on demand via 's'. The single-column
+          layout demoted Sessions out of the main view; this is the on-ramp
+          back to it (debugging stuck sessions, claim-holder cwds, etc.). */}
+      {mode === "sessions-overlay" && (
+        <Box marginTop={1} flexDirection="column">
+          <SessionsPanel
+            rows={filtered.sessions}
+            selected={0}
+            focused
+            now={now}
+          />
+          <Text color={C.dim}> Esc / s / q to close</Text>
+        </Box>
+      )}
+
+      {/* Live-feed overlay — shown only on demand via 'l'. Same data as the
+          old always-on panel, but only when the operator asks for it. */}
+      {mode === "feed-overlay" && (
+        <Box marginTop={1} flexDirection="column">
+          <LiveFeedPanel records={feedRecords} state={feedState} focused />
+          <Text color={C.dim}>
+            {" "}
+            Esc / l / q to close · F pause · End resume
+          </Text>
         </Box>
       )}
 
@@ -1280,25 +1315,6 @@ export function AddTaskForm({
       </Text>
     </Box>
   );
-}
-
-function maxIndex(
-  focus: PanelKey,
-  filtered: {
-    sessions: SessionRow[];
-    tasks: TaskRow[];
-    claims: ClaimRow[];
-    events: EventRow[];
-  } | null,
-): number {
-  if (!filtered) return 1;
-  const lens: Record<PanelKey, number> = {
-    sessions: filtered.sessions.length,
-    tasks: filtered.tasks.length,
-    claims: filtered.claims.length,
-    events: filtered.events.length,
-  };
-  return Math.max(1, lens[focus]);
 }
 
 export function runAbandon(
