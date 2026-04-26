@@ -1091,30 +1091,30 @@ describe("LoopStatusFooter rendering", () => {
     eventsAgeSec: 3,
   };
 
-  test("renders all four fields: state, task, claude pid+uptime, events age", () => {
+  test("renders claude-p pid+uptime, events age, and restart hint", () => {
+    // Loop state + currentTask body are now carried by HeaderBar +
+    // CurrentTaskCard, so the footer no longer repeats them.
     const { lastFrame, unmount } = render(
       React.createElement(LoopStatusFooter, { status: base }),
     );
     const out = lastFrame() ?? "";
-    expect(out).toContain("Loop");
-    expect(out).toContain("running");
-    expect(out).toContain("pid 999");
-    expect(out).toContain("abcdef12"); // short external_id
-    expect(out).toContain("TUI live loop-status"); // first chars of body
     expect(out).toContain("pid 5555 running 42s");
     expect(out).toContain("3s ago");
     expect(out).toContain("L");
+    // Loop state cell is gone — should NOT appear here anymore.
+    expect(out).not.toContain("Loop ·");
     unmount();
   });
 
   test("idle state shown when loop pid present but no claude-p", () => {
+    // Loop state itself is no longer in the footer; the absence-of-claude
+    // marker stays.
     const { lastFrame, unmount } = render(
       React.createElement(LoopStatusFooter, {
         status: { ...base, state: "idle", claude: null },
       }),
     );
     const out = lastFrame() ?? "";
-    expect(out).toContain("idle");
     expect(out).toContain("no claude -p");
     unmount();
   });
@@ -1132,8 +1132,6 @@ describe("LoopStatusFooter rendering", () => {
       }),
     );
     const out = lastFrame() ?? "";
-    expect(out).toContain("dead");
-    expect(out).toContain("— (idle)");
     expect(out).toContain("no claude -p");
     expect(out).toContain("no events.jsonl");
     unmount();

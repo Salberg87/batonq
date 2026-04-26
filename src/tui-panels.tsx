@@ -22,8 +22,6 @@ import {
 import {
   eventsAgeColor,
   formatEventsAge,
-  loopStateGlyph,
-  taskBodyPreview,
   type LoopStatus,
 } from "./loop-status";
 import type { FeedRecord, FeedSource, FeedState } from "./live-feed";
@@ -246,6 +244,13 @@ export function PendingLane({
 // RecentDoneLane — standalone, borderless rendering of last-done with verify/
 // judge badges. Cheat rows (⚠) hoist to top inside the lane so the operator
 // sees them without scrolling.
+//
+// Window: only completions with `completed_at` within RECENT_WINDOW_MS show
+// up. Pre-gate-enforcement legacy rows (verify_cmd set, verify_ran_at null,
+// completed_at null) would otherwise dominate the lane forever — they're
+// historical, not actionable.
+export const RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 export function RecentDoneLane({
   done,
   now,
@@ -255,9 +260,15 @@ export function RecentDoneLane({
   now: number;
   focused: boolean;
 }): React.ReactElement {
+  const windowStart = now - RECENT_WINDOW_MS;
+  const recent = done.filter((t) => {
+    if (!t.completed_at) return false;
+    const ts = Date.parse(t.completed_at);
+    return Number.isFinite(ts) && ts >= windowStart;
+  });
   // Hoist cheats to top — keep relative order otherwise.
-  const cheats = done.filter((t) => doneBadge(t) === "⚠");
-  const others = done.filter((t) => doneBadge(t) !== "⚠");
+  const cheats = recent.filter((t) => doneBadge(t) === "⚠");
+  const others = recent.filter((t) => doneBadge(t) !== "⚠");
   const ordered = [...cheats, ...others].slice(0, 6);
   const headerColor = focused ? C.brand : C.paper;
   return (
@@ -266,10 +277,10 @@ export function RecentDoneLane({
         <Text bold color={headerColor}>
           RECENT
         </Text>
-        <Text color={C.dim}> · {done.length} done</Text>
+        <Text color={C.dim}> · {recent.length} done · last 24h</Text>
       </Box>
       {ordered.length === 0 ? (
-        <Text color={C.dim}> no recent completions</Text>
+        <Text color={C.dim}> no completions in last 24h</Text>
       ) : (
         ordered.map((t, i) => {
           const badge = doneBadge(t);
@@ -593,15 +604,11 @@ export function LoopStatusFooter({
   status: LoopStatus;
   burn?: BurnSummary | null;
 }) {
-  const stateColor =
-    status.state === "running"
-      ? C.ok
-      : status.state === "idle"
-        ? C.warn
-        : C.err;
-  const taskText = status.currentTask
-    ? `${status.currentTask.externalId.slice(0, 8)} · ${taskBodyPreview(status.currentTask.body, 50)}`
-    : "— (idle)";
+  // The HeaderBar now carries loop state ("loop ◉ running") and the
+  // CurrentTaskCard above shows the running task body — so this footer
+  // omits both to avoid duplicate signal. What stays: claude-p pid +
+  // uptime, events-jsonl staleness, burn bucket. All three are
+  // operational specifics no other surface shows.
   const claudeText = status.claude
     ? `pid ${status.claude.pid} running ${status.claude.uptimeSec}s`
     : "— (no claude -p)";
@@ -614,19 +621,6 @@ export function LoopStatusFooter({
 
   return (
     <Box flexDirection="column">
-      <Box>
-        <Text color={C.brand} bold>
-          Loop
-        </Text>
-        <Text color={C.dim}> · </Text>
-        <Text color={stateColor}>{loopStateGlyph(status.state)}</Text>
-        {status.loopPid !== null && (
-          <Text color={C.dim}> (pid {status.loopPid})</Text>
-        )}
-        <Text color={C.dim}> · </Text>
-        <Text color={C.paper}>task: </Text>
-        <Text color={C.brand}>{taskText}</Text>
-      </Box>
       <Box>
         <Text color={C.paper}>claude: </Text>
         <Text color={C.brand}>{claudeText}</Text>

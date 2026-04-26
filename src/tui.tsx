@@ -705,7 +705,7 @@ export function App() {
     <Box flexDirection="column">
       <HeaderBar alerts={alerts} burn={burn} loop={loopStatus} />
       <AlertLane alerts={alerts} />
-      {renderCurrentTaskArea(snap, snap.claims, now, false)}
+      {renderCurrentTaskArea(snap, snap.claims, now, false, alerts)}
       <PendingLane
         pending={filtered.pendingOnly}
         drafts={filtered.drafts}
@@ -993,9 +993,15 @@ function renderCurrentTaskArea(
   claims: ClaimRow[],
   now: number,
   focused: boolean,
-): React.ReactElement {
+  alerts: Alert[] = [],
+): React.ReactElement | null {
   const task = snap.tasks.claimed[0] ?? null;
   if (!task) {
+    // Suppress the IdleBanner when the empty-queue alert is firing — the
+    // alert is more specific ("queue empty for 143m"), and rendering both
+    // states the same fact twice. Header counts already convey the rest.
+    const hasEmptyQueueAlert = alerts.some((a) => a.kind === "empty-queue");
+    if (hasEmptyQueueAlert) return null;
     return <IdleBanner pendingCount={snap.tasks.counts.pending} />;
   }
   // Pair the task with a claim — tasks.claimed_by encodes a PPID
