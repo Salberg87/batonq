@@ -233,35 +233,82 @@ describe("applySkillToPrompt — shared prepend separator", () => {
   });
 });
 
-describe("runner injection — claude uses --append-system-prompt-file", () => {
-  test("buildClaudeArgs adds the file flag with the cached path", () => {
+describe("runner injection — claude reads SKILL.md into --append-system-prompt", () => {
+  // 2026-04-28: claude CLI rejects --append-system-prompt and
+  // --append-system-prompt-file used together. The runner now reads the
+  // SKILL.md content and prepends it to the systemPrompt string so a
+  // single flag carries everything. The dual-flag form is gone.
+
+  test("buildClaudeArgs reads skill file and inlines it into --append-system-prompt", () => {
+    const dir = track(makeTmpCache());
+    const skillPath = `${dir}/worker/SKILL.md`;
+    require("node:fs").mkdirSync(`${dir}/worker`, { recursive: true });
+    require("node:fs").writeFileSync(skillPath, "# worker\nrules");
     const args = buildClaudeArgs(
       { prompt: "task body", cwd: "/tmp" },
       undefined,
-      "/tmp/cache/worker/SKILL.md",
+      skillPath,
     );
-    const idx = args.indexOf("--append-system-prompt-file");
+    expect(args).not.toContain("--append-system-prompt-file");
+    const idx = args.indexOf("--append-system-prompt");
     expect(idx).toBeGreaterThanOrEqual(0);
-    expect(args[idx + 1]).toBe("/tmp/cache/worker/SKILL.md");
+    expect(args[idx + 1]).toContain("# worker");
+    expect(args[idx + 1]).toContain("rules");
   });
 
-  test("no skillPath → no --append-system-prompt-file flag", () => {
+  test("buildClaudeArgs concatenates skill BEFORE caller systemPrompt with separator", () => {
+    const dir = track(makeTmpCache());
+    const skillPath = `${dir}/judge/SKILL.md`;
+    require("node:fs").mkdirSync(`${dir}/judge`, { recursive: true });
+    require("node:fs").writeFileSync(skillPath, "JUDGE_ROLE");
+    const args = buildClaudeArgs(
+      { prompt: "p", cwd: "/tmp", systemPrompt: "PICK_NEXT_BODY" },
+      undefined,
+      skillPath,
+    );
+    const idx = args.indexOf("--append-system-prompt");
+    const combined = args[idx + 1]!;
+    expect(combined.indexOf("JUDGE_ROLE")).toBeLessThan(
+      combined.indexOf("PICK_NEXT_BODY"),
+    );
+    expect(combined).toContain("---");
+  });
+
+  test("no skillPath, no systemPrompt → no --append-system-prompt flag", () => {
     const args = buildClaudeArgs(
       { prompt: "task body", cwd: "/tmp" },
       undefined,
     );
+    expect(args).not.toContain("--append-system-prompt");
     expect(args).not.toContain("--append-system-prompt-file");
   });
 
-  test("analyze mode does NOT inject the role skill flag", () => {
-    // claude --print ignores --append-system-prompt[-file]; surfacing the
-    // flag in analyze mode would mislead callers about its effect.
+  test("systemPrompt only (no skillPath) still works", () => {
     const args = buildClaudeArgs(
-      { prompt: "explain this", cwd: "/tmp", mode: "analyze" },
+      { prompt: "p", cwd: "/tmp", systemPrompt: "BARE_PROMPT" },
       undefined,
-      "/tmp/cache/worker/SKILL.md",
+    );
+    const idx = args.indexOf("--append-system-prompt");
+    expect(args[idx + 1]).toBe("BARE_PROMPT");
+  });
+
+  test("analyze mode does NOT inject either flag", () => {
+    const dir = track(makeTmpCache());
+    const skillPath = `${dir}/worker/SKILL.md`;
+    require("node:fs").mkdirSync(`${dir}/worker`, { recursive: true });
+    require("node:fs").writeFileSync(skillPath, "# worker");
+    const args = buildClaudeArgs(
+      {
+        prompt: "explain this",
+        cwd: "/tmp",
+        mode: "analyze",
+        systemPrompt: "would-be-system",
+      },
+      undefined,
+      skillPath,
     );
     expect(args).not.toContain("--append-system-prompt-file");
+    expect(args).not.toContain("--append-system-prompt");
   });
 });
 
@@ -350,7 +397,11 @@ describe("runner injection covers every implemented role", () => {
         undefined,
         skill!.path,
       );
-      expect(cArgs).toContain("--append-system-prompt-file");
+      // 2026-04-28: claude reads SKILL.md content into a single
+      // --append-system-prompt; the file-based flag is gone.
+      const idx = cArgs.indexOf("--append-system-prompt");
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(cArgs[idx + 1]).toContain(`# ${role}`);
       const xArgs = buildCodexArgs(
         { prompt: "p", cwd: "/tmp", role },
         undefined,
