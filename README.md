@@ -469,6 +469,23 @@ of unix verbs around those three files.
 For mermaid-rendered component, state, claim-write-path, and data-flow
 diagrams (with prose), see [`docs/architecture.md`](./docs/architecture.md).
 
+## Configuration
+
+The `batonq-loop` runner reads four env vars to tune dispatch behaviour:
+
+| Var                       | Default | Controls                                                                   |
+| ------------------------- | ------- | -------------------------------------------------------------------------- |
+| `BATONQ_LOOP_TIMEOUT`     | `20m`   | Wall-clock timeout for each agent dispatch (passed to `gtimeout`).         |
+| `BATONQ_BURN_PCT_LIMIT`   | `85`    | Skip pick when the 5h Claude bucket is ≥ N% full. Set to `100` to disable. |
+| `BATONQ_BURN_BACKOFF_SEC` | `600`   | Seconds to sleep when the burn gate skips a pick.                          |
+| `BATONQ_MAX_ATTEMPTS`     | `3`     | Retry-with-wip-context cap before a thrashing task is truly abandoned.     |
+
+**Tuning.** Lower `BATONQ_LOOP_TIMEOUT` for small focused tasks so a stuck
+agent gets killed faster; raise it for larger refactors that legitimately need
+30+ minutes to converge. Lower `BATONQ_MAX_ATTEMPTS` to fail fast and surface
+broken specs instead of burning the queue on retries; raise it for tasks where
+convergence over thrash matters (flaky environments, long judge loops).
+
 ## Ship status
 
 Ship-readiness is not a vibe. `docs/ship-criteria.md` lists every
