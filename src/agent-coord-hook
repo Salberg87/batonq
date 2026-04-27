@@ -284,16 +284,16 @@ async function main() {
             // ── Tool-event audit (runs BEFORE verify_cmd so a no-edit cheat
             // is caught even when verify_cmd happens to pass for unrelated
             // reasons — e.g. a verify that only checks git state when a peer
-            // loop made the matching commit). Returns -1 on un-runnable
-            // audits (no claimed_at, unreadable log) → fail open per hook
-            // discipline. Read-only sessions (the agent never called
-            // Edit/Write/MultiEdit since claim) come back as 0 → deny.
-            const editCount = countMutatingEventsSinceClaim(
+            // loop made the matching commit). Unrunnable audits (no
+            // claimed_at, unreadable log) fail open per hook discipline.
+            // Read-only sessions (the agent never called Edit/Write/MultiEdit
+            // since claim) come back as `{ kind: "ok", count: 0 }` → deny.
+            const audit = countMutatingEventsSinceClaim(
               LOG_PATH,
               session,
               row.claimed_at,
             );
-            if (editCount === 0) {
+            if (audit.kind === "ok" && audit.count === 0) {
               emitDeny(
                 `verify-gate: no edits since claim — agent did not actually do the work ` +
                   `(task ${row.external_id.slice(0, 8)}, session ${session.slice(0, 8)}, ` +

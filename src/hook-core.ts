@@ -10,6 +10,10 @@ export const MUTATING_TOOLS = ["Edit", "Write", "MultiEdit"] as const;
 
 export const MAX_HASH_BYTES = 1_048_576;
 
+export type AuditResult =
+  | { kind: "ok"; count: number }
+  | { kind: "unrunnable"; reason: string };
+
 // Quote-aware: the `(?<!["'][^"']*)` lookbehind prevents false positives on
 // destructive tokens inside quoted strings (e.g. `echo "rm -rf" > note.md`
 // shouldn't trip the hook — the `rm` there is data, not a command).
@@ -56,10 +60,10 @@ export function extractDoneEid(cmd: string): string | null {
 
 // Tool-event audit for the verify-gate. Reads the measurement log and counts
 // mutating tool events (Edit | Write | MultiEdit) emitted by `sessionId` at or
-// after `claimedAtIso`. A return of 0 means the agent claimed a task and then
-// called `batonq done` without ever attempting an edit — the canonical
-// "no-work cheat". Returns -1 when the audit can't run reliably (missing log,
-// unparsable claim timestamp, fs error) so callers can fail-open.
+// after `claimedAtIso`. `{ kind: "ok", count: 0 }` means the agent claimed a
+// task and then called `batonq done` without ever attempting an edit — the
+// canonical "no-work cheat". `{ kind: "unrunnable" }` means the audit can't
+// run reliably, so callers should fail open.
 //
 // Counting only `phase === "pre"` avoids double-counting a single edit (which
 // emits both pre and post). `pre` is more reliable than `post` because the
@@ -68,11 +72,13 @@ export function countMutatingEventsSinceClaim(
   logPath: string,
   sessionId: string,
   claimedAtIso: string | null | undefined,
-): number {
-  if (!claimedAtIso) return -1;
+): AuditResult {
+  if (!claimedAtIso) return { kind: "unrunnable", reason: "missing_claimed_at" };
   const claimMs = Date.parse(claimedAtIso);
-  if (Number.isNaN(claimMs)) return -1;
-  if (!existsSync(logPath)) return 0;
+  if (Number.isNaN(claimMs)) {
+    return { kind: "unrunnable", reason: "invalid_claimed_at" };
+  }
+  if (!existsSync(logPath)) return { kind: "ok", count: 0 };
   let count = 0;
   try {
     const content = readFileSync(logPath, "utf8");
@@ -92,9 +98,9 @@ export function countMutatingEventsSinceClaim(
       count++;
     }
   } catch {
-    return -1;
+    return { kind: "unrunnable", reason: "read_failed" };
   }
-  return count;
+  return { kind: "ok", count };
 }
 
 export function extractBashPaths(cmd: string, cwd: string): string[] {

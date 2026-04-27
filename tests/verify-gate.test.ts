@@ -454,6 +454,24 @@ describe("verify-gate (PreToolUse hook integration)", () => {
     );
   });
 
+  test("audit fails open when claimed_at is unparsable", () => {
+    const eid = "6666666666666666";
+    seedTask({
+      fakeHome: fx.fakeHome,
+      externalId: eid,
+      verifyCmd: "true",
+      claimedAt: "not-a-date",
+    });
+    const r = driveHook({
+      cmd: `batonq done ${eid}`,
+      cwd: fx.cwd,
+      fakeHome: fx.fakeHome,
+      sessionId: "bad-claim-ts-session",
+    });
+    expect(r.deny).toBeUndefined();
+    expect(r.status).toBe(0);
+  });
+
   test("fails open when task row is missing (don't break agents on bad eid)", () => {
     // No seedTask call — the eid the agent passes doesn't exist.
     const r = driveHook({

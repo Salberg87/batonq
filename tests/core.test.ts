@@ -55,6 +55,7 @@ import {
 import { AGENTS, parseTaskInput, TaskSchema } from "../src/task-schema";
 import { IMPLEMENTED_TOOLS } from "../src/agent-runners/types";
 import {
+  countMutatingEventsSinceClaim,
   DESTRUCTIVE,
   MAX_HASH_BYTES,
   extractBashPaths,
@@ -835,6 +836,66 @@ describe("hashFile", () => {
     expect(aHash).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(bHash).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(aHash).not.toBe(bHash);
+  });
+});
+
+// ── 10b. countMutatingEventsSinceClaim: discriminated audit result ───────────
+
+describe("countMutatingEventsSinceClaim", () => {
+  test("returns `{ kind: 'ok', count }` for matching mutating events since claim", () => {
+    const logPath = join(workdir, "events.jsonl");
+    writeFileSync(
+      logPath,
+      [
+        {
+          ts: "2026-04-26T00:10:00.000Z",
+          phase: "pre",
+          session: "sess-a",
+          tool: "Edit",
+        },
+        {
+          ts: "2026-04-26T00:11:00.000Z",
+          phase: "post",
+          session: "sess-a",
+          tool: "Write",
+        },
+        {
+          ts: "2026-04-26T00:12:00.000Z",
+          phase: "pre",
+          session: "sess-a",
+          tool: "Write",
+        },
+        {
+          ts: "2026-04-26T00:13:00.000Z",
+          phase: "pre",
+          session: "sess-b",
+          tool: "MultiEdit",
+        },
+      ]
+        .map((line) => JSON.stringify(line))
+        .join("\n") + "\n",
+    );
+
+    expect(
+      countMutatingEventsSinceClaim(
+        logPath,
+        "sess-a",
+        "2026-04-26T00:00:00.000Z",
+      ),
+    ).toEqual({ kind: "ok", count: 2 });
+  });
+
+  test("returns `{ kind: 'unrunnable' }` when claim timestamp is missing or invalid", () => {
+    expect(countMutatingEventsSinceClaim("/tmp/nope", "sess-a", null)).toEqual({
+      kind: "unrunnable",
+      reason: "missing_claimed_at",
+    });
+    expect(
+      countMutatingEventsSinceClaim("/tmp/nope", "sess-a", "not-a-date"),
+    ).toEqual({
+      kind: "unrunnable",
+      reason: "invalid_claimed_at",
+    });
   });
 });
 
