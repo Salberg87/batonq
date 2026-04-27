@@ -114,20 +114,34 @@ if ! git checkout "$ACTIVE_BRANCH" >/dev/null 2>&1; then
   exit 0
 fi
 
-# Active branch is clean again. Abandon the task so the queue progresses.
+# Active branch is clean again. Mark the task needs-retry (or true-abandon
+# if the per-task attempt cap is reached — batonq decides) so the next pick
+# carries the wip context forward instead of starting from scratch.
 # Find batonq on PATH (installer drops it at ~/.local/bin or ~/bin).
 BATONQ_BIN="$(command -v batonq 2>/dev/null || echo "")"
 if [ -z "$BATONQ_BIN" ]; then
-  echo "[pre-die] batonq not on PATH; cannot abandon ${EID} — task will linger as 'claimed' until watchdog sweep" >&2
+  echo "[pre-die] batonq not on PATH; cannot mark-needs-retry ${EID} — task will linger as 'claimed' until watchdog sweep" >&2
   exit 0
 fi
 
-# Pre-die abandon: re-queue the task so another runner gets a fresh shot.
-# Stderr captured so the loop log shows the reason if abandon errors out.
-if ! "$BATONQ_BIN" abandon "$EID" >/dev/null 2>&1; then
-  echo "[pre-die] batonq abandon ${EID} failed; task may be stuck in 'claimed' state" >&2
-  exit 0
+# Phase 1.5: mark-needs-retry preserves the claim/attempt history and
+# stores the wip branch + failure reason for the next pick. Past
+# BATONQ_MAX_ATTEMPTS (default 3) batonq itself flips to true abandon.
+# Reason string includes the exit code + a human label for grep-ability
+# in the loop log (143 = SIGTERM = gtimeout fired; 124 = gtimeout's own
+# exit code; 0 = clean exit but no done call).
+REASON="exit ${EXIT_CODE}"
+case "$EXIT_CODE" in
+  124) REASON="exit 124 (gtimeout fired)" ;;
+  143) REASON="exit 143 (SIGTERM, likely gtimeout)" ;;
+  137) REASON="exit 137 (SIGKILL, watchdog or OOM)" ;;
+  0)   REASON="exit 0 (worker exited without calling \`batonq done\`)" ;;
+esac
+
+if ! "$BATONQ_BIN" mark-needs-retry "$EID" "$WIP_BRANCH" "$REASON" >/dev/null 2>&1; then
+  echo "[pre-die] batonq mark-needs-retry ${EID} failed; falling back to abandon" >&2
+  "$BATONQ_BIN" abandon "$EID" >/dev/null 2>&1 || true
 fi
 
-echo "[pre-die] ${EID}: work saved to ${WIP_BRANCH}, task re-queued" >&2
+echo "[pre-die] ${EID}: work saved to ${WIP_BRANCH} (${REASON})" >&2
 exit 0

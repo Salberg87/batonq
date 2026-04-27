@@ -161,6 +161,9 @@ switch (cmd) {
   case "abandon":
     abandonTask(process.argv[3]);
     break;
+  case "mark-needs-retry":
+    markNeedsRetry(process.argv[3], process.argv[4], process.argv[5]);
+    break;
   case "tasks":
     listTasks();
     break;
@@ -2004,6 +2007,43 @@ function pickTask(): void {
     console.log(`TASK:`);
     console.log(candidate.body);
     console.log(``);
+    // Phase 1.5 — retry context. When the picked row was needs-retry, include
+    // the wip-branch reference + last failure reason so the new attempt can
+    // continue from where the previous one died instead of redoing the work
+    // from scratch. Limit to 60 lines of diff to keep the prompt bounded;
+    // fuller context is available via `git diff main..<branch>` if needed.
+    if (candidate.last_wip_branch) {
+      const branch = candidate.last_wip_branch;
+      const reason = candidate.last_failure_reason ?? "(no reason recorded)";
+      const attempt = candidate.attempt_count ?? 0;
+      console.log(`RETRY ATTEMPT ${attempt}:`);
+      console.log(
+        `  Previous attempt(s) preserved on branch: ${branch}`
+      );
+      console.log(`  Last failure: ${reason}`);
+      try {
+        const diff = require("node:child_process")
+          .spawnSync(
+            "git",
+            ["diff", "--stat", `HEAD..${branch}`],
+            { encoding: "utf8", timeout: 3000 }
+          )
+          .stdout?.trim() ?? "";
+        if (diff) {
+          console.log(`  Diff vs HEAD:`);
+          for (const line of diff.split("\n").slice(0, 60)) {
+            console.log(`    ${line}`);
+          }
+        }
+      } catch {
+        // git unavailable / branch missing — agent can still inspect manually
+      }
+      console.log(
+        `  ACTION: read \`git diff HEAD..${branch}\`, continue from where it left off, ` +
+          `do NOT redo from scratch. Fix what failed (see reason above) then call \`batonq done\`.`
+      );
+      console.log(``);
+    }
     console.log(`When complete:   batonq done ${candidate.external_id}`);
     console.log(`If abandoning:   batonq abandon ${candidate.external_id}`);
   } finally {
@@ -2212,11 +2252,73 @@ function abandonTask(id?: string): void {
       console.error("No matching task.");
       process.exit(1);
     }
+    // True abandon clears the retry counter so a fresh dispatch starts at 0.
+    // mark-needs-retry preserves the counter and increments it.
     db.run(
-      `UPDATE tasks SET status = 'pending', claimed_by = NULL, claimed_at = NULL WHERE id = ?`,
+      `UPDATE tasks SET status = 'pending', claimed_by = NULL, claimed_at = NULL,
+       attempt_count = 0, last_wip_branch = NULL, last_failure_reason = NULL
+       WHERE id = ?`,
       [target.id]
     );
     console.log(`↺ abandoned (re-queued): [${target.repo}] ${target.body}`);
+  } finally {
+    db.close();
+  }
+}
+
+// Phase 1.5 — pre-die-hook calls this when a dispatch died with preserved
+// work on a wip branch. Transitions claimed → needs-retry, increments
+// attempt_count, stores wip branch + failure reason. Past BATONQ_MAX_ATTEMPTS
+// (default 3) it falls through to true abandon so a thrashing task doesn't
+// monopolise the queue forever.
+//
+// Usage: batonq mark-needs-retry <eid> <wip-branch> <reason>
+// Reason is a short string (e.g. "exit 143 (SIGTERM at gtimeout 20m)").
+function markNeedsRetry(
+  eid?: string,
+  wipBranch?: string,
+  reason?: string,
+): void {
+  if (!eid || !wipBranch) {
+    console.error("usage: batonq mark-needs-retry <eid> <wip-branch> [<reason>]");
+    process.exit(2);
+  }
+  const maxAttempts = Number(process.env.BATONQ_MAX_ATTEMPTS ?? "3");
+  const db = openTaskDb();
+  try {
+    const target: any = db
+      .query("SELECT * FROM tasks WHERE external_id = ?")
+      .get(eid);
+    if (!target) {
+      console.error(`mark-needs-retry: task ${eid} not found`);
+      process.exit(1);
+    }
+    const nextAttempt = (target.attempt_count ?? 0) + 1;
+    if (nextAttempt > maxAttempts) {
+      // Cap reached — true abandon, clear counter, log distinct exit signal
+      // so the operator can grep loop logs for "max-attempts" later.
+      db.run(
+        `UPDATE tasks SET status = 'pending', claimed_by = NULL, claimed_at = NULL,
+         attempt_count = 0, last_wip_branch = NULL, last_failure_reason = NULL
+         WHERE id = ?`,
+        [target.id]
+      );
+      console.log(
+        `↺ max-attempts (${maxAttempts}) reached for ${eid.slice(0, 8)} — abandoned. ` +
+          `Wip branches preserved: batonq/wip/${eid}/{1..${target.attempt_count ?? 0}}`
+      );
+      return;
+    }
+    db.run(
+      `UPDATE tasks SET status = 'needs-retry', claimed_by = NULL, claimed_at = NULL,
+       attempt_count = ?, last_wip_branch = ?, last_failure_reason = ?
+       WHERE id = ?`,
+      [nextAttempt, wipBranch, reason ?? "", target.id]
+    );
+    console.log(
+      `↻ needs-retry: ${eid.slice(0, 8)} attempt ${nextAttempt}/${maxAttempts}, ` +
+        `wip ${wipBranch}, reason: ${(reason ?? "").slice(0, 60)}`
+    );
   } finally {
     db.close();
   }

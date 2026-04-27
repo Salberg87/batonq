@@ -348,12 +348,14 @@ export function initTaskSchema(db: Database): void {
     migrateSessionIdColumn,
     migrateReuseSessionColumn,
     migrateRoleColumn,
+    migrateRetryColumns,
   } = require("./migrate");
   migrateAgentColumn(db);
   migrateModelColumn(db);
   migrateSessionIdColumn(db);
   migrateReuseSessionColumn(db);
   migrateRoleColumn(db);
+  migrateRetryColumns(db);
   // The pick index is created after ALTERs so migrating DBs get it too.
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_task_pick ON tasks(status, priority, scheduled_for, created_at)`,
@@ -544,6 +546,14 @@ const PICK_ORDER_BY = `
   created_at ASC
 `;
 
+// Phase 1.5: 'needs-retry' is treated identically to 'pending' for pick
+// candidate selection — the same priority/age ordering applies. The wip
+// context is added at print-time in pickTask (see agent-coord). We don't
+// boost needs-retry rows above pending of equal priority because that
+// would let a thrashing task starve fresh work; the priority field is the
+// operator's lever for that.
+const PICK_STATUSES_SQL = `status IN ('pending','needs-retry')`;
+
 export function selectCandidate(db: Database, opts: PickOptions): any {
   const { repo, any } = opts;
   const nowIso = opts.nowIso ?? new Date().toISOString();
@@ -553,7 +563,7 @@ export function selectCandidate(db: Database, opts: PickOptions): any {
     return db
       .query(
         `SELECT * FROM tasks
-         WHERE status = 'pending' AND ${scheduleGate}
+         WHERE ${PICK_STATUSES_SQL} AND ${scheduleGate}
          ORDER BY ${PICK_ORDER_BY}
          LIMIT 1`,
       )
@@ -563,7 +573,7 @@ export function selectCandidate(db: Database, opts: PickOptions): any {
     return db
       .query(
         `SELECT * FROM tasks
-         WHERE status = 'pending' AND ${scheduleGate}
+         WHERE ${PICK_STATUSES_SQL} AND ${scheduleGate}
            AND (repo = ? OR repo LIKE 'any:%')
          ORDER BY ${PICK_ORDER_BY}
          LIMIT 1`,
@@ -573,7 +583,7 @@ export function selectCandidate(db: Database, opts: PickOptions): any {
   return db
     .query(
       `SELECT * FROM tasks
-       WHERE status = 'pending' AND ${scheduleGate}
+       WHERE ${PICK_STATUSES_SQL} AND ${scheduleGate}
          AND repo LIKE 'any:%'
        ORDER BY ${PICK_ORDER_BY}
        LIMIT 1`,
@@ -601,9 +611,11 @@ export function claimCandidate(
   session: string,
   nowIso: string = new Date().toISOString(),
 ): { changes: number } {
+  // Accept both 'pending' (fresh) and 'needs-retry' (Phase 1.5 retry-with-
+  // wip-context). Other states (claimed/done/draft/lost) cannot be claimed.
   const result = db.run(
     `UPDATE tasks SET status = 'claimed', claimed_by = ?, claimed_at = ?
-     WHERE id = ? AND status = 'pending'`,
+     WHERE id = ? AND status IN ('pending','needs-retry')`,
     [session, nowIso, id],
   );
   return { changes: result.changes };

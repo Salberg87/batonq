@@ -198,3 +198,36 @@ export function migrateRoleColumn(db: Database): void {
   if (cols.some((c) => c.name === "role")) return;
   db.exec("ALTER TABLE tasks ADD COLUMN role TEXT NOT NULL DEFAULT 'worker'");
 }
+
+// Phase 1.5 retry-with-wip-context columns. When a dispatch dies before
+// reaching `batonq done`, the pre-die hook records:
+//   - attempt_count    incremented per retry; when this exceeds
+//                      BATONQ_MAX_ATTEMPTS (default 3), the task is truly
+//                      abandoned instead of re-queued as needs-retry.
+//   - last_wip_branch  e.g. `batonq/wip/abc12345/3` — the branch carrying the
+//                      previous attempt's partial work; the next pick reads
+//                      its diff and prepends it to the prompt so the retry
+//                      starts where the prior attempt left off (instead of
+//                      thrashing from scratch — see the 30-attempt
+//                      df2137e46adc pathology, 2026-04-27).
+//   - last_failure_reason  e.g. "exit 143 (SIGTERM at gtimeout 20m)" — fed
+//                      to the agent in the next prompt so it knows what to
+//                      avoid.
+// All three are nullable / default-zero; idempotent per the existing pattern.
+export function migrateRetryColumns(db: Database): void {
+  const cols = db
+    .query("SELECT name FROM pragma_table_info('tasks')")
+    .all() as { name: string }[];
+  const have = new Set(cols.map((c) => c.name));
+  if (!have.has("attempt_count")) {
+    db.exec(
+      "ALTER TABLE tasks ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+    );
+  }
+  if (!have.has("last_wip_branch")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN last_wip_branch TEXT");
+  }
+  if (!have.has("last_failure_reason")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN last_failure_reason TEXT");
+  }
+}
