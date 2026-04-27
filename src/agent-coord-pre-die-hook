@@ -1,0 +1,133 @@
+#!/bin/bash
+# agent-coord-pre-die-hook — preserves partial work when a dispatch dies.
+#
+# Phase 1 of Track D's auto-commit-before-die design (docs/v2/track-d-control-loop.md §4).
+# The failure this addresses (observed 2026-04-26): claude-p worker hits
+# `gtimeout 20m` SIGTERM with real edits sitting in the working tree, never
+# called `batonq done`, never committed. The next loop iteration sees stray
+# uncommitted files from the dead agent. Operator wakes up to claimed-but-
+# half-done tasks and orphaned diffs.
+#
+# This script preserves the work to a wip branch + abandons the task back
+# to the queue, so:
+#   1. The work isn't lost (operator can cherry-pick from wip later).
+#   2. The active branch goes back to a clean state.
+#   3. The task re-enters the queue for another attempt by a different runner.
+#
+# Usage: agent-coord-pre-die-hook <eid> <exit_code> <runner> <model>
+# Env:   BATONQ_PRE_DIE_DISABLE=1 short-circuits (escape hatch for ops debug).
+#
+# Discipline: NEVER fail noisily. If git is in a weird state, log and exit 0.
+# Killing the outer loop because the wip-commit failed is worse than losing
+# one attempt's worth of work.
+
+set -u  # NOT -e — every git op handles its own error
+
+EID="${1:-}"
+EXIT_CODE="${2:-0}"
+RUNNER="${3:-?}"
+MODEL="${4:-?}"
+
+if [ -z "$EID" ]; then
+  echo "[pre-die] missing eid arg; skipping" >&2
+  exit 0
+fi
+
+if [ "${BATONQ_PRE_DIE_DISABLE:-0}" = "1" ]; then
+  echo "[pre-die] BATONQ_PRE_DIE_DISABLE=1; skipping" >&2
+  exit 0
+fi
+
+# Resolve git root in the current cwd. If we're not in a git repo, nothing
+# to preserve — the agent ran in a non-repo location and we have no
+# preservation story.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$REPO_ROOT" ]; then
+  echo "[pre-die] not inside a git repo; nothing to preserve" >&2
+  exit 0
+fi
+
+cd "$REPO_ROOT" || exit 0
+
+# Skip detached-HEAD state — branch creation gets confusing and the operator
+# is probably mid-rebase or mid-bisect; better not to interfere.
+if ! git symbolic-ref -q HEAD >/dev/null; then
+  echo "[pre-die] detached HEAD; skipping" >&2
+  exit 0
+fi
+
+ACTIVE_BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || echo HEAD)"
+
+# Detect dirty tree — tracked changes, staged changes, OR untracked files
+# (the agent may have created brand-new files we want to preserve too).
+DIRTY=0
+if ! git diff-index --quiet HEAD -- 2>/dev/null; then DIRTY=1; fi
+if ! git diff --cached --quiet 2>/dev/null; then DIRTY=1; fi
+if [ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]; then DIRTY=1; fi
+
+if [ "$DIRTY" -eq 0 ]; then
+  echo "[pre-die] tree clean; nothing to preserve for ${EID}" >&2
+  exit 0
+fi
+
+# Determine next attempt number. Branches live at batonq/wip/<eid>/<n>.
+# Glob for existing ones and pick max+1. The leading slashes in the pattern
+# are git-ref conventions, not directory paths.
+ATTEMPT=1
+while git show-ref --verify --quiet "refs/heads/batonq/wip/${EID}/${ATTEMPT}" 2>/dev/null; do
+  ATTEMPT=$((ATTEMPT + 1))
+done
+
+WIP_BRANCH="batonq/wip/${EID}/${ATTEMPT}"
+
+# Capture diff stat for the events log (use against HEAD because that's what
+# we're branching from).
+DIFF_STAT="$(git diff --stat HEAD 2>/dev/null | tail -1 || echo "")"
+UNTRACKED_COUNT="$(git ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
+
+echo "[pre-die] preserving work for ${EID} → ${WIP_BRANCH} (${DIFF_STAT}, ${UNTRACKED_COUNT} untracked)" >&2
+
+# Create the wip branch from current HEAD (uncommitted changes carry over),
+# stage everything, commit. Then switch back to the active branch — git
+# automatically restores the clean tree because the changes are now
+# committed on the wip branch.
+if ! git checkout -b "$WIP_BRANCH" >/dev/null 2>&1; then
+  echo "[pre-die] could not create branch ${WIP_BRANCH}; tree left dirty" >&2
+  exit 0
+fi
+
+git add -A >/dev/null 2>&1 || true
+COMMIT_MSG="wip(batonq): partial work from ${RUNNER}/${MODEL} for ${EID} (attempt ${ATTEMPT}, exit ${EXIT_CODE})"
+if ! git commit -m "$COMMIT_MSG" --no-verify >/dev/null 2>&1; then
+  # Commit failed (signing, hooks, whatever). Roll back the branch creation
+  # so we don't leave the operator on the wip branch with no commit.
+  git checkout "$ACTIVE_BRANCH" >/dev/null 2>&1 || true
+  git branch -D "$WIP_BRANCH" >/dev/null 2>&1 || true
+  echo "[pre-die] commit failed; rolled back branch creation, tree still dirty" >&2
+  exit 0
+fi
+
+# Switch back to where we started. The wip branch keeps the work.
+if ! git checkout "$ACTIVE_BRANCH" >/dev/null 2>&1; then
+  echo "[pre-die] could not return to ${ACTIVE_BRANCH}; operator is on ${WIP_BRANCH}" >&2
+  # Don't try to abandon the task — the dispatcher's cwd is now wrong.
+  exit 0
+fi
+
+# Active branch is clean again. Abandon the task so the queue progresses.
+# Find batonq on PATH (installer drops it at ~/.local/bin or ~/bin).
+BATONQ_BIN="$(command -v batonq 2>/dev/null || echo "")"
+if [ -z "$BATONQ_BIN" ]; then
+  echo "[pre-die] batonq not on PATH; cannot abandon ${EID} — task will linger as 'claimed' until watchdog sweep" >&2
+  exit 0
+fi
+
+# Pre-die abandon: re-queue the task so another runner gets a fresh shot.
+# Stderr captured so the loop log shows the reason if abandon errors out.
+if ! "$BATONQ_BIN" abandon "$EID" >/dev/null 2>&1; then
+  echo "[pre-die] batonq abandon ${EID} failed; task may be stuck in 'claimed' state" >&2
+  exit 0
+fi
+
+echo "[pre-die] ${EID}: work saved to ${WIP_BRANCH}, task re-queued" >&2
+exit 0

@@ -233,6 +233,7 @@ install_bins() {
   # path was taken above. They have no JS deps to bundle.
   install_one "${src}/agent-coord-loop"          "${bindir}/${NAME}-loop"
   install_one "${src}/agent-coord-loop-watchdog" "${bindir}/${NAME}-loop-watchdog"
+  install_one "${src}/agent-coord-pre-die-hook"  "${bindir}/${NAME}-pre-die-hook"
   install_one "${src}/agent-coord-loop"          "${bindir}/agent-coord-loop"
 
   # Platform-compat helper sourced by the loop + watchdog at runtime. Must sit

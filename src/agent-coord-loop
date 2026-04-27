@@ -114,6 +114,7 @@ while true; do
     AGENT="$(extract_pick_field agent)"
     MODEL="$(extract_pick_field model)"
     ROLE="$(extract_pick_field role)"
+    EID="$(extract_pick_field external_id)"
     AGENT="${AGENT:-claude}"
     MODEL="${MODEL:-sonnet}"
     ROLE="${ROLE:-worker}"
@@ -152,16 +153,31 @@ while true; do
     # keep running. The full pick output is passed as --prompt so the picked
     # agent has the same context (external_id, body, "When complete: batonq
     # done <id>") that claude got under the previous hard-coded path.
+    DISPATCH_EXIT=0
     "$TIMEOUT_CMD" "$LOOP_TIMEOUT" batonq agent-run \
         --tool="$AGENT" \
         --model="$MODEL" \
         --role="$ROLE" \
         --prompt="$PICK_OUTPUT" \
-        --system-prompt="$PICK_NEXT_SYSTEM_PROMPT" || true
+        --system-prompt="$PICK_NEXT_SYSTEM_PROMPT" || DISPATCH_EXIT=$?
 
     # Clean up watchdog (task done or killed)
     kill "$WATCHDOG_PID" 2>/dev/null || true
     wait "$WATCHDOG_PID" 2>/dev/null || true
+
+    # Pre-die hook (Track D §4 — auto-commit-before-die). Runs after every
+    # dispatch regardless of exit code: a clean exit with no commit AND a
+    # dirty tree is the "agent wrote code but never reached `batonq done`"
+    # failure mode that motivated this work. The hook is a no-op when the
+    # tree is clean. EID may be empty for very old DB rows that pre-date
+    # the external_id field on pick output — the hook fast-exits in that
+    # case. See src/agent-coord-pre-die-hook.
+    PRE_DIE_HOOK="$(command -v batonq-pre-die-hook \
+                 || command -v agent-coord-pre-die-hook \
+                 || echo "$(dirname "$0")/agent-coord-pre-die-hook")"
+    if [ -x "$PRE_DIE_HOOK" ] && [ -n "$EID" ]; then
+      "$PRE_DIE_HOOK" "$EID" "$DISPATCH_EXIT" "$AGENT" "$MODEL" || true
+    fi
 
     # Wait before next pick
     echo
