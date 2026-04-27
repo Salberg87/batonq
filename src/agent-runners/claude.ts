@@ -137,14 +137,29 @@ export function buildClaudeArgs(
   }
 
   if (resolvedModel) args.push("--model", resolvedModel);
-  if (opts.systemPrompt && mode === "execute") {
-    args.push("--append-system-prompt", opts.systemPrompt);
-  }
-  // Role SKILL.md → claude's native file-based system-prompt loader. Stays
-  // out of analyze mode because `--print` ignores append-system-prompt and
-  // surfacing the flag there would mislead callers about its effect.
-  if (skillPath && mode === "execute") {
-    args.push("--append-system-prompt-file", skillPath);
+  // Claude CLI rejects --append-system-prompt and --append-system-prompt-file
+  // used together: "Cannot use both --append-system-prompt and
+  // --append-system-prompt-file. Please use only one." (observed 2026-04-28
+  // when validating Phase 1.5 dispatch). When the loop passes a system
+  // prompt AND a per-role SKILL.md is resolved, we read the skill file and
+  // concatenate it onto the system-prompt string, falling through to the
+  // single --append-system-prompt path. Skill goes FIRST so the role's
+  // instructions frame the loop's pick-next prompt that follows.
+  if (mode === "execute") {
+    let systemPrompt = opts.systemPrompt ?? "";
+    if (skillPath) {
+      try {
+        const skill = require("node:fs").readFileSync(skillPath, "utf8");
+        systemPrompt = systemPrompt
+          ? `${skill}\n\n---\n\n${systemPrompt}`
+          : skill;
+      } catch {
+        // Skill file unreadable — fall through with whatever systemPrompt
+        // we have. Better to dispatch without the role skill than to wedge
+        // the loop on a missing cache file.
+      }
+    }
+    if (systemPrompt) args.push("--append-system-prompt", systemPrompt);
   }
   if (opts.extraArgs?.length) args.push(...opts.extraArgs);
   return args;
